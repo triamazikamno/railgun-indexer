@@ -1,0 +1,36 @@
+[package]
+name = "railgun-indexer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+alloy-primitives = { version = "1.6", features = ["serde"] }
+alloy-rpc-types-eth = { workspace = true }
+axum = { workspace = true }
+broadcaster-core = { workspace = true }
+chrono = { workspace = true }
+cid = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { workspace = true }
+eyre = { workspace = true }
+futures-util = { workspace = true }
+merkletree = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { version = "0.9" }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url = { workspace = true }
+
+railgun-indexer-core = { path = "../../crates/railgun-indexer-core" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

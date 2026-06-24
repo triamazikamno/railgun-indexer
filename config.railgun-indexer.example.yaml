@@ -1,0 +1,157 @@
+# General railgun-indexer publisher infrastructure.
+railgun_indexer:
+  # PostgreSQL connection string used for durable indexer state.
+  postgres_connection_string: "postgres://railgun_indexer:railgun_indexer@localhost:5432/railgun_indexer"
+
+  # IPFS or pinning-service endpoint used for snapshot and manifest publication.
+  ipfs_endpoint: "https://api.example-ipfs.invalid"
+
+  # Plain ed25519 signing key file used for manifest signing and IPNS publication.
+  publisher_signing_key_path: "secrets/railgun-indexer-publisher.key"
+
+  # Separate ed25519 key for chain-indexed artifact manifest signing and IPNS publication.
+  chain_indexed_publisher_signing_key_path: "secrets/railgun-indexer-chain-indexed-publisher.key"
+
+  # Public IPFS DHT bootstrap peers used by the in-process IPNS publisher.
+  ipns_bootstrap_peers:
+    - "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+    - "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa"
+    - "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb"
+    - "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt"
+
+  # IPNS record validity window. The indexer republishes before this expires.
+  ipns_record_lifetime: "24h"
+
+  # IPNS record TTL hint for DHT resolvers and caches.
+  ipns_record_ttl: "1h"
+
+  # Cadence for republishing the latest IPNS record when no new manifest is emitted.
+  ipns_republish_interval: "12h"
+
+  # Timeout for one IPNS DHT publish or resolve attempt.
+  ipns_publish_timeout: "60s"
+
+  # How long superseded artifact and manifest CIDs should remain pinned after replacement.
+  retention_interval: "168h"
+
+# POI dataset family configuration.
+poi:
+  # Upstream POI JSON-RPC endpoint to mirror.
+  upstream_url: "https://ppoi.fdi.network"
+
+  # POI list operator public keys. Each key is a 32-byte ed25519 public key in hex.
+  list_keys:
+    - "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+  # Supported chain IDs: 1 (Ethereum), 56 (BNB Chain), 137 (Polygon), 42161 (Arbitrum).
+  chain_ids:
+    - 1
+    - 56
+    - 137
+    - 42161
+
+  # Maximum upstream request page size. The public upstream caps POI leaf pages at 100.
+  page_size_max: 100
+
+  # Number of retry attempts for a failed page before shrinking page size.
+  retry_budget: 5
+
+  # Delay between successful upstream page requests.
+  polite_interval: "1s"
+
+  # Cadence for full blocked-shield refreshes. This runs separately from event sync.
+  blocked_shield_resync_interval: "30m"
+
+  # Cadence for publishing delta snapshots after new events are indexed.
+  delta_publish_interval: "10m"
+
+  # Cadence for rebuilding the base snapshot and resetting the delta chain.
+  base_rebuild_interval: "24h"
+
+  # Maximum number of (list_key, chain_id) pairs synced concurrently.
+  per_pair_concurrency_limit: 4
+
+# Chain-indexed artifact configuration. These datasets are sourced from explicit
+# RPC/archive RPC providers, never from Squid or implicit public defaults.
+chain_indexed:
+  enabled: true
+
+  # Fallback cadence for chain-indexed tail checks and retry backoff.
+  index_interval: "15s"
+
+  # Cadence for periodic recent tail safety scans once historical catch-up is complete.
+  tail_safety_interval: "5m"
+
+  # Maximum recent block span for one tail safety scan. Tail scans use normal RPC
+  # first and fall back to archive RPC if normal RPC cannot serve the range.
+  tail_safety_block_span: 1000
+
+  # Cadence for publishing indexed chunks, catalogs, manifests, and IPNS updates.
+  publish_interval: "10m"
+
+  # Maximum block span for one RPC log indexing batch. Historical catch-up runs
+  # batches back-to-back and shrinks this span automatically after RPC errors.
+  max_blocks_per_batch: 50000
+
+  # Blocks to lag chain head before indexing to reduce reorg exposure.
+  safe_confirmations: 12
+
+  # Public TXID chunks are contiguous TXID-index ranges.
+  public_txid_chunk_row_limit: 10000
+
+  # Commitment chunks are contiguous global tree-position ranges.
+  commitment_chunk_row_limit: 50000
+
+  chains:
+    - chain_id: 1
+      railgun_contract: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+      rpc_url: "https://mainnet-rpc.example.invalid"
+      ws_url: "wss://mainnet-rpc.example.invalid"
+      archive_rpc_url: "https://mainnet-archive-rpc.example.invalid"
+      start_block: 14737691
+      v2_start_block: 16076750
+      legacy_shield_block: 16790263
+      datasets:
+        - public_txid
+        - wallet_scan
+        - commitments
+        - merkle_checkpoint
+    - chain_id: 56
+      railgun_contract: "0x590162bf4b50f6576a459b75309ee21d92178a10"
+      rpc_url: "https://bsc-rpc.example.invalid"
+      ws_url: "wss://bsc-rpc.example.invalid"
+      archive_rpc_url: "https://bsc-archive-rpc.example.invalid"
+      start_block: 17633701
+      v2_start_block: 23478204
+      legacy_shield_block: 26313947
+      datasets:
+        - public_txid
+        - wallet_scan
+        - commitments
+        - merkle_checkpoint
+    - chain_id: 137
+      railgun_contract: "0x19b620929f97b7b990801496c3b361ca5def8c71"
+      rpc_url: "https://polygon-rpc.example.invalid"
+      ws_url: "wss://polygon-rpc.example.invalid"
+      archive_rpc_url: "https://polygon-archive-rpc.example.invalid"
+      start_block: 28083766
+      v2_start_block: 36219104
+      legacy_shield_block: 40143539
+      datasets:
+        - public_txid
+        - wallet_scan
+        - commitments
+        - merkle_checkpoint
+    - chain_id: 42161
+      railgun_contract: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"
+      rpc_url: "https://arbitrum-rpc.example.invalid"
+      ws_url: "wss://arbitrum-rpc.example.invalid"
+      archive_rpc_url: "https://arbitrum-archive-rpc.example.invalid"
+      start_block: 56109834
+      v2_start_block: 0
+      legacy_shield_block: 68196853
+      datasets:
+        - public_txid
+        - wallet_scan
+        - commitments
+        - merkle_checkpoint
