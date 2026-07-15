@@ -13,7 +13,7 @@ use tracing::info;
 
 const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
 const CHAIN_INDEXED_IPNS_SEQUENCE_STATE_KEY: &str = "chain_indexed_ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 9;
+const CURRENT_SCHEMA_VERSION: i32 = 11;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -1568,6 +1568,7 @@ impl Store {
         railgun_contract: Address,
         start_global_position: u64,
         end_global_position: u64,
+        indexed_through_block: Option<u64>,
     ) -> Result<Vec<StoredCommitmentRow>, StoreError> {
         let chain_type = i16::from(chain_type);
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
@@ -1575,6 +1576,9 @@ impl Store {
         let start_global_position = u64_to_i64(start_global_position, "start_global_position")?;
         let end_global_position = u64_to_i64(end_global_position, "end_global_position")?;
         let tree_leaf_count = u64_to_i64(TREE_LEAF_COUNT, "tree_leaf_count")?;
+        let indexed_through_block = indexed_through_block
+            .map(|block| u64_to_i64(block, "indexed_through_block"))
+            .transpose()?;
         let rows = sqlx::query_as::<_, (String, i64, i64, i64, Vec<u8>)>(
             r"
             WITH all_commitments AS (
@@ -1587,6 +1591,7 @@ impl Store {
                 FROM indexed_transact_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
                     AND tree_number * $6 + tree_position BETWEEN $4 AND $5
+                    AND ($7::BIGINT IS NULL OR block_number <= $7)
                 UNION ALL
                 SELECT
                     'shield' AS family,
@@ -1596,6 +1601,7 @@ impl Store {
                     commitment_hash
                 FROM indexed_shield_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($7::BIGINT IS NULL OR block_number <= $7)
                 UNION ALL
                 SELECT
                     'legacy_encrypted' AS family,
@@ -1605,6 +1611,7 @@ impl Store {
                     commitment_hash
                 FROM indexed_legacy_encrypted_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($7::BIGINT IS NULL OR block_number <= $7)
                 UNION ALL
                 SELECT
                     'legacy_generated' AS family,
@@ -1614,6 +1621,7 @@ impl Store {
                     commitment_hash
                 FROM indexed_legacy_generated_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($7::BIGINT IS NULL OR block_number <= $7)
             )
             SELECT
                 family,
@@ -1634,6 +1642,7 @@ impl Store {
         .bind(start_global_position)
         .bind(end_global_position)
         .bind(tree_leaf_count)
+        .bind(indexed_through_block)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1660,6 +1669,7 @@ impl Store {
         chain_type: u8,
         chain_id: u64,
         railgun_contract: Address,
+        indexed_through_block: Option<u64>,
     ) -> Result<Vec<StoredCommitmentTreeSummary>, StoreError> {
         let rows = sqlx::query_as::<_, (i64, i64, i64)>(
             r"
@@ -1670,18 +1680,22 @@ impl Store {
                     block_number
                 FROM indexed_transact_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($4::BIGINT IS NULL OR block_number <= $4)
                 UNION ALL
                 SELECT tree_number, tree_position, block_number
                 FROM indexed_shield_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($4::BIGINT IS NULL OR block_number <= $4)
                 UNION ALL
                 SELECT tree_number, tree_position, block_number
                 FROM indexed_legacy_encrypted_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($4::BIGINT IS NULL OR block_number <= $4)
                 UNION ALL
                 SELECT tree_number, tree_position, block_number
                 FROM indexed_legacy_generated_commitments
                 WHERE chain_type = $1 AND chain_id = $2 AND railgun_contract = $3
+                    AND ($4::BIGINT IS NULL OR block_number <= $4)
             )
             SELECT
                 tree_number,
@@ -1695,6 +1709,11 @@ impl Store {
         .bind(i16::from(chain_type))
         .bind(u64_to_i64(chain_id, "chain_id")?)
         .bind(railgun_contract.to_string())
+        .bind(
+            indexed_through_block
+                .map(|block| u64_to_i64(block, "indexed_through_block"))
+                .transpose()?,
+        )
         .fetch_all(&self.pool)
         .await?;
 
@@ -1715,6 +1734,7 @@ impl Store {
         chain_id: u64,
         railgun_contract: Address,
         summary: &StoredCommitmentTreeSummary,
+        indexed_through_block: Option<u64>,
     ) -> Result<StoredCommitmentTreeCheckpoint, StoreError> {
         let end_position =
             summary
@@ -1733,6 +1753,7 @@ impl Store {
                 railgun_contract,
                 start_global_position,
                 end_global_position,
+                indexed_through_block,
             )
             .await?;
 
@@ -2748,6 +2769,8 @@ const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[
     (7, V7_MIGRATIONS),
     (8, V8_MIGRATIONS),
     (9, V9_MIGRATIONS),
+    (10, V10_MIGRATIONS),
+    (11, V11_MIGRATIONS),
 ];
 
 const V4_MIGRATIONS: &[&str] = &[
@@ -3431,6 +3454,34 @@ const V9_MIGRATIONS: &[&str] = &[
     END $$
     ",
     "CREATE INDEX IF NOT EXISTS idx_public_txid_rows_order ON indexed_public_txid_rows (chain_type, chain_id, railgun_contract, block_number, first_log_index, transaction_hash, railgun_transaction_index)",
+];
+
+const V10_MIGRATIONS: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS published_indexed_artifacts_retention_lookup ON published_indexed_artifacts (last_referenced_at, cid) WHERE unpinned_at IS NULL",
+];
+
+const V11_MIGRATIONS: &[&str] = &[
+    r"
+    CREATE TABLE IF NOT EXISTS published_indexed_manifest_artifacts (
+        manifest_id BIGINT NOT NULL REFERENCES published_indexed_manifests(id) ON DELETE CASCADE,
+        artifact_cid TEXT NOT NULL,
+        PRIMARY KEY (manifest_id, artifact_cid)
+    )
+    ",
+    "CREATE INDEX IF NOT EXISTS published_indexed_manifest_artifacts_cid_lookup ON published_indexed_manifest_artifacts (artifact_cid, manifest_id)",
+    r"
+    INSERT INTO published_indexed_manifest_artifacts (manifest_id, artifact_cid)
+    SELECT manifest.id, artifact.cid
+    FROM published_indexed_manifests AS manifest
+    CROSS JOIN (
+        SELECT DISTINCT cid
+        FROM published_indexed_artifacts
+        WHERE unpinned_at IS NULL
+    ) AS artifact
+    WHERE manifest.superseded_at IS NULL
+        AND manifest.unpinned_at IS NULL
+    ON CONFLICT (manifest_id, artifact_cid) DO NOTHING
+    ",
 ];
 
 fn decode_fixed_hex<const N: usize>(

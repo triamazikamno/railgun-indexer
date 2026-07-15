@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,9 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use railgun_indexer_core::audit::{Audit, IndexedArtifactPublicationKind};
+use railgun_indexer_core::audit::{
+    Audit, ChainCanonicalityCoordinator, IndexedArtifactPublicationKind, PinLifecycleCoordinator,
+};
 use railgun_indexer_core::chain_indexer::{
     ChainIndexedBlockHeader, ChainLogIndexingOutcome, ChainLogIndexingRange, index_chain_log_range,
 };
@@ -31,7 +34,8 @@ use railgun_indexer_core::manifest::{
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
     INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION, INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
     IndexedArtifactCatalog, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
-    IndexedArtifactRange, IndexedDatasetKind, LatestIndexedHeight, PublisherIdentity, content_hash,
+    IndexedArtifactRange, IndexedArtifactRangeKind, IndexedDatasetKind, LatestIndexedHeight,
+    PublisherIdentity, content_hash,
 };
 use railgun_indexer_core::merkle_checkpoint::{
     MerkleCheckpointArtifact, prepare_merkle_checkpoint_artifact,
@@ -42,7 +46,7 @@ use railgun_indexer_core::public_txid::{
 use railgun_indexer_core::publish::ipfs::{IpfsClient, pin_indexed_chunk, pin_manifest};
 use railgun_indexer_core::publish::ipns::IpnsPublisher;
 use railgun_indexer_core::store::{
-    IndexedDatasetKind as StoreDatasetKind, Store, StoredPublicTxidRow,
+    IndexedDatasetKind as StoreDatasetKind, Store, StoredIndexedBlockHeader, StoredPublicTxidRow,
 };
 use railgun_indexer_core::wallet_scan::{prepare_wallet_scan_chunk, wallet_scan_chunk_plan_item};
 
@@ -84,6 +88,7 @@ impl ChainRuntime {
 pub(crate) async fn run_indexing_loop(
     config: Config,
     store: Store,
+    canonicality: ChainCanonicalityCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let chains = config
@@ -98,7 +103,10 @@ pub(crate) async fn run_indexing_loop(
         let config = config.clone();
         let store = store.clone();
         let shutdown = shutdown.clone();
-        tasks.spawn(async move { run_chain_indexing_loop(config, store, chain, shutdown).await });
+        let canonicality = canonicality.clone();
+        tasks.spawn(async move {
+            run_chain_indexing_loop(config, store, chain, canonicality, shutdown).await
+        });
     }
 
     loop {
@@ -129,6 +137,7 @@ async fn run_chain_indexing_loop(
     config: Config,
     store: Store,
     runtime: ChainRuntime,
+    canonicality: ChainCanonicalityCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let idle_interval = checked_interval(
@@ -166,6 +175,7 @@ async fn run_chain_indexing_loop(
             &store,
             &config,
             &runtime,
+            &canonicality,
             requested_batch_span,
             provider_mode,
         )
@@ -388,6 +398,8 @@ pub(crate) async fn run_publication_loop(
     ipfs_client: Arc<dyn IpfsClient>,
     signing_key: SigningKey,
     ipns_publisher: IpnsPublisher,
+    pin_lifecycle: PinLifecycleCoordinator,
+    canonicality: ChainCanonicalityCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let interval = checked_interval(
@@ -400,6 +412,8 @@ pub(crate) async fn run_publication_loop(
         ipfs_client,
         signing_key,
         ipns_publisher,
+        pin_lifecycle,
+        canonicality,
         last_ipns_sequence: None,
         ipns_sequence_loaded: false,
     };
@@ -439,6 +453,7 @@ async fn index_chain_once(
     store: &Store,
     config: &Config,
     runtime: &ChainRuntime,
+    canonicality: &ChainCanonicalityCoordinator,
     batch_span: u64,
     provider_mode: ChainIndexProviderMode,
 ) -> Result<ChainIndexStep> {
@@ -448,7 +463,7 @@ async fn index_chain_once(
         .await
         .wrap_err("fetch chain head")?
         .saturating_sub(config.chain_indexed.safe_confirmations);
-    let from_block = resume_block_after_reorg(store, config, runtime).await?;
+    let from_block = resume_block_after_reorg(store, config, runtime, canonicality).await?;
     if from_block > safe_head {
         return Ok(ChainIndexStep::CaughtUp);
     }
@@ -609,6 +624,7 @@ async fn resume_block_after_reorg(
     store: &Store,
     config: &Config,
     runtime: &ChainRuntime,
+    canonicality: &ChainCanonicalityCoordinator,
 ) -> Result<u64> {
     loop {
         let Some(progress) = store
@@ -624,6 +640,25 @@ async fn resume_block_after_reorg(
             return Ok(runtime.chain.start_block);
         };
 
+        let remote_header =
+            fetch_block_header(&runtime.archive_provider, progress.indexed_through_block).await?;
+        if remote_header.block_hash.as_slice() == progress.indexed_through_block_hash {
+            return Ok(progress.indexed_through_block.saturating_add(1));
+        }
+
+        let _canonicality = canonicality.reorg_lease().await;
+        let Some(progress) = store
+            .chain_indexing_progress(
+                EVM_CHAIN_TYPE,
+                runtime.chain.chain_id,
+                runtime.chain.railgun_contract,
+                StoreDatasetKind::WalletScan,
+            )
+            .await
+            .wrap_err("re-read chain-indexed progress before reorg rewind")?
+        else {
+            continue;
+        };
         let remote_header =
             fetch_block_header(&runtime.archive_provider, progress.indexed_through_block).await?;
         if remote_header.block_hash.as_slice() == progress.indexed_through_block_hash {
@@ -707,8 +742,31 @@ struct ChainIndexedPublicationScheduler {
     ipfs_client: Arc<dyn IpfsClient>,
     signing_key: SigningKey,
     ipns_publisher: IpnsPublisher,
+    pin_lifecycle: PinLifecycleCoordinator,
+    canonicality: ChainCanonicalityCoordinator,
     last_ipns_sequence: Option<u64>,
     ipns_sequence_loaded: bool,
+}
+
+struct PublishedCatalog {
+    descriptor: IndexedArtifactDescriptor,
+    artifact_cids: Vec<String>,
+}
+
+struct PublishedChainEntry {
+    entry: IndexedArtifactChainEntry,
+    artifact_cids: Vec<String>,
+}
+
+fn extend_published_catalogs(
+    descriptors: &mut Vec<IndexedArtifactDescriptor>,
+    artifact_cids: &mut BTreeSet<String>,
+    published: Vec<PublishedCatalog>,
+) {
+    for catalog in published {
+        descriptors.push(catalog.descriptor);
+        artifact_cids.extend(catalog.artifact_cids);
+    }
 }
 
 impl ChainIndexedPublicationScheduler {
@@ -722,9 +780,13 @@ impl ChainIndexedPublicationScheduler {
         .await;
 
         let mut chains = Vec::new();
+        let mut artifact_cids = BTreeSet::new();
         for (chain, result) in configured_chains.iter().zip(published_chains) {
             match result {
-                Ok(Some(entry)) => chains.push(entry),
+                Ok(Some(published)) => {
+                    chains.push(published.entry);
+                    artifact_cids.extend(published.artifact_cids);
+                }
                 Ok(None) => {}
                 Err(error) => {
                     return Err(error).wrap_err_with(|| {
@@ -739,6 +801,10 @@ impl ChainIndexedPublicationScheduler {
         if chains.is_empty() {
             return Ok(());
         }
+
+        let canonicality_guard = self.canonicality.publication_lease().await;
+        self.validate_combined_manifest_snapshot(&configured_chains, &chains)
+            .await?;
 
         let sequence = self.next_ipns_sequence(now).await?;
         let mut manifest = railgun_indexer_core::manifest::IndexedArtifactManifest::new(
@@ -761,6 +827,10 @@ impl ChainIndexedPublicationScheduler {
         let byte_size = u64::try_from(manifest_bytes.len())
             .wrap_err("chain-indexed manifest byte size overflow")?;
         let manifest_hash = content_hash(&manifest_bytes);
+        let artifact_cids = artifact_cids.into_iter().collect::<Vec<_>>();
+        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
+        self.ensure_indexed_artifacts_available(&artifact_cids)
+            .await?;
         let manifest_cid = pin_manifest(self.ipfs_client.as_ref(), &manifest_bytes)
             .await
             .wrap_err("pin chain-indexed manifest")?;
@@ -773,6 +843,7 @@ impl ChainIndexedPublicationScheduler {
         Audit::record_indexed_manifest_pin(
             &mut tx,
             &manifest_cid,
+            &artifact_cids,
             sequence,
             byte_size,
             &manifest_hash,
@@ -783,10 +854,15 @@ impl ChainIndexedPublicationScheduler {
         tx.commit()
             .await
             .wrap_err("commit chain-indexed manifest pin audit")?;
+        drop(pin_lifecycle_guard);
 
         let manifest_cid_string = manifest_cid.to_string();
         self.ipns_publisher
-            .publish_manifest_cid(&manifest_cid_string, sequence)
+            .publish_manifest_cid_with_lease(
+                &manifest_cid_string,
+                sequence,
+                canonicality_guard.clone(),
+            )
             .await
             .wrap_err("publish chain-indexed manifest CID to IPNS")?;
         let mut tx = self
@@ -800,6 +876,7 @@ impl ChainIndexedPublicationScheduler {
         tx.commit()
             .await
             .wrap_err("commit chain-indexed manifest IPNS audit")?;
+        drop(canonicality_guard);
 
         info!(
             manifest_cid = %manifest_cid_string,
@@ -814,10 +891,35 @@ impl ChainIndexedPublicationScheduler {
         Ok(())
     }
 
+    async fn validate_combined_manifest_snapshot(
+        &self,
+        configured_chains: &[ChainIndexedChainConfig],
+        entries: &[IndexedArtifactChainEntry],
+    ) -> Result<()> {
+        for entry in entries {
+            let chain = configured_chains
+                .iter()
+                .find(|chain| {
+                    chain.chain_id == entry.scope.chain_id
+                        && chain.railgun_contract == entry.scope.railgun_contract
+                })
+                .ok_or_else(|| {
+                    eyre!(
+                        "combined indexed manifest contains unconfigured chain {} ({})",
+                        entry.scope.chain_id,
+                        entry.scope.railgun_contract
+                    )
+                })?;
+            self.validate_chain_snapshot(chain, &entry.latest_indexed)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn publish_chain_entry(
         &self,
         chain: &ChainIndexedChainConfig,
-    ) -> Result<Option<IndexedArtifactChainEntry>> {
+    ) -> Result<Option<PublishedChainEntry>> {
         let scope = ChainScope {
             chain_type: ChainType::Evm,
             chain_id: chain.chain_id,
@@ -825,43 +927,90 @@ impl ChainIndexedPublicationScheduler {
         };
         let latest_indexed = self.latest_indexed_heights(chain).await?;
         let mut catalogs = Vec::new();
+        let mut artifact_cids = BTreeSet::new();
         for dataset in &chain.datasets {
             match dataset {
                 IndexedDatasetKind::PublicTxid => {
                     if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
-                        catalogs.extend(
-                            self.publish_public_txid_catalog(chain, &scope, max_block)
-                                .await?,
-                        );
+                        let published = self
+                            .publish_public_txid_catalog(chain, &scope, max_block)
+                            .await?;
+                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
                     }
                 }
                 IndexedDatasetKind::WalletScan => {
                     if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
-                        catalogs.extend(
-                            self.publish_wallet_scan_catalog(chain, &scope, max_block)
-                                .await?,
-                        );
+                        let published = self
+                            .publish_wallet_scan_catalog(chain, &scope, max_block)
+                            .await?;
+                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
                     }
                 }
                 IndexedDatasetKind::Commitments => {
-                    catalogs.extend(self.publish_commitment_catalog(chain, &scope).await?);
+                    if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
+                        let published = self
+                            .publish_commitment_catalog(chain, &scope, max_block)
+                            .await?;
+                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
+                    }
                 }
                 IndexedDatasetKind::MerkleCheckpoint => {
-                    catalogs.extend(
-                        self.publish_merkle_checkpoint_catalog(chain, &scope)
-                            .await?,
-                    );
+                    if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
+                        let published = self
+                            .publish_merkle_checkpoint_catalog(chain, &scope, max_block)
+                            .await?;
+                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
+                    }
                 }
             }
         }
+        self.validate_chain_snapshot(chain, &latest_indexed).await?;
         if catalogs.is_empty() {
             return Ok(None);
         }
-        Ok(Some(IndexedArtifactChainEntry {
-            scope,
-            latest_indexed,
-            catalogs,
+        Ok(Some(PublishedChainEntry {
+            entry: IndexedArtifactChainEntry {
+                scope,
+                latest_indexed,
+                catalogs,
+            },
+            artifact_cids: artifact_cids.into_iter().collect(),
         }))
+    }
+
+    async fn ensure_indexed_artifacts_available(&self, artifact_cids: &[String]) -> Result<()> {
+        for cid in artifact_cids {
+            let parsed = cid
+                .parse::<cid::Cid>()
+                .wrap_err_with(|| format!("parse indexed manifest artifact CID {cid}"))?;
+            if !self
+                .ipfs_client
+                .contains(&parsed)
+                .await
+                .wrap_err_with(|| format!("check indexed manifest artifact CID {cid}"))?
+            {
+                return Err(eyre!(
+                    "indexed manifest artifact CID {cid} is unavailable before manifest publication"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_chain_snapshot(
+        &self,
+        chain: &ChainIndexedChainConfig,
+        latest_indexed: &[LatestIndexedHeight],
+    ) -> Result<()> {
+        for height in latest_indexed {
+            let header = self
+                .store
+                .indexed_block_header(EVM_CHAIN_TYPE, chain.chain_id, height.block_number)
+                .await
+                .wrap_err("revalidate chain-indexed publication watermark")?;
+            validate_publication_watermark(height, header.as_ref())?;
+        }
+        Ok(())
     }
 
     async fn publish_public_txid_catalog(
@@ -869,7 +1018,7 @@ impl ChainIndexedPublicationScheduler {
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
         max_block: u64,
-    ) -> Result<Vec<IndexedArtifactDescriptor>> {
+    ) -> Result<Vec<PublishedCatalog>> {
         let mut offset = 0_u64;
         let mut chunks = Vec::new();
         loop {
@@ -922,7 +1071,6 @@ impl ChainIndexedPublicationScheduler {
                 published.descriptor = self
                     .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                     .await?;
-                self.record_chunk_descriptor(&published.descriptor).await?;
                 offset = published.descriptor.range.end.saturating_add(1);
                 chunks.push(published.descriptor);
             }
@@ -930,8 +1078,13 @@ impl ChainIndexedPublicationScheduler {
                 break;
             }
         }
-        self.publish_catalogs(scope, IndexedDatasetKind::PublicTxid, chunks)
-            .await
+        self.publish_catalogs(
+            scope,
+            IndexedDatasetKind::PublicTxid,
+            chunks,
+            CatalogCoverage::DerivedFromChunks,
+        )
+        .await
     }
 
     async fn public_txid_checkpoint_root(
@@ -1018,7 +1171,7 @@ impl ChainIndexedPublicationScheduler {
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
         max_block: u64,
-    ) -> Result<Vec<IndexedArtifactDescriptor>> {
+    ) -> Result<Vec<PublishedCatalog>> {
         if max_block < chain.start_block {
             return Ok(Vec::new());
         }
@@ -1055,21 +1208,34 @@ impl ChainIndexedPublicationScheduler {
             published.descriptor = self
                 .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                 .await?;
-            self.record_chunk_descriptor(&published.descriptor).await?;
             chunks.push(published.descriptor);
         }
-        self.publish_catalogs(scope, IndexedDatasetKind::WalletScan, chunks)
-            .await
+        self.publish_catalogs(
+            scope,
+            IndexedDatasetKind::WalletScan,
+            chunks,
+            CatalogCoverage::ExplicitBlockRange {
+                start_block: chain.start_block,
+                indexed_through_block: max_block,
+            },
+        )
+        .await
     }
 
     async fn publish_commitment_catalog(
         &self,
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
-    ) -> Result<Vec<IndexedArtifactDescriptor>> {
+        max_block: u64,
+    ) -> Result<Vec<PublishedCatalog>> {
         let summaries = self
             .store
-            .commitment_tree_summaries(EVM_CHAIN_TYPE, chain.chain_id, chain.railgun_contract)
+            .commitment_tree_summaries(
+                EVM_CHAIN_TYPE,
+                chain.chain_id,
+                chain.railgun_contract,
+                Some(max_block),
+            )
             .await
             .wrap_err("read commitment tree summaries for commitment publication")?;
         let mut max_position = None;
@@ -1110,6 +1276,7 @@ impl ChainIndexedPublicationScheduler {
                     chain.railgun_contract,
                     start_position,
                     end_position,
+                    Some(max_block),
                 )
                 .await
                 .wrap_err("read commitment rows for artifact publication")?;
@@ -1129,6 +1296,7 @@ impl ChainIndexedPublicationScheduler {
                         chain.railgun_contract,
                         planned.range.start,
                         planned.range.end,
+                        Some(max_block),
                     )
                     .await
                     .wrap_err("read planned commitment rows for artifact publication")?;
@@ -1141,23 +1309,33 @@ impl ChainIndexedPublicationScheduler {
                 published.descriptor = self
                     .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                     .await?;
-                self.record_chunk_descriptor(&published.descriptor).await?;
                 start_position = published.descriptor.range.end.saturating_add(1);
                 chunks.push(published.descriptor);
             }
         }
-        self.publish_catalogs(scope, IndexedDatasetKind::Commitments, chunks)
-            .await
+        self.publish_catalogs(
+            scope,
+            IndexedDatasetKind::Commitments,
+            chunks,
+            CatalogCoverage::DerivedFromChunks,
+        )
+        .await
     }
 
     async fn publish_merkle_checkpoint_catalog(
         &self,
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
-    ) -> Result<Vec<IndexedArtifactDescriptor>> {
+        max_block: u64,
+    ) -> Result<Vec<PublishedCatalog>> {
         let summaries = self
             .store
-            .commitment_tree_summaries(EVM_CHAIN_TYPE, chain.chain_id, chain.railgun_contract)
+            .commitment_tree_summaries(
+                EVM_CHAIN_TYPE,
+                chain.chain_id,
+                chain.railgun_contract,
+                Some(max_block),
+            )
             .await
             .wrap_err("read commitment tree summaries for checkpoint publication")?;
         let mut chunks = Vec::new();
@@ -1169,6 +1347,7 @@ impl ChainIndexedPublicationScheduler {
                     chain.chain_id,
                     chain.railgun_contract,
                     &summary,
+                    Some(max_block),
                 )
                 .await
                 .wrap_err("read commitment tree checkpoint leaves")?;
@@ -1187,11 +1366,15 @@ impl ChainIndexedPublicationScheduler {
             published.descriptor = self
                 .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                 .await?;
-            self.record_chunk_descriptor(&published.descriptor).await?;
             chunks.push(published.descriptor);
         }
-        self.publish_catalogs(scope, IndexedDatasetKind::MerkleCheckpoint, chunks)
-            .await
+        self.publish_catalogs(
+            scope,
+            IndexedDatasetKind::MerkleCheckpoint,
+            chunks,
+            CatalogCoverage::DerivedFromChunks,
+        )
+        .await
     }
 
     async fn publish_catalogs(
@@ -1199,11 +1382,13 @@ impl ChainIndexedPublicationScheduler {
         scope: &ChainScope,
         dataset_kind: IndexedDatasetKind,
         chunks: Vec<IndexedArtifactDescriptor>,
-    ) -> Result<Vec<IndexedArtifactDescriptor>> {
-        if chunks.is_empty() {
+        coverage: CatalogCoverage,
+    ) -> Result<Vec<PublishedCatalog>> {
+        if chunks.is_empty() && matches!(coverage, CatalogCoverage::DerivedFromChunks) {
             return Ok(Vec::new());
         }
-        let catalog = IndexedArtifactCatalog::new(dataset_kind, scope.clone(), chunks);
+        let (catalog, catalog_bytes, catalog_hash, mut descriptor) =
+            prepare_catalog_artifact(scope, dataset_kind, chunks, coverage)?;
         let chunk_count = catalog.chunks.len();
         let total_chunk_byte_size = catalog.chunks.iter().try_fold(0_u64, |total, chunk| {
             total
@@ -1216,13 +1401,6 @@ impl ChainIndexedPublicationScheduler {
             .map(|chunk| chunk.byte_size)
             .max()
             .unwrap_or(0);
-        let catalog_bytes = catalog
-            .deterministic_body_bytes()
-            .wrap_err("serialize indexed artifact catalog")?;
-        let byte_size = u64::try_from(catalog_bytes.len())
-            .wrap_err("indexed artifact catalog byte size overflow")?;
-        let catalog_hash = content_hash(&catalog_bytes);
-        let mut descriptor = catalog_descriptor(&catalog, "", byte_size, &catalog_hash)?;
         let catalog_cid = self
             .reuse_or_pin_indexed_artifact(
                 IndexedArtifactPublicationKind::Catalog,
@@ -1237,30 +1415,6 @@ impl ChainIndexedPublicationScheduler {
             .await
             .wrap_err("pin indexed artifact catalog")?;
         descriptor.cid = catalog_cid;
-        let catalog_cid = descriptor
-            .cid
-            .parse::<cid::Cid>()
-            .wrap_err_with(|| format!("parse indexed catalog CID {}", descriptor.cid))?;
-        let mut tx = self
-            .store
-            .begin()
-            .await
-            .wrap_err("begin indexed catalog audit transaction")?;
-        Audit::record_indexed_artifact_pin(
-            &mut tx,
-            IndexedArtifactPublicationKind::Catalog,
-            descriptor.dataset_kind,
-            &descriptor.scope,
-            &descriptor.range,
-            &catalog_cid,
-            descriptor.byte_size,
-            &catalog_hash,
-            descriptor.encoding_version,
-        )
-        .await
-        .wrap_err("record indexed catalog pin")?;
-        tx.commit().await.wrap_err("commit indexed catalog audit")?;
-
         info!(
             chain_id = scope.chain_id,
             railgun_contract = %scope.railgun_contract,
@@ -1269,11 +1423,20 @@ impl ChainIndexedPublicationScheduler {
             chunk_count,
             total_chunk_byte_size,
             max_chunk_byte_size,
-            byte_size,
+            byte_size = descriptor.byte_size,
             sha256 = %descriptor.sha256,
             "published indexed artifact catalog"
         );
-        Ok(vec![descriptor])
+        let mut artifact_cids = catalog
+            .chunks
+            .iter()
+            .map(|chunk| chunk.cid.clone())
+            .collect::<Vec<_>>();
+        artifact_cids.push(descriptor.cid.clone());
+        Ok(vec![PublishedCatalog {
+            descriptor,
+            artifact_cids,
+        }])
     }
 
     async fn reuse_or_pin_chunk(
@@ -1309,7 +1472,8 @@ impl ChainIndexedPublicationScheduler {
         format_version: u16,
         bytes: &[u8],
     ) -> Result<String> {
-        if let Some(cid) = Audit::live_indexed_artifact_cid(
+        let _pin_lifecycle = self.pin_lifecycle.lock().await;
+        let reusable = Audit::live_indexed_artifact_cid(
             self.store.pool(),
             artifact_kind,
             dataset_kind,
@@ -1320,12 +1484,52 @@ impl ChainIndexedPublicationScheduler {
             format_version,
         )
         .await
-        .wrap_err("lookup reusable indexed artifact CID")?
-        {
-            return Ok(cid.to_string());
-        }
+        .wrap_err("lookup reusable indexed artifact CID")?;
+        let cid = if let Some(cid) = reusable {
+            if self
+                .ipfs_client
+                .contains(&cid)
+                .await
+                .wrap_err("check reusable indexed artifact availability")?
+            {
+                cid
+            } else {
+                warn!(%cid, "reusable indexed artifact CID is missing; repinning");
+                self.pin_indexed_artifact(artifact_kind, bytes).await?
+            }
+        } else {
+            self.pin_indexed_artifact(artifact_kind, bytes).await?
+        };
+        let mut tx = self
+            .store
+            .begin()
+            .await
+            .wrap_err("begin indexed artifact audit transaction")?;
+        Audit::record_indexed_artifact_pin(
+            &mut tx,
+            artifact_kind,
+            dataset_kind,
+            scope,
+            range,
+            &cid,
+            byte_size,
+            content_hash,
+            format_version,
+        )
+        .await
+        .wrap_err("record indexed artifact pin")?;
+        tx.commit()
+            .await
+            .wrap_err("commit indexed artifact audit")?;
+        Ok(cid.to_string())
+    }
 
-        let cid = match artifact_kind {
+    async fn pin_indexed_artifact(
+        &self,
+        artifact_kind: IndexedArtifactPublicationKind,
+        bytes: &[u8],
+    ) -> Result<cid::Cid> {
+        match artifact_kind {
             IndexedArtifactPublicationKind::Chunk => {
                 pin_indexed_chunk(self.ipfs_client.as_ref(), bytes)
                     .await
@@ -1336,36 +1540,7 @@ impl ChainIndexedPublicationScheduler {
                     .await
                     .wrap_err("pin indexed artifact catalog")
             }
-        }?;
-        Ok(cid.to_string())
-    }
-
-    async fn record_chunk_descriptor(&self, descriptor: &IndexedArtifactDescriptor) -> Result<()> {
-        let cid = descriptor
-            .cid
-            .parse()
-            .wrap_err_with(|| format!("parse indexed chunk CID {}", descriptor.cid))?;
-        let hash = fixed_bytes(&descriptor.sha256);
-        let mut tx = self
-            .store
-            .begin()
-            .await
-            .wrap_err("begin indexed chunk audit transaction")?;
-        Audit::record_indexed_artifact_pin(
-            &mut tx,
-            IndexedArtifactPublicationKind::Chunk,
-            descriptor.dataset_kind,
-            &descriptor.scope,
-            &descriptor.range,
-            &cid,
-            descriptor.byte_size,
-            &hash,
-            descriptor.encoding_version,
-        )
-        .await
-        .wrap_err("record indexed chunk pin")?;
-        tx.commit().await.wrap_err("commit indexed chunk audit")?;
-        Ok(())
+        }
     }
 
     async fn latest_indexed_heights(
@@ -1418,9 +1593,61 @@ impl ChainIndexedPublicationScheduler {
     }
 }
 
+fn validate_publication_watermark(
+    height: &LatestIndexedHeight,
+    header: Option<&StoredIndexedBlockHeader>,
+) -> Result<()> {
+    let header = header.ok_or_else(|| {
+        eyre!(
+            "chain-indexed publication watermark {} for {:?} was rewound during publication",
+            height.block_number,
+            height.dataset_kind
+        )
+    })?;
+    if header.block_hash.as_slice() != height.block_hash.as_slice() {
+        return Err(eyre!(
+            "chain-indexed publication watermark {} for {:?} changed during publication",
+            height.block_number,
+            height.dataset_kind
+        ));
+    }
+    Ok(())
+}
+
 fn build_provider(rpc_url: &str) -> Result<RootProvider> {
     let url = url::Url::parse(rpc_url).wrap_err("parse RPC URL")?;
     Ok(ProviderBuilder::new().connect_http(url).root().clone())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CatalogCoverage {
+    DerivedFromChunks,
+    ExplicitBlockRange {
+        start_block: u64,
+        indexed_through_block: u64,
+    },
+}
+
+fn prepare_catalog_artifact(
+    scope: &ChainScope,
+    dataset_kind: IndexedDatasetKind,
+    chunks: Vec<IndexedArtifactDescriptor>,
+    coverage: CatalogCoverage,
+) -> Result<(
+    IndexedArtifactCatalog,
+    Vec<u8>,
+    [u8; 32],
+    IndexedArtifactDescriptor,
+)> {
+    let catalog = IndexedArtifactCatalog::new(dataset_kind, scope.clone(), chunks);
+    let catalog_bytes = catalog
+        .deterministic_body_bytes()
+        .wrap_err("serialize indexed artifact catalog")?;
+    let byte_size = u64::try_from(catalog_bytes.len())
+        .wrap_err("indexed artifact catalog byte size overflow")?;
+    let catalog_hash = content_hash(&catalog_bytes);
+    let descriptor = catalog_descriptor(&catalog, "", byte_size, &catalog_hash, coverage)?;
+    Ok((catalog, catalog_bytes, catalog_hash, descriptor))
 }
 
 fn catalog_descriptor(
@@ -1428,6 +1655,7 @@ fn catalog_descriptor(
     cid: &str,
     byte_size: u64,
     content_hash: &[u8; 32],
+    coverage: CatalogCoverage,
 ) -> Result<IndexedArtifactDescriptor> {
     let mut chunks = catalog.chunks.clone();
     chunks.sort_by(|left, right| {
@@ -1437,18 +1665,64 @@ fn catalog_descriptor(
             .then_with(|| left.range.end.cmp(&right.range.end))
             .then_with(|| left.cid.cmp(&right.cid))
     });
-    let first = chunks
-        .first()
-        .ok_or_else(|| eyre!("indexed artifact catalog cannot be empty"))?;
-    let last = chunks.last().expect("non-empty chunks checked above");
     if chunks
         .iter()
-        .any(|chunk| chunk.range.kind != first.range.kind || chunk.scope != catalog.scope)
+        .any(|chunk| chunk.dataset_kind != catalog.dataset_kind || chunk.scope != catalog.scope)
     {
         return Err(eyre!(
-            "indexed artifact catalog chunks have mixed scope or range kind"
+            "indexed artifact catalog chunks have mixed dataset or scope"
         ));
     }
+    let range = match coverage {
+        CatalogCoverage::DerivedFromChunks => {
+            let first = chunks
+                .first()
+                .ok_or_else(|| eyre!("indexed artifact catalog cannot be empty"))?;
+            let last = chunks.last().expect("non-empty chunks checked above");
+            if chunks
+                .iter()
+                .any(|chunk| chunk.range.kind != first.range.kind)
+            {
+                return Err(eyre!(
+                    "indexed artifact catalog chunks have mixed range kind"
+                ));
+            }
+            IndexedArtifactRange {
+                kind: first.range.kind,
+                start: first.range.start,
+                end: last.range.end,
+            }
+        }
+        CatalogCoverage::ExplicitBlockRange {
+            start_block,
+            indexed_through_block,
+        } => {
+            if catalog.dataset_kind != IndexedDatasetKind::WalletScan {
+                return Err(eyre!(
+                    "explicit block coverage is only supported for wallet-scan catalogs"
+                ));
+            }
+            if start_block > indexed_through_block {
+                return Err(eyre!(
+                    "indexed artifact catalog coverage start {start_block} exceeds indexed-through block {indexed_through_block}"
+                ));
+            }
+            if chunks.iter().any(|chunk| {
+                chunk.range.kind != IndexedArtifactRangeKind::Block
+                    || chunk.range.start < start_block
+                    || chunk.range.end > indexed_through_block
+            }) {
+                return Err(eyre!(
+                    "indexed artifact catalog chunk is outside explicit block coverage {start_block}-{indexed_through_block}"
+                ));
+            }
+            IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::Block,
+                start: start_block,
+                end: indexed_through_block,
+            }
+        }
+    };
     let row_count = chunks.iter().try_fold(0_u64, |total, chunk| {
         total
             .checked_add(chunk.row_count)
@@ -1466,15 +1740,28 @@ fn catalog_descriptor(
         .iter()
         .filter_map(|chunk| chunk.metadata.end_block)
         .max();
+    let (start_block, end_block, last_indexed_block, checkpoint_block) = match coverage {
+        CatalogCoverage::DerivedFromChunks => (
+            start_block,
+            end_block,
+            last_indexed_block,
+            last_indexed_block,
+        ),
+        CatalogCoverage::ExplicitBlockRange {
+            start_block,
+            indexed_through_block,
+        } => (
+            Some(start_block),
+            Some(indexed_through_block),
+            Some(indexed_through_block),
+            Some(indexed_through_block),
+        ),
+    };
 
     Ok(IndexedArtifactDescriptor {
         dataset_kind: catalog.dataset_kind,
         scope: catalog.scope.clone(),
-        range: IndexedArtifactRange {
-            kind: first.range.kind,
-            start: first.range.start,
-            end: last.range.end,
-        },
+        range,
         row_count,
         cid: cid.to_string(),
         sha256: FixedBytes::from(*content_hash),
@@ -1485,7 +1772,7 @@ fn catalog_descriptor(
             start_block,
             end_block,
             last_indexed_block,
-            checkpoint_block: last_indexed_block,
+            checkpoint_block,
             ..Default::default()
         },
     })
@@ -1539,7 +1826,7 @@ const fn store_dataset_kind(dataset: IndexedDatasetKind) -> StoreDatasetKind {
     }
 }
 
-fn fixed_bytes(value: &FixedBytes<32>) -> [u8; 32] {
+const fn fixed_bytes(value: &FixedBytes<32>) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     bytes.copy_from_slice(value.as_slice());
     bytes
@@ -1606,6 +1893,98 @@ fn provider_error(source: TransportError) -> eyre::Report {
 mod tests {
     use super::*;
     use alloy::primitives::Address;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn replacement_watermark_is_rejected_inside_publication_lease() {
+        let coordinator = ChainCanonicalityCoordinator::default();
+        let height = LatestIndexedHeight {
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            block_number: 200,
+            block_hash: FixedBytes::from([3_u8; 32]),
+        };
+        let replacement = StoredIndexedBlockHeader {
+            block_number: 200,
+            block_hash: [4_u8; 32],
+            parent_hash: [2_u8; 32],
+        };
+        let ipns_called = AtomicBool::new(false);
+
+        let _publication = coordinator.publication_lease().await;
+        let validation = validate_publication_watermark(&height, Some(&replacement));
+        if validation.is_ok() {
+            ipns_called.store(true, Ordering::SeqCst);
+        }
+
+        assert!(validation.is_err());
+        assert!(!ipns_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn publication_lease_blocks_reorg_until_release() {
+        let coordinator = ChainCanonicalityCoordinator::default();
+        let publication = coordinator.publication_lease().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let reorg_coordinator = coordinator.clone();
+        let reorg = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _reorg = reorg_coordinator.reorg_lease().await;
+            let _ = acquired_tx.send(());
+        });
+
+        started_rx.await.expect("reorg task started");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut acquired_rx)
+                .await
+                .is_err(),
+            "reorg must wait for publication lease"
+        );
+        let background_publication = publication.clone();
+        drop(publication);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut acquired_rx)
+                .await
+                .is_err(),
+            "cloned publication lease must not reacquire behind queued writer"
+        );
+        drop(background_publication);
+        tokio::time::timeout(Duration::from_secs(1), acquired_rx)
+            .await
+            .expect("reorg acquisition timeout")
+            .expect("reorg acquired notification");
+        reorg.await.expect("reorg task");
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_releases_canonicality_lease() {
+        let coordinator = ChainCanonicalityCoordinator::default();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let publication_coordinator = coordinator.clone();
+        let publication = tokio::spawn(async move {
+            let _publication = publication_coordinator.publication_lease().await;
+            let _ = acquired_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        acquired_rx.await.expect("publication acquired lease");
+
+        publication.abort();
+        let _ = publication.await;
+        tokio::time::timeout(Duration::from_secs(1), coordinator.reorg_lease())
+            .await
+            .expect("cancelled publication retained lease");
+    }
+
+    #[tokio::test]
+    async fn append_only_work_does_not_wait_for_publication_lease() {
+        let coordinator = ChainCanonicalityCoordinator::default();
+        let _publication = coordinator.publication_lease().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("append-only work was unexpectedly blocked");
+    }
 
     #[test]
     fn catalog_descriptor_summarizes_chunk_ranges_and_counts() -> Result<()> {
@@ -1620,7 +1999,13 @@ mod tests {
         ];
         let catalog = IndexedArtifactCatalog::new(IndexedDatasetKind::PublicTxid, scope, chunks);
 
-        let descriptor = catalog_descriptor(&catalog, "bafytestcatalog", 512, &[7_u8; 32])?;
+        let descriptor = catalog_descriptor(
+            &catalog,
+            "bafytestcatalog",
+            512,
+            &[7_u8; 32],
+            CatalogCoverage::DerivedFromChunks,
+        )?;
 
         assert_eq!(descriptor.dataset_kind, IndexedDatasetKind::PublicTxid);
         assert_eq!(descriptor.range.start, 0);
@@ -1631,6 +2016,151 @@ mod tests {
         assert_eq!(descriptor.metadata.start_block, Some(100));
         assert_eq!(descriptor.metadata.end_block, Some(110));
         assert_eq!(descriptor.metadata.last_indexed_block, Some(110));
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_catalog_descriptor_attests_sparse_deployment_to_checkpoint_coverage() -> Result<()> {
+        let scope = ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: 1,
+            railgun_contract: Address::from([0xbb; 20]),
+        };
+        let chunks = vec![
+            wallet_chunk_descriptor(scope.clone(), 14_751_290, 18_551_881, 40_574),
+            wallet_chunk_descriptor(scope.clone(), 18_551_907, 20_246_689, 40_496),
+        ];
+        let catalog =
+            IndexedArtifactCatalog::new(IndexedDatasetKind::WalletScan, scope, chunks.clone());
+
+        let descriptor = catalog_descriptor(
+            &catalog,
+            "bafywalletcatalog",
+            512,
+            &[8_u8; 32],
+            CatalogCoverage::ExplicitBlockRange {
+                start_block: 14_737_691,
+                indexed_through_block: 20_300_000,
+            },
+        )?;
+
+        assert_eq!(descriptor.range.kind, IndexedArtifactRangeKind::Block);
+        assert_eq!(descriptor.range.start, 14_737_691);
+        assert_eq!(descriptor.range.end, 20_300_000);
+        assert_eq!(descriptor.row_count, 81_070);
+        assert_eq!(descriptor.metadata.start_block, Some(14_737_691));
+        assert_eq!(descriptor.metadata.end_block, Some(20_300_000));
+        assert_eq!(descriptor.metadata.checkpoint_block, Some(20_300_000));
+        assert_eq!(descriptor.metadata.last_indexed_block, Some(20_300_000));
+        assert_eq!(catalog.chunks, chunks);
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_catalog_descriptor_attests_zero_row_coverage() -> Result<()> {
+        let scope = ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: 1,
+            railgun_contract: Address::from([0xbb; 20]),
+        };
+        let catalog =
+            IndexedArtifactCatalog::new(IndexedDatasetKind::WalletScan, scope, Vec::new());
+
+        let (prepared_catalog, catalog_bytes, catalog_hash, descriptor) = prepare_catalog_artifact(
+            &catalog.scope,
+            IndexedDatasetKind::WalletScan,
+            Vec::new(),
+            CatalogCoverage::ExplicitBlockRange {
+                start_block: 14_737_691,
+                indexed_through_block: 14_751_289,
+            },
+        )?;
+
+        assert_eq!(prepared_catalog, catalog);
+        assert_eq!(content_hash(&catalog_bytes), catalog_hash);
+        assert_eq!(
+            u64::try_from(catalog_bytes.len()).expect("catalog byte size"),
+            descriptor.byte_size
+        );
+        let decoded: IndexedArtifactCatalog =
+            serde_json::from_slice(&catalog_bytes).expect("decode empty catalog");
+        assert!(decoded.chunks.is_empty());
+        assert_eq!(descriptor.range.start, 14_737_691);
+        assert_eq!(descriptor.range.end, 14_751_289);
+        assert_eq!(descriptor.row_count, 0);
+        assert_eq!(descriptor.metadata.checkpoint_block, Some(14_751_289));
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_catalog_descriptor_rejects_invalid_or_out_of_range_coverage() {
+        let scope = ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: 1,
+            railgun_contract: Address::from([0xbb; 20]),
+        };
+        let catalog = IndexedArtifactCatalog::new(
+            IndexedDatasetKind::WalletScan,
+            scope.clone(),
+            vec![wallet_chunk_descriptor(scope, 150, 180, 1)],
+        );
+
+        let invalid = catalog_descriptor(
+            &catalog,
+            "bafywalletcatalog",
+            64,
+            &[9_u8; 32],
+            CatalogCoverage::ExplicitBlockRange {
+                start_block: 200,
+                indexed_through_block: 100,
+            },
+        )
+        .expect_err("invalid coverage rejected");
+        assert!(invalid.to_string().contains("coverage start"));
+
+        let outside = catalog_descriptor(
+            &catalog,
+            "bafywalletcatalog",
+            64,
+            &[9_u8; 32],
+            CatalogCoverage::ExplicitBlockRange {
+                start_block: 151,
+                indexed_through_block: 200,
+            },
+        )
+        .expect_err("out-of-range chunk rejected");
+        assert!(
+            outside
+                .to_string()
+                .contains("outside explicit block coverage")
+        );
+    }
+
+    #[test]
+    fn publication_watermark_rejects_rewind_or_replacement_hash() -> Result<()> {
+        let height = LatestIndexedHeight {
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            block_number: 200,
+            block_hash: FixedBytes::from([3_u8; 32]),
+        };
+        let matching = StoredIndexedBlockHeader {
+            block_number: 200,
+            block_hash: [3_u8; 32],
+            parent_hash: [2_u8; 32],
+        };
+        validate_publication_watermark(&height, Some(&matching))?;
+
+        let rewound =
+            validate_publication_watermark(&height, None).expect_err("rewound watermark rejected");
+        assert!(rewound.to_string().contains("was rewound"));
+
+        let replacement = StoredIndexedBlockHeader {
+            block_hash: [4_u8; 32],
+            ..matching
+        };
+        let changed = validate_publication_watermark(&height, Some(&replacement))
+            .expect_err("replacement watermark rejected");
+        assert!(changed.to_string().contains("changed during publication"));
         Ok(())
     }
 
@@ -1684,6 +2214,34 @@ mod tests {
                 start_block: Some(block),
                 end_block: Some(block),
                 last_indexed_block: Some(block),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn wallet_chunk_descriptor(
+        scope: ChainScope,
+        start: u64,
+        end: u64,
+        row_count: u64,
+    ) -> IndexedArtifactDescriptor {
+        IndexedArtifactDescriptor {
+            dataset_kind: IndexedDatasetKind::WalletScan,
+            scope,
+            range: IndexedArtifactRange {
+                kind: IndexedArtifactRangeKind::Block,
+                start,
+                end,
+            },
+            row_count,
+            cid: format!("bafywalletchunk{start}"),
+            sha256: FixedBytes::from([2_u8; 32]),
+            byte_size: 128,
+            encoding_version: 1,
+            compression: CompressionAlgorithm::Zstd,
+            metadata: DatasetDescriptorMetadata {
+                checkpoint_block: Some(end),
+                last_indexed_block: Some(end),
                 ..Default::default()
             },
         }

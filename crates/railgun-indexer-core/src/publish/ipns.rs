@@ -1,3 +1,4 @@
+use crate::audit::ChainCanonicalityLease;
 use crate::config::Config;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
@@ -111,6 +112,7 @@ struct PublishRequest {
     not_before: time::Instant,
     attempts_started: u32,
     response: oneshot::Sender<Result<IpnsPublication, IpnsError>>,
+    canonicality_lease: Option<ChainCanonicalityLease>,
 }
 
 impl IpnsPublisher {
@@ -151,6 +153,26 @@ impl IpnsPublisher {
         manifest_cid: &str,
         sequence: u64,
     ) -> Result<IpnsPublication, IpnsError> {
+        self.publish_manifest_cid_inner(manifest_cid, sequence, None)
+            .await
+    }
+
+    pub async fn publish_manifest_cid_with_lease(
+        &self,
+        manifest_cid: &str,
+        sequence: u64,
+        canonicality_lease: ChainCanonicalityLease,
+    ) -> Result<IpnsPublication, IpnsError> {
+        self.publish_manifest_cid_inner(manifest_cid, sequence, Some(canonicality_lease))
+            .await
+    }
+
+    async fn publish_manifest_cid_inner(
+        &self,
+        manifest_cid: &str,
+        sequence: u64,
+        canonicality_lease: Option<ChainCanonicalityLease>,
+    ) -> Result<IpnsPublication, IpnsError> {
         let (response_tx, response_rx) = oneshot::channel();
         let deadline = time::Instant::now() + self.publish_timeout;
         let request = PublishRequest {
@@ -161,6 +183,7 @@ impl IpnsPublisher {
             not_before: time::Instant::now(),
             attempts_started: 0,
             response: response_tx,
+            canonicality_lease,
         };
 
         time::timeout_at(deadline, self.requests.send(request))
@@ -260,6 +283,10 @@ struct ActivePublish {
 impl PublishRequest {
     fn is_expired(&self, now: time::Instant) -> bool {
         now >= self.deadline
+    }
+
+    fn may_expire_while_active(&self, now: time::Instant) -> bool {
+        self.canonicality_lease.is_none() && self.is_expired(now)
     }
 
     fn respond(self, result: Result<IpnsPublication, IpnsError>) {
@@ -558,7 +585,8 @@ fn handle_swarm_event(
 }
 
 fn expire_active_publish(active: &mut Option<ActivePublish>, now: time::Instant) {
-    let Some(publish) = active.take_if(|publish| publish.request.is_expired(now)) else {
+    let Some(publish) = active.take_if(|publish| publish.request.may_expire_while_active(now))
+    else {
         return;
     };
     debug!(
@@ -600,7 +628,9 @@ fn next_publish_wake(
     active: Option<&ActivePublish>,
     now: time::Instant,
 ) -> Option<time::Instant> {
-    let mut wake = active.map(|publish| publish.request.deadline);
+    let mut wake = active
+        .filter(|publish| publish.request.canonicality_lease.is_none())
+        .map(|publish| publish.request.deadline);
     for request in pending {
         if request.response.is_closed() {
             continue;
@@ -948,6 +978,7 @@ mod tests {
             not_before: now,
             attempts_started: 0,
             response: response_tx,
+            canonicality_lease: None,
         }]);
 
         discard_unpublishable_pending(&mut pending, now + Duration::from_millis(1));
@@ -957,6 +988,38 @@ mod tests {
             Err(IpnsError::Timeout(actual_timeout)) => assert_eq!(actual_timeout, timeout),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn active_request_with_canonicality_lease_outlives_caller_deadline() {
+        let now = time::Instant::now();
+        let timeout = Duration::from_secs(1);
+        let coordinator = crate::audit::ChainCanonicalityCoordinator::default();
+        let lease = coordinator.publication_lease().await;
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        let request = PublishRequest {
+            manifest_cid: EMPTY_RAW_CID.to_string(),
+            sequence: 1,
+            timeout,
+            deadline: now,
+            not_before: now,
+            attempts_started: 1,
+            response: response_tx,
+            canonicality_lease: Some(lease),
+        };
+
+        assert!(!request.may_expire_while_active(now));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), coordinator.reorg_lease())
+                .await
+                .is_err(),
+            "active request must retain canonicality lease"
+        );
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(1), coordinator.reorg_lease())
+            .await
+            .expect("lease was not released with active request");
     }
 
     #[test]
@@ -973,6 +1036,7 @@ mod tests {
             not_before: now,
             attempts_started: 0,
             response: response_tx,
+            canonicality_lease: None,
         }]);
 
         discard_unpublishable_pending(&mut pending, now);
@@ -1001,6 +1065,7 @@ mod tests {
             not_before: now,
             attempts_started: 3,
             response: response_tx,
+            canonicality_lease: None,
         };
 
         let retry_at = next_retry_at(&request, now).expect("retry should fit before deadline");
@@ -1022,6 +1087,7 @@ mod tests {
             not_before: now,
             attempts_started: 1,
             response: response_tx,
+            canonicality_lease: None,
         };
 
         assert_eq!(next_retry_at(&request, now), None);
@@ -1040,6 +1106,7 @@ mod tests {
             not_before: now + Duration::from_secs(2),
             attempts_started: 1,
             response: response_tx,
+            canonicality_lease: None,
         }]);
 
         assert_eq!(

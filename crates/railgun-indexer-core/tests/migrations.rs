@@ -8,7 +8,9 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 use cid::Cid;
 use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
-use railgun_indexer_core::audit::{Audit, IndexedArtifactPublicationKind, Retention};
+use railgun_indexer_core::audit::{
+    Audit, IndexedArtifactPublicationKind, PinLifecycleCoordinator, Retention,
+};
 use railgun_indexer_core::chain_logs::{
     IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment, IndexedLogBatch,
     IndexedLogSource, IndexedNullifier, IndexedPublicTransaction, IndexedShieldCommitment,
@@ -25,10 +27,12 @@ use railgun_indexer_core::store::{
     run_migrations,
 };
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tokio::sync::Notify;
 
 #[tokio::test]
 async fn migrations_apply_and_tables_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
@@ -389,7 +393,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     .execute(&pool)
     .await?;
     sqlx::query(
-        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 9, now())",
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 11, now())",
     )
     .execute(&pool)
     .await?;
@@ -397,8 +401,99 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     run_migrations(&pool).await?;
 
     assert!(!table_exists(&pool, "poi_events").await?);
-    assert_eq!(schema_version(&pool).await?, 9);
+    assert_eq!(schema_version(&pool).await?, 11);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn v11_conservatively_backfills_active_manifest_artifact_references()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V11 manifest reference migration test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+
+    sqlx::query("DROP TABLE published_indexed_manifest_artifacts")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE poi_indexer_schema_version SET version = 10 WHERE id = TRUE")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        r"
+        INSERT INTO published_indexed_artifacts (
+            artifact_kind, dataset_kind, chain_type, chain_id, railgun_contract,
+            range_kind, range_start, range_end, cid, byte_size, content_hash, format_version
+        ) VALUES ('chunk', 'wallet_scan', 0, 1, '0x0000000000000000000000000000000000000001',
+            'block', 100, 200, 'artifact-cid', 128, $1, 1)
+        ",
+    )
+    .bind([1_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r"
+        INSERT INTO published_indexed_manifests (
+            cid, ipns_sequence, byte_size, content_hash, format_version, ipns_published_at
+        ) VALUES ('manifest-cid', 1, 96, $1, 1, now())
+        ",
+    )
+    .bind([2_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+
+    run_migrations(&pool).await?;
+
+    assert_eq!(schema_version(&pool).await?, 11);
+    let references: Vec<(String, String)> = sqlx::query_as(
+        r"
+        SELECT manifest.cid, reference.artifact_cid
+        FROM published_indexed_manifest_artifacts AS reference
+        JOIN published_indexed_manifests AS manifest ON manifest.id = reference.manifest_id
+        ",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        references,
+        vec![("manifest-cid".to_string(), "artifact-cid".to_string())]
+    );
+
+    let missing_manifest_cid = raw_block_cid(b"manifest with missing artifact")?;
+    let mut tx = pool.begin().await?;
+    let missing = Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &missing_manifest_cid,
+        &["missing-artifact-cid".to_string()],
+        2,
+        96,
+        &[3_u8; 32],
+        1,
+    )
+    .await
+    .expect_err("manifest with missing artifact rejected");
+    assert!(matches!(
+        missing,
+        railgun_indexer_core::audit::AuditError::MissingIndexedManifestArtifacts {
+            expected: 1,
+            actual: 0,
+        }
+    ));
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -610,14 +705,16 @@ async fn commitment_tree_checkpoint_fills_sparse_hash_only_transact_leaves()
     assert_eq!(wallet_scan_rows.transact_commitments[0].tree_position, 0);
 
     let summaries = store
-        .commitment_tree_summaries(0, 1, railgun_contract)
+        .commitment_tree_summaries(0, 1, railgun_contract, None)
         .await?;
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].tree_number, 0);
     assert_eq!(summaries[0].leaf_count, 3);
-    assert_eq!(summaries[0].last_indexed_block, 100);
+    assert_eq!(summaries[0].last_indexed_block, 102);
 
-    let rows = store.commitment_rows(0, 1, railgun_contract, 0, 2).await?;
+    let rows = store
+        .commitment_rows(0, 1, railgun_contract, 0, 2, None)
+        .await?;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].tree_position, 0);
     assert_eq!(rows[1].tree_position, 2);
@@ -628,12 +725,30 @@ async fn commitment_tree_checkpoint_fills_sparse_hash_only_transact_leaves()
     assert_eq!(rows[0].commitment_hash, [0x30_u8; 32]);
     assert_eq!(rows[1].commitment_hash, [0x32_u8; 32]);
 
+    let bounded_summaries = store
+        .commitment_tree_summaries(0, 1, railgun_contract, Some(100))
+        .await?;
+    assert_eq!(bounded_summaries.len(), 1);
+    assert_eq!(bounded_summaries[0].leaf_count, 1);
+    assert_eq!(bounded_summaries[0].last_indexed_block, 100);
+    let bounded_rows = store
+        .commitment_rows(0, 1, railgun_contract, 0, 2, Some(100))
+        .await?;
+    assert_eq!(bounded_rows.len(), 1);
+    assert_eq!(bounded_rows[0].tree_position, 0);
+    let bounded_checkpoint = store
+        .commitment_tree_checkpoint(0, 1, railgun_contract, &bounded_summaries[0], Some(100))
+        .await?;
+    assert_eq!(bounded_checkpoint.leaf_count, 1);
+    assert_eq!(bounded_checkpoint.last_indexed_block, 100);
+    assert_eq!(bounded_checkpoint.leaves, vec![[0x30_u8; 32]]);
+
     let checkpoint = store
-        .commitment_tree_checkpoint(0, 1, railgun_contract, &summaries[0])
+        .commitment_tree_checkpoint(0, 1, railgun_contract, &summaries[0], None)
         .await?;
     assert_eq!(checkpoint.tree_number, 0);
     assert_eq!(checkpoint.leaf_count, 3);
-    assert_eq!(checkpoint.last_indexed_block, 100);
+    assert_eq!(checkpoint.last_indexed_block, 102);
     assert_eq!(
         checkpoint.leaves,
         vec![
@@ -1184,12 +1299,21 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         1,
     )
     .await?;
-    Audit::record_indexed_manifest_pin(&mut tx, &old_indexed_manifest_cid, 20, 96, &[22_u8; 32], 1)
-        .await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &old_indexed_manifest_cid,
+        &[],
+        20,
+        96,
+        &[22_u8; 32],
+        1,
+    )
+    .await?;
     Audit::record_indexed_manifest_ipns_publication(&mut tx, &old_indexed_manifest_cid).await?;
     Audit::record_indexed_manifest_pin(
         &mut tx,
         &new_indexed_manifest_cid,
+        &[],
         21,
         112,
         &[23_u8; 32],
@@ -1409,6 +1533,7 @@ async fn retention_expires_deltas_only_after_covering_base_ages()
     let upstream_url = "https://ppoi.example.invalid";
     let old_base_cid = raw_block_cid(b"expiry old base")?;
     let retained_delta_cid = raw_block_cid(b"expiry retained delta")?;
+    let old_covering_base_cid = raw_block_cid(b"expiry old covering base")?;
     let new_base_cid = raw_block_cid(b"expiry new base")?;
 
     let mut tx = store.begin().await?;
@@ -1450,9 +1575,24 @@ async fn retention_expires_deltas_only_after_covering_base_ages()
         SnapshotKind::Base,
         0,
         9,
+        &old_covering_base_cid,
+        384,
+        &[33_u8; 32],
+        1,
+        &[42_u8; 32],
+    )
+    .await?;
+    Audit::record_publication(
+        &mut tx,
+        &list_key,
+        1,
+        upstream_url,
+        SnapshotKind::Base,
+        0,
+        9,
         &new_base_cid,
         512,
-        &[33_u8; 32],
+        &[34_u8; 32],
         1,
         &[42_u8; 32],
     )
@@ -1469,7 +1609,15 @@ async fn retention_expires_deltas_only_after_covering_base_ages()
 
     sqlx::query(
         "UPDATE published_snapshots \
-         SET published_at = to_timestamp(100) \
+         SET published_at = to_timestamp(100), superseded_at = to_timestamp(160) \
+         WHERE cid = $1",
+    )
+    .bind(old_covering_base_cid.to_string())
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE published_snapshots \
+         SET published_at = to_timestamp(180) \
          WHERE cid = $1",
     )
     .bind(new_base_cid.to_string())
@@ -1500,15 +1648,357 @@ async fn retention_expires_deltas_only_after_covering_base_ages()
         Duration::from_secs(50),
     )
     .await?;
-    assert_eq!(
-        sorted_cids(second_sweep.unpinned_cids),
-        vec![retained_delta_cid.to_string()]
+    let mut expected = vec![
+        old_covering_base_cid.to_string(),
+        retained_delta_cid.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(sorted_cids(second_sweep.unpinned_cids), expected);
+    assert_eq!(ipfs_client.unpinned_cids(), expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_prunes_stale_indexed_artifacts() -> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping indexed artifact retention test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
     );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+
+    let store = Store::new(pool.clone());
+    let scope = indexed_scope();
+    let stale_cid = raw_block_cid(b"stale indexed artifact")?;
+    let fresh_cid = raw_block_cid(b"fresh indexed artifact")?;
+    let shared_cid = raw_block_cid(b"shared indexed artifact")?;
+    let active_catalog_cid = raw_block_cid(b"active indexed catalog")?;
+    let active_chunk_cid = raw_block_cid(b"active indexed chunk")?;
+    let active_indexed_manifest_cid = raw_block_cid(b"active indexed manifest")?;
+    let pending_catalog_cid = raw_block_cid(b"pending indexed catalog")?;
+    let pending_indexed_manifest_cid = raw_block_cid(b"pending indexed manifest")?;
+    let stale_range = indexed_block_range(0, 9);
+    let fresh_range = indexed_block_range(10, 19);
+    let shared_stale_range = indexed_block_range(20, 29);
+    let shared_fresh_range = indexed_block_range(30, 39);
+    let active_catalog_range = indexed_block_range(40, 49);
+    let active_chunk_range = indexed_block_range(50, 59);
+    let pending_catalog_range = indexed_block_range(60, 69);
+
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &stale_range,
+        &stale_cid,
+        128,
+        &[31_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &fresh_range,
+        &fresh_cid,
+        128,
+        &[32_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &shared_stale_range,
+        &shared_cid,
+        128,
+        &[33_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &shared_fresh_range,
+        &shared_cid,
+        128,
+        &[33_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &active_catalog_range,
+        &active_catalog_cid,
+        128,
+        &[34_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &active_chunk_range,
+        &active_chunk_cid,
+        128,
+        &[35_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &active_indexed_manifest_cid,
+        &[active_catalog_cid.to_string(), active_chunk_cid.to_string()],
+        10,
+        96,
+        &[36_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &active_indexed_manifest_cid).await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Catalog,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &pending_catalog_range,
+        &pending_catalog_cid,
+        128,
+        &[37_u8; 32],
+        1,
+    )
+    .await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &pending_indexed_manifest_cid,
+        &[pending_catalog_cid.to_string()],
+        11,
+        96,
+        &[38_u8; 32],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+
+    for range_start in [0_i64, 20, 40, 50, 60] {
+        sqlx::query(
+            "UPDATE published_indexed_artifacts \
+             SET published_at = to_timestamp(100), last_referenced_at = to_timestamp(100) \
+             WHERE range_start = $1",
+        )
+        .bind(range_start)
+        .execute(&pool)
+        .await?;
+    }
+    for range_start in [10_i64, 30] {
+        sqlx::query(
+            "UPDATE published_indexed_artifacts \
+             SET published_at = to_timestamp(180), last_referenced_at = to_timestamp(180) \
+             WHERE range_start = $1",
+        )
+        .bind(range_start)
+        .execute(&pool)
+        .await?;
+    }
+
+    let ipfs_client = RecordingIpfsClient::default();
+    let sweep = Retention::sweep(
+        &pool,
+        &ipfs_client,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+    let expected = vec![stale_cid.to_string()];
+    assert_eq!(sorted_cids(sweep.unpinned_cids), expected);
+    assert_eq!(ipfs_client.unpinned_cids(), expected);
+
+    let stale_unpinned_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM published_indexed_artifacts \
+         WHERE cid = $1 AND unpinned_at IS NOT NULL",
+    )
+    .bind(stale_cid.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stale_unpinned_count, 1);
+
+    let preserved_unpinned_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM published_indexed_artifacts \
+         WHERE (cid = $1 OR cid = $2 OR cid = $3 OR cid = $4 OR cid = $5) \
+              AND unpinned_at IS NOT NULL",
+    )
+    .bind(fresh_cid.to_string())
+    .bind(shared_cid.to_string())
+    .bind(active_catalog_cid.to_string())
+    .bind(active_chunk_cid.to_string())
+    .bind(pending_catalog_cid.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(preserved_unpinned_count, 0);
+
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &pending_indexed_manifest_cid).await?;
+    tx.commit().await?;
+    let superseded_sweep = Retention::sweep(
+        &pool,
+        &ipfs_client,
+        UNIX_EPOCH + Duration::from_mins(5),
+        Duration::from_secs(200),
+    )
+    .await?;
+    let mut expected_superseded =
+        vec![active_catalog_cid.to_string(), active_chunk_cid.to_string()];
+    expected_superseded.sort();
     assert_eq!(
-        ipfs_client.unpinned_cids(),
-        vec![retained_delta_cid.to_string()]
+        sorted_cids(superseded_sweep.unpinned_cids),
+        expected_superseded
+    );
+    assert!(
+        !ipfs_client
+            .unpinned_cids()
+            .contains(&pending_catalog_cid.to_string())
     );
 
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &stale_range,
+        &stale_cid,
+        128,
+        &[31_u8; 32],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    let repinned_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM published_indexed_artifacts \
+         WHERE cid = $1 AND unpinned_at IS NULL",
+    )
+    .bind(stale_cid.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(repinned_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_first_forces_concurrent_reuse_to_observe_unpinned_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping indexed artifact retention race test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+
+    let store = Store::new(pool.clone());
+    let scope = indexed_scope();
+    let range = indexed_block_range(0, 9);
+    let cid = raw_block_cid(b"retention race artifact")?;
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &scope,
+        &range,
+        &cid,
+        128,
+        &[41_u8; 32],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    sqlx::query("UPDATE published_indexed_artifacts SET last_referenced_at = to_timestamp(100)")
+        .execute(&pool)
+        .await?;
+
+    let coordinator = PinLifecycleCoordinator::default();
+    let ipfs_client = Arc::new(BlockingUnpinIpfsClient::default());
+    let retention_pool = pool.clone();
+    let retention_coordinator = coordinator.clone();
+    let retention_client = Arc::clone(&ipfs_client);
+    let retention = tokio::spawn(async move {
+        Retention::sweep_with_coordinator(
+            &retention_pool,
+            retention_client.as_ref(),
+            UNIX_EPOCH + Duration::from_secs(200),
+            Duration::from_secs(50),
+            &retention_coordinator,
+        )
+        .await
+    });
+    ipfs_client.unpin_entered.notified().await;
+
+    let reuse_pool = pool.clone();
+    let reuse_coordinator = coordinator.clone();
+    let reuse_scope = scope.clone();
+    let mut reuse = tokio::spawn(async move {
+        let _pin_lifecycle = reuse_coordinator.lock().await;
+        Audit::live_indexed_artifact_cid(
+            &reuse_pool,
+            IndexedArtifactPublicationKind::Chunk,
+            ManifestIndexedDatasetKind::WalletScan,
+            &reuse_scope,
+            &range,
+            128,
+            &[41_u8; 32],
+            1,
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut reuse)
+            .await
+            .is_err(),
+        "reuse must wait while retention owns the pin lifecycle"
+    );
+
+    ipfs_client.allow_unpin.notify_one();
+    let sweep = retention.await??;
+    assert_eq!(sweep.unpinned_cids, vec![cid]);
+    assert_eq!(reuse.await??, None);
+    assert!(!ipfs_client.pinned.load(Ordering::SeqCst));
     Ok(())
 }
 
@@ -1577,6 +2067,14 @@ fn indexed_scope() -> ChainScope {
         railgun_contract: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             .parse()
             .expect("scope address"),
+    }
+}
+
+const fn indexed_block_range(start: u64, end: u64) -> IndexedArtifactRange {
+    IndexedArtifactRange {
+        kind: IndexedArtifactRangeKind::Block,
+        start,
+        end,
     }
 }
 
@@ -1660,7 +2158,7 @@ fn sparse_commitment_batch() -> IndexedLogBatch {
                 tree_position: 2,
                 hash: AlloyFixedBytes::from([0x32; 32]),
                 ciphertext: None,
-                source: indexed_source_at(100, 1),
+                source: indexed_source_at(102, 1),
             },
         ],
         public_transactions: vec![IndexedPublicTransaction {
@@ -1741,6 +2239,46 @@ const fn token_data() -> TokenData {
 #[derive(Debug, Default)]
 struct RecordingIpfsClient {
     unpinned: Mutex<Vec<Cid>>,
+}
+
+#[derive(Debug)]
+struct BlockingUnpinIpfsClient {
+    unpin_entered: Notify,
+    allow_unpin: Notify,
+    pinned: AtomicBool,
+}
+
+impl Default for BlockingUnpinIpfsClient {
+    fn default() -> Self {
+        Self {
+            unpin_entered: Notify::new(),
+            allow_unpin: Notify::new(),
+            pinned: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait]
+impl IpfsClient for BlockingUnpinIpfsClient {
+    fn service_name(&self) -> &'static str {
+        "blocking-unpin"
+    }
+
+    async fn pin_bytes(&self, bytes: &[u8]) -> Result<Cid, IpfsError> {
+        self.pinned.store(true, Ordering::SeqCst);
+        raw_block_cid(bytes)
+    }
+
+    async fn unpin(&self, _cid: &Cid) -> Result<(), IpfsError> {
+        self.unpin_entered.notify_one();
+        self.allow_unpin.notified().await;
+        self.pinned.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn contains(&self, _cid: &Cid) -> Result<bool, IpfsError> {
+        Ok(self.pinned.load(Ordering::SeqCst))
+    }
 }
 
 impl RecordingIpfsClient {

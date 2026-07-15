@@ -5,7 +5,9 @@ use axum::{Json, Router};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use eyre::{Result, WrapErr, eyre};
-use railgun_indexer_core::audit::{Audit, Retention};
+use railgun_indexer_core::audit::{
+    Audit, ChainCanonicalityCoordinator, PinLifecycleCoordinator, Retention,
+};
 use railgun_indexer_core::blocked::content_hash;
 use railgun_indexer_core::config::Config;
 use railgun_indexer_core::manifest::{
@@ -181,6 +183,8 @@ async fn run_background_tasks(
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    let pin_lifecycle = PinLifecycleCoordinator::default();
+    let chain_canonicality = ChainCanonicalityCoordinator::default();
 
     tasks.spawn({
         let shutdown = shutdown_rx.clone();
@@ -228,6 +232,7 @@ async fn run_background_tasks(
             publisher_key,
             ipns_publisher,
             status.clone(),
+            pin_lifecycle.clone(),
         );
         let shutdown = shutdown_rx.clone();
         async move {
@@ -241,8 +246,9 @@ async fn run_background_tasks(
             let config = config.clone();
             let store = store.clone();
             let shutdown = shutdown_rx.clone();
+            let chain_canonicality = chain_canonicality.clone();
             async move {
-                chain_indexed::run_indexing_loop(config, store, shutdown)
+                chain_indexed::run_indexing_loop(config, store, chain_canonicality, shutdown)
                     .await
                     .wrap_err("chain-indexed RPC indexing task")
             }
@@ -252,6 +258,8 @@ async fn run_background_tasks(
             let store = store.clone();
             let ipfs_pinner = ipfs_pinner.clone();
             let shutdown = shutdown_rx.clone();
+            let pin_lifecycle = pin_lifecycle.clone();
+            let chain_canonicality = chain_canonicality.clone();
             async move {
                 chain_indexed::run_publication_loop(
                     config,
@@ -259,6 +267,8 @@ async fn run_background_tasks(
                     ipfs_pinner,
                     chain_indexed_publisher_key,
                     chain_indexed_ipns_publisher,
+                    pin_lifecycle,
+                    chain_canonicality,
                     shutdown,
                 )
                 .await
@@ -272,10 +282,17 @@ async fn run_background_tasks(
         let retention_interval =
             checked_interval(*config.retention_interval, "retention_interval")?;
         let shutdown = shutdown_rx.clone();
+        let pin_lifecycle = pin_lifecycle.clone();
         async move {
-            run_retention_sweeper(store, ipfs_pinner, retention_interval, shutdown)
-                .await
-                .wrap_err("retention sweeper task")
+            run_retention_sweeper(
+                store,
+                ipfs_pinner,
+                retention_interval,
+                pin_lifecycle,
+                shutdown,
+            )
+            .await
+            .wrap_err("retention sweeper task")
         }
     });
     tasks.spawn({
@@ -357,6 +374,7 @@ async fn run_retention_sweeper(
     store: Store,
     ipfs_client: Arc<dyn IpfsClient>,
     retention_interval: Duration,
+    pin_lifecycle: PinLifecycleCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let sweep_interval = retention_interval.min(RETENTION_SWEEP_INTERVAL_CAP);
@@ -366,11 +384,12 @@ async fn run_retention_sweeper(
             return Ok(());
         }
 
-        match Retention::sweep(
+        match Retention::sweep_with_coordinator(
             store.pool(),
             ipfs_client.as_ref(),
             SystemTime::now(),
             retention_interval,
+            &pin_lifecycle,
         )
         .await
         {
@@ -393,6 +412,7 @@ struct PublicationScheduler {
     signing_key: SigningKey,
     ipns_publisher: IpnsPublisher,
     status: SharedStatus,
+    pin_lifecycle: PinLifecycleCoordinator,
     last_manifest_cid: Option<String>,
     manifest_needs_publish: bool,
     last_ipns_publish_at: Option<SystemTime>,
@@ -413,6 +433,7 @@ impl PublicationScheduler {
         signing_key: SigningKey,
         ipns_publisher: IpnsPublisher,
         status: SharedStatus,
+        pin_lifecycle: PinLifecycleCoordinator,
     ) -> Self {
         let lifecycle = Lifecycle::new(
             store.clone(),
@@ -429,6 +450,7 @@ impl PublicationScheduler {
             signing_key,
             ipns_publisher,
             status,
+            pin_lifecycle,
             last_manifest_cid: None,
             manifest_needs_publish: true,
             last_ipns_publish_at: None,
@@ -624,6 +646,7 @@ impl PublicationScheduler {
                 .await
                 .wrap_err("build delta snapshot")?,
         };
+        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
         let cid = pin_snapshot_file(self.ipfs_client.as_ref(), &bytes)
             .await
             .wrap_err("pin snapshot to IPFS")?;
@@ -654,6 +677,7 @@ impl PublicationScheduler {
         tx.commit()
             .await
             .wrap_err("commit snapshot publication audit")?;
+        drop(pin_lifecycle_guard);
 
         info!(
             list_key = %list_key_hex(list_key),
@@ -706,6 +730,7 @@ impl PublicationScheduler {
             );
         }
 
+        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
         let cid = pin_blocked_shields(self.ipfs_client.as_ref(), &bytes)
             .await
             .wrap_err("pin blocked-shields artifact to IPFS")?;
@@ -732,6 +757,7 @@ impl PublicationScheduler {
         tx.commit()
             .await
             .wrap_err("commit blocked-shields publication audit")?;
+        drop(pin_lifecycle_guard);
 
         info!(
             list_key = %list_key_hex(list_key),
@@ -765,6 +791,7 @@ impl PublicationScheduler {
         let byte_size =
             u64::try_from(manifest_bytes.len()).wrap_err("manifest byte size overflow")?;
         let manifest_hash = content_hash(&manifest_bytes);
+        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
         let manifest_cid = pin_manifest(self.ipfs_client.as_ref(), &manifest_bytes)
             .await
             .wrap_err("pin manifest to IPFS")?;
@@ -798,6 +825,7 @@ impl PublicationScheduler {
             }
             return Err(error);
         }
+        drop(pin_lifecycle_guard);
         let manifest_cid = manifest_cid.to_string();
 
         self.status

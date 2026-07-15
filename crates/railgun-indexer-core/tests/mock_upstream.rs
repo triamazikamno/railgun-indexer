@@ -270,7 +270,7 @@ async fn scrape_worker_shrinks_page_size_after_page_timeouts()
 
     let signing_key = SigningKey::from_bytes(&[13_u8; 32]);
     let state = MockState::fixture(&signing_key, 4, 0)
-        .with_event_page_timeout_above(2, Duration::from_millis(50));
+        .with_event_page_timeout_above(2, Duration::from_millis(500));
     let (upstream_url, server) = spawn_mock_upstream(state.clone()).await?;
     let store = Store::new(pool);
 
@@ -281,7 +281,7 @@ async fn scrape_worker_shrinks_page_size_after_page_timeouts()
         4,
         4,
         1,
-        Duration::from_millis(5),
+        Duration::from_millis(100),
     );
     worker.run_until_caught_up().await?;
 
@@ -535,7 +535,7 @@ async fn handle_rpc(State(state): State<MockState>, Json(body): Json<Value>) -> 
                     let index = event.signed_poi_event.index;
                     index >= start_index && index < end_index
                 })
-                .map(|event| event.signed_poi_event.blinded_commitment.clone())
+                .map(|event| event.signed_poi_event.blinded_commitment)
                 .collect::<Vec<_>>();
             Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response()
         }
