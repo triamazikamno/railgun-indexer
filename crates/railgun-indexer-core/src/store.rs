@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 
-const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
+pub(crate) const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
 const CHAIN_INDEXED_IPNS_SEQUENCE_STATE_KEY: &str = "chain_indexed_ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 11;
+const CURRENT_SCHEMA_VERSION: i32 = 19;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -35,6 +35,52 @@ impl Store {
         self.pool.begin().await.map_err(StoreError::Sqlx)
     }
 
+    pub async fn admit_poi_txid_version(&self, configured: &str) -> Result<(), StoreError> {
+        self.set_poi_txid_version(configured, false).await
+    }
+
+    pub async fn adopt_poi_txid_version(&self, configured: &str) -> Result<(), StoreError> {
+        self.set_poi_txid_version(configured, true).await
+    }
+
+    async fn set_poi_txid_version(
+        &self,
+        configured: &str,
+        allow_populated_adoption: bool,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("LOCK TABLE poi_dataset_identity IN EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let persisted = sqlx::query_scalar::<_, String>(
+            "SELECT txid_version FROM poi_dataset_identity WHERE id = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(persisted) = persisted {
+            if persisted != configured {
+                return Err(StoreError::PoiTxidVersionMismatch {
+                    configured: configured.to_string(),
+                    persisted,
+                });
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        if !allow_populated_adoption && poi_dataset_has_state(&mut tx).await? {
+            return Err(StoreError::PoiTxidVersionAdoptionRequired {
+                configured: configured.to_string(),
+            });
+        }
+        sqlx::query("INSERT INTO poi_dataset_identity (id, txid_version) VALUES (TRUE, $1)")
+            .bind(configured)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn last_event_index(
         &self,
         list_key: &FixedBytes<32>,
@@ -53,6 +99,31 @@ impl Store {
         .bind(chain_id)
         .bind(upstream_url)
         .fetch_optional(&self.pool)
+        .await?;
+
+        index
+            .map(|index| i64_to_u64(index, "last_event_index"))
+            .transpose()
+    }
+
+    pub(crate) async fn last_event_index_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        list_key: &FixedBytes<32>,
+        chain_id: u64,
+        upstream_url: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        let chain_id = u64_to_i64(chain_id, "chain_id")?;
+        let index = sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT last_event_index
+            FROM chain_tips
+            WHERE list_key = $1 AND chain_id = $2 AND upstream_url = $3
+            ",
+        )
+        .bind(list_key.as_slice())
+        .bind(chain_id)
+        .bind(upstream_url)
+        .fetch_optional(&mut **tx)
         .await?;
 
         index
@@ -203,19 +274,28 @@ impl Store {
         chain_id: u64,
         events: &[SignedPoiEvent],
     ) -> Result<(), StoreError> {
+        let chain_id_u64 = chain_id;
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
         for event in events {
             let event_index = u64_to_i64(event.index, "event_index")?;
             let blinded_commitment = event.blinded_commitment;
             let signature = decode_fixed_hex::<SIGNATURE_BYTES>("signature", &event.signature)?;
 
-            sqlx::query(
+            let result = sqlx::query(
                 r"
                 INSERT INTO poi_events (
-                    list_key, chain_id, event_index, blinded_commitment, signature, event_type
+                    list_key, chain_id, event_index, blinded_commitment, signature, event_type,
+                    event_data_complete
                 )
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (list_key, chain_id, event_index) DO NOTHING
+                VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+                ON CONFLICT (list_key, chain_id, event_index) DO UPDATE SET
+                    blinded_commitment = EXCLUDED.blinded_commitment,
+                    signature = EXCLUDED.signature,
+                    event_type = EXCLUDED.event_type,
+                    event_data_complete = TRUE,
+                    fetched_at = now()
+                WHERE poi_events.event_data_complete = FALSE
+                    AND poi_events.blinded_commitment = EXCLUDED.blinded_commitment
                 ",
             )
             .bind(list_key.as_slice())
@@ -226,8 +306,60 @@ impl Store {
             .bind(event_type_discriminant(event.event_type))
             .execute(&mut **tx)
             .await?;
+            if result.rows_affected() == 0 {
+                let stored_event = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i16, bool)>(
+                    r"
+                    SELECT blinded_commitment, signature, event_type, event_data_complete
+                    FROM poi_events
+                    WHERE list_key = $1 AND chain_id = $2 AND event_index = $3
+                    ",
+                )
+                .bind(list_key.as_slice())
+                .bind(chain_id)
+                .bind(event_index)
+                .fetch_one(&mut **tx)
+                .await?;
+                let exact_complete_reinsert = stored_event.3
+                    && exact_array::<BLINDED_COMMITMENT_BYTES>(
+                        "blinded_commitment",
+                        &stored_event.0,
+                    )? == blinded_commitment.0
+                    && exact_array::<SIGNATURE_BYTES>("signature", &stored_event.1)? == signature
+                    && stored_event.2 == event_type_discriminant(event.event_type);
+                if exact_complete_reinsert {
+                    continue;
+                }
+                return Err(StoreError::PoiEventConflict {
+                    chain_id: chain_id_u64,
+                    event_index: event.index,
+                });
+            }
         }
         Ok(())
+    }
+
+    pub async fn first_incomplete_event_index(
+        &self,
+        list_key: &FixedBytes<32>,
+        chain_id: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let chain_id = u64_to_i64(chain_id, "chain_id")?;
+        let index = sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT event_index
+            FROM poi_events
+            WHERE list_key = $1 AND chain_id = $2 AND event_data_complete = FALSE
+            ORDER BY event_index ASC
+            LIMIT 1
+            ",
+        )
+        .bind(list_key.as_slice())
+        .bind(chain_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        index
+            .map(|index| i64_to_u64(index, "incomplete_event_index"))
+            .transpose()
     }
 
     pub async fn insert_event_leaves(
@@ -237,26 +369,27 @@ impl Store {
         start_index: u64,
         leaves: &[U256],
     ) -> Result<(), StoreError> {
+        let chain_id_u64 = chain_id;
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
         let signature = [0_u8; SIGNATURE_BYTES];
         for (offset, leaf) in leaves.iter().enumerate() {
-            let event_index = start_index.checked_add(offset as u64).ok_or_else(|| {
+            let absolute_event_index = start_index.checked_add(offset as u64).ok_or_else(|| {
                 StoreError::IntegerOutOfRange {
                     field: "event_index",
                     value: format!("{start_index}+{offset}"),
                 }
             })?;
-            let event_index = u64_to_i64(event_index, "event_index")?;
+            let event_index = u64_to_i64(absolute_event_index, "event_index")?;
             let blinded_commitment = leaf.to_be_bytes::<BLINDED_COMMITMENT_BYTES>();
 
-            sqlx::query(
+            let result = sqlx::query(
                 r"
                 INSERT INTO poi_events (
-                    list_key, chain_id, event_index, blinded_commitment, signature, event_type
+                    list_key, chain_id, event_index, blinded_commitment, signature, event_type,
+                    event_data_complete
                 )
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (list_key, chain_id, event_index) DO UPDATE SET
-                    blinded_commitment = EXCLUDED.blinded_commitment
+                VALUES ($1, $2, $3, $4, $5, $6, FALSE)
+                ON CONFLICT (list_key, chain_id, event_index) DO NOTHING
                 ",
             )
             .bind(list_key.as_slice())
@@ -267,6 +400,30 @@ impl Store {
             .bind(event_type_discriminant(PoiEventType::Shield))
             .execute(&mut **tx)
             .await?;
+            if result.rows_affected() == 0 {
+                let stored_commitment = sqlx::query_scalar::<_, Vec<u8>>(
+                    r"
+                    SELECT blinded_commitment
+                    FROM poi_events
+                    WHERE list_key = $1 AND chain_id = $2 AND event_index = $3
+                    ",
+                )
+                .bind(list_key.as_slice())
+                .bind(chain_id)
+                .bind(event_index)
+                .fetch_one(&mut **tx)
+                .await?;
+                if exact_array::<BLINDED_COMMITMENT_BYTES>(
+                    "blinded_commitment",
+                    &stored_commitment,
+                )? != blinded_commitment
+                {
+                    return Err(StoreError::PoiEventConflict {
+                        chain_id: chain_id_u64,
+                        event_index: absolute_event_index,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -392,12 +549,36 @@ impl Store {
         start_index: u64,
         end_index: u64,
     ) -> Result<Vec<StoredEvent>, StoreError> {
+        self.page_event_range_with_completeness(list_key, chain_id, start_index, end_index, true)
+            .await
+    }
+
+    pub(crate) async fn page_event_range_for_hydration(
+        &self,
+        list_key: &FixedBytes<32>,
+        chain_id: u64,
+        start_index: u64,
+        end_index: u64,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        self.page_event_range_with_completeness(list_key, chain_id, start_index, end_index, false)
+            .await
+    }
+
+    async fn page_event_range_with_completeness(
+        &self,
+        list_key: &FixedBytes<32>,
+        chain_id: u64,
+        start_index: u64,
+        end_index: u64,
+        require_complete: bool,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        let chain_id_u64 = chain_id;
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
         let start_index = u64_to_i64(start_index, "start_index")?;
         let end_index = u64_to_i64(end_index, "end_index")?;
-        let rows = sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, i16)>(
+        let rows = sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, i16, bool)>(
             r"
-            SELECT event_index, blinded_commitment, signature, event_type
+            SELECT event_index, blinded_commitment, signature, event_type, event_data_complete
             FROM poi_events
             WHERE list_key = $1
                 AND chain_id = $2
@@ -412,15 +593,24 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
 
+        if require_complete && let Some(row) = rows.iter().find(|row| !row.4) {
+            return Err(StoreError::IncompletePoiEvent {
+                chain_id: chain_id_u64,
+                event_index: i64_to_u64(row.0, "event_index")?,
+            });
+        }
+
         rows.into_iter()
-            .map(|(event_index, blinded_commitment, signature, event_type)| {
-                Ok(StoredEvent {
-                    event_index: i64_to_u64(event_index, "event_index")?,
-                    blinded_commitment: exact_array("blinded_commitment", &blinded_commitment)?,
-                    signature: exact_array("signature", &signature)?,
-                    event_type: event_type_from_discriminant(event_type)?,
-                })
-            })
+            .map(
+                |(event_index, blinded_commitment, signature, event_type, _event_data_complete)| {
+                    Ok(StoredEvent {
+                        event_index: i64_to_u64(event_index, "event_index")?,
+                        blinded_commitment: exact_array("blinded_commitment", &blinded_commitment)?,
+                        signature: exact_array("signature", &signature)?,
+                        event_type: event_type_from_discriminant(event_type)?,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -465,6 +655,28 @@ impl Store {
     pub async fn record_ipns_sequence(&self, sequence: u64) -> Result<(), StoreError> {
         self.record_state_sequence(IPNS_SEQUENCE_STATE_KEY, "ipns_last_sequence", sequence)
             .await
+    }
+
+    pub async fn reserve_poi_publication_sequence(
+        &self,
+        minimum_sequence: u64,
+    ) -> Result<u64, StoreError> {
+        let minimum_sequence = u64_to_i64(minimum_sequence, "poi_publication_sequence")?;
+        let sequence = sqlx::query_scalar::<_, i64>(
+            r"
+            INSERT INTO indexer_state (key, value)
+            VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET
+                value = GREATEST(indexer_state.value + 1, EXCLUDED.value),
+                updated_at = now()
+            RETURNING value
+            ",
+        )
+        .bind(IPNS_SEQUENCE_STATE_KEY)
+        .bind(minimum_sequence)
+        .fetch_one(&self.pool)
+        .await?;
+        i64_to_u64(sequence, "poi_publication_sequence")
     }
 
     pub async fn last_chain_indexed_ipns_sequence(&self) -> Result<Option<u64>, StoreError> {
@@ -2668,6 +2880,12 @@ pub enum StoreError {
     },
     #[error("invalid stored POI event type {0}")]
     InvalidEventType(i16),
+    #[error(
+        "stored POI event conflicts with incoming event data at chain {chain_id} index {event_index}"
+    )]
+    PoiEventConflict { chain_id: u64, event_index: u64 },
+    #[error("stored POI event data is incomplete at chain {chain_id} index {event_index}")]
+    IncompletePoiEvent { chain_id: u64, event_index: u64 },
     #[error("invalid stored snapshot kind {0}")]
     InvalidSnapshotKind(String),
     #[error("invalid stored commitment family {0}")]
@@ -2685,6 +2903,40 @@ pub enum StoreError {
         block_number: u64,
         block_hash: String,
     },
+    #[error(
+        "POI database TXID version is {persisted}, but config requests {configured}; use a separate database or a future explicit corpus migration, and do not rewrite the identity fence"
+    )]
+    PoiTxidVersionMismatch {
+        configured: String,
+        persisted: String,
+    },
+    #[error(
+        "POI database contains legacy source/publication state without a TXID-version identity fence; stop the publisher and run --adopt-poi-txid-version --authorized-txid-version {configured} with the same config after independently verifying the historical corpus identity"
+    )]
+    PoiTxidVersionAdoptionRequired { configured: String },
+}
+
+async fn poi_dataset_has_state(tx: &mut Transaction<'_, Postgres>) -> Result<bool, StoreError> {
+    sqlx::query_scalar::<_, bool>(
+        r"
+        SELECT EXISTS(SELECT 1 FROM poi_events)
+            OR EXISTS(SELECT 1 FROM blocked_shields)
+            OR EXISTS(SELECT 1 FROM chain_tips)
+            OR EXISTS(SELECT 1 FROM published_snapshots)
+            OR EXISTS(SELECT 1 FROM published_blocked_shields)
+            OR EXISTS(SELECT 1 FROM published_manifests)
+            OR EXISTS(SELECT 1 FROM published_poi_v4_artifacts)
+            OR EXISTS(SELECT 1 FROM published_poi_v4_manifests)
+            OR EXISTS(SELECT 1 FROM published_poi_v4_manifest_entries)
+            OR EXISTS(SELECT 1 FROM published_poi_v4_manifest_artifacts)
+            OR EXISTS(
+                SELECT 1 FROM indexer_state WHERE key = 'ipns_last_sequence'
+            )
+        ",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(StoreError::Sqlx)
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), StoreError> {
@@ -2771,6 +3023,14 @@ const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[
     (9, V9_MIGRATIONS),
     (10, V10_MIGRATIONS),
     (11, V11_MIGRATIONS),
+    (12, V12_MIGRATIONS),
+    (13, V13_MIGRATIONS),
+    (14, V14_MIGRATIONS),
+    (15, V15_MIGRATIONS),
+    (16, V16_MIGRATIONS),
+    (17, V17_MIGRATIONS),
+    (18, V18_MIGRATIONS),
+    (19, V19_MIGRATIONS),
 ];
 
 const V4_MIGRATIONS: &[&str] = &[
@@ -3483,6 +3743,228 @@ const V11_MIGRATIONS: &[&str] = &[
     ON CONFLICT (manifest_id, artifact_cid) DO NOTHING
     ",
 ];
+
+const V12_MIGRATIONS: &[&str] = &[
+    r"
+    CREATE TABLE IF NOT EXISTS published_poi_v4_artifacts (
+        id BIGSERIAL PRIMARY KEY,
+        artifact_kind TEXT NOT NULL,
+        list_key BYTEA NOT NULL,
+        chain_type SMALLINT NOT NULL,
+        chain_id BIGINT NOT NULL,
+        txid_version TEXT NOT NULL,
+        range_start BIGINT NOT NULL,
+        range_end BIGINT NOT NULL,
+        cid TEXT NOT NULL,
+        byte_size BIGINT NOT NULL,
+        content_hash BYTEA NOT NULL,
+        end_root BYTEA,
+        descriptor_json TEXT NOT NULL,
+        format_version INTEGER NOT NULL,
+        published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_referenced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        unpinned_at TIMESTAMPTZ,
+        UNIQUE (
+            artifact_kind, list_key, chain_type, chain_id, txid_version,
+            range_start, range_end, cid
+        )
+    )
+    ",
+    r"
+    CREATE TABLE IF NOT EXISTS published_poi_v4_manifests (
+        id BIGSERIAL PRIMARY KEY,
+        cid TEXT NOT NULL,
+        ipns_sequence BIGINT NOT NULL,
+        byte_size BIGINT NOT NULL,
+        content_hash BYTEA NOT NULL,
+        format_version INTEGER NOT NULL,
+        published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        ipns_published_at TIMESTAMPTZ,
+        superseded_at TIMESTAMPTZ,
+        unpinned_at TIMESTAMPTZ
+    )
+    ",
+    r"
+    CREATE TABLE IF NOT EXISTS published_poi_v4_manifest_entries (
+        manifest_id BIGINT NOT NULL REFERENCES published_poi_v4_manifests(id) ON DELETE CASCADE,
+        list_key BYTEA NOT NULL,
+        chain_type SMALLINT NOT NULL,
+        chain_id BIGINT NOT NULL,
+        txid_version TEXT NOT NULL,
+        entry_json TEXT NOT NULL,
+        PRIMARY KEY (manifest_id, list_key, chain_type, chain_id, txid_version)
+    )
+    ",
+    r"
+    CREATE TABLE IF NOT EXISTS published_poi_v4_manifest_artifacts (
+        manifest_id BIGINT NOT NULL REFERENCES published_poi_v4_manifests(id) ON DELETE CASCADE,
+        artifact_cid TEXT NOT NULL,
+        PRIMARY KEY (manifest_id, artifact_cid)
+    )
+    ",
+    r"
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_artifacts_kind_check') THEN
+            ALTER TABLE published_poi_v4_artifacts
+                ADD CONSTRAINT published_poi_v4_artifacts_kind_check CHECK (
+                    artifact_kind IN ('checkpoint_chunk', 'checkpoint_catalog', 'current_tail', 'bridge', 'blocked_shields')
+                );
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_artifacts_chain_type_check') THEN
+            ALTER TABLE published_poi_v4_artifacts
+                ADD CONSTRAINT published_poi_v4_artifacts_chain_type_check CHECK (chain_type = 0);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_artifacts_list_key_len_check') THEN
+            ALTER TABLE published_poi_v4_artifacts
+                ADD CONSTRAINT published_poi_v4_artifacts_list_key_len_check CHECK (octet_length(list_key) = 32);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_artifacts_hash_len_check') THEN
+            ALTER TABLE published_poi_v4_artifacts
+                ADD CONSTRAINT published_poi_v4_artifacts_hash_len_check CHECK (octet_length(content_hash) = 32);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_artifacts_root_len_check') THEN
+            ALTER TABLE published_poi_v4_artifacts
+                ADD CONSTRAINT published_poi_v4_artifacts_root_len_check CHECK (end_root IS NULL OR octet_length(end_root) = 32);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_artifacts_range_check') THEN
+            ALTER TABLE published_poi_v4_artifacts
+                ADD CONSTRAINT published_poi_v4_artifacts_range_check CHECK (
+                    (range_start = -1 AND range_end = -1) OR
+                    (range_start >= 0 AND range_end >= range_start)
+                );
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_poi_v4_manifests_hash_len_check') THEN
+            ALTER TABLE published_poi_v4_manifests
+                ADD CONSTRAINT published_poi_v4_manifests_hash_len_check CHECK (octet_length(content_hash) = 32);
+        END IF;
+    END $$
+    ",
+    "CREATE INDEX IF NOT EXISTS published_poi_v4_artifacts_exact_lookup ON published_poi_v4_artifacts (artifact_kind, list_key, chain_type, chain_id, txid_version, range_start, range_end, byte_size, content_hash) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_poi_v4_artifacts_retention_lookup ON published_poi_v4_artifacts (last_referenced_at, cid) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_poi_v4_manifests_retention_lookup ON published_poi_v4_manifests (superseded_at, published_at, unpinned_at, cid) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_poi_v4_manifest_artifacts_cid_lookup ON published_poi_v4_manifest_artifacts (artifact_cid, manifest_id)",
+    "CREATE INDEX IF NOT EXISTS published_poi_v4_manifest_entries_scope_lookup ON published_poi_v4_manifest_entries (list_key, chain_type, chain_id, txid_version, manifest_id)",
+];
+
+const V13_MIGRATIONS: &[&str] = &[
+    r"
+    CREATE UNIQUE INDEX IF NOT EXISTS published_manifests_one_pending
+    ON published_manifests ((TRUE))
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+    ",
+    r"
+    CREATE UNIQUE INDEX IF NOT EXISTS published_poi_v4_manifests_one_pending
+    ON published_poi_v4_manifests ((TRUE))
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+    ",
+];
+
+const V14_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE poi_events ADD COLUMN IF NOT EXISTS event_data_complete BOOLEAN NOT NULL DEFAULT FALSE",
+    r"
+    UPDATE poi_events
+    SET event_data_complete = TRUE
+    WHERE signature <> decode(repeat('00', 64), 'hex')
+    ",
+    "CREATE INDEX IF NOT EXISTS poi_events_incomplete_lookup ON poi_events (list_key, chain_id, event_index) WHERE event_data_complete = FALSE",
+];
+
+const V15_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE published_manifests ADD COLUMN IF NOT EXISTS reconciliation_invalidated_at TIMESTAMPTZ",
+    "ALTER TABLE published_poi_v4_manifests ADD COLUMN IF NOT EXISTS reconciliation_invalidated_at TIMESTAMPTZ",
+    r"
+    UPDATE published_manifests
+    SET reconciliation_invalidated_at = now()
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+      AND reconciliation_invalidated_at IS NULL
+    ",
+    r"
+    UPDATE published_poi_v4_manifests
+    SET reconciliation_invalidated_at = now()
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+      AND reconciliation_invalidated_at IS NULL
+    ",
+    "DROP INDEX IF EXISTS published_manifests_one_pending",
+    "DROP INDEX IF EXISTS published_poi_v4_manifests_one_pending",
+    r"
+    CREATE UNIQUE INDEX published_manifests_one_pending
+    ON published_manifests ((TRUE))
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+      AND reconciliation_invalidated_at IS NULL
+    ",
+    r"
+    CREATE UNIQUE INDEX published_poi_v4_manifests_one_pending
+    ON published_poi_v4_manifests ((TRUE))
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+      AND reconciliation_invalidated_at IS NULL
+    ",
+];
+
+const V16_MIGRATIONS: &[&str] =
+    &["ALTER TABLE published_indexed_manifests ADD COLUMN IF NOT EXISTS manifest_json TEXT"];
+
+const V17_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE published_indexed_manifests ADD COLUMN IF NOT EXISTS reconciliation_invalidated_at TIMESTAMPTZ",
+    r"
+    UPDATE published_indexed_manifests
+    SET reconciliation_invalidated_at = now()
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+      AND manifest_json IS NULL
+      AND reconciliation_invalidated_at IS NULL
+    ",
+    r"
+    INSERT INTO indexer_state (key, value)
+    SELECT 'chain_indexed_ipns_last_sequence', MAX(ipns_sequence)
+    FROM published_indexed_manifests
+    WHERE reconciliation_invalidated_at IS NOT NULL
+      AND superseded_at IS NULL
+    HAVING COUNT(*) > 0
+    ON CONFLICT (key) DO UPDATE SET
+        value = GREATEST(indexer_state.value, EXCLUDED.value),
+        updated_at = now()
+    ",
+    r"
+    CREATE UNIQUE INDEX IF NOT EXISTS published_indexed_manifests_one_pending
+    ON published_indexed_manifests ((TRUE))
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+      AND reconciliation_invalidated_at IS NULL
+    ",
+];
+
+const V18_MIGRATIONS: &[&str] = &[r"
+    CREATE TABLE IF NOT EXISTS poi_dataset_identity (
+        id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+        txid_version TEXT NOT NULL CHECK (btrim(txid_version) <> '')
+    )
+    "];
+
+const V19_MIGRATIONS: &[&str] = &[r"
+    CREATE TABLE IF NOT EXISTS pin_cleanup_debt (
+        cid TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        attempts BIGINT NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        last_error TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    "];
 
 fn decode_fixed_hex<const N: usize>(
     field: &'static str,

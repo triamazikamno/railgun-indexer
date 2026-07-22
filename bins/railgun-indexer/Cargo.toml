@@ -17,11 +17,13 @@ ed25519-dalek = { workspace = true }
 eyre = { workspace = true }
 futures-util = { workspace = true }
 merkletree = { workspace = true }
+poi = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { version = "0.9" }
 sha2 = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
@@ -31,6 +33,8 @@ railgun-indexer-core = { path = "../../crates/railgun-indexer-core" }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+libp2p = { workspace = true }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [lints]
 workspace = true

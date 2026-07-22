@@ -50,6 +50,9 @@ poi:
     - 137
     - 42161
 
+  # Upstream POI/TXID tree convention.
+  txid_version: "V2_PoseidonMerkle"
+
   # Maximum upstream request page size. The public upstream caps POI leaf pages at 100.
   page_size_max: 100
 

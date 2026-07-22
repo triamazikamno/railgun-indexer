@@ -596,7 +596,7 @@ mod tests {
             .expect("section exists");
         let offset = usize::try_from(section.offset).expect("section offset");
         let bytes = envelope
-            .payload
+            .payload()
             .get(offset..offset + 8)
             .expect("section count bytes");
         u64::from_le_bytes(bytes.try_into().expect("u64 count"))

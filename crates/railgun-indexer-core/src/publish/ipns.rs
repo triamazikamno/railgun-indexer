@@ -1,7 +1,9 @@
 use crate::audit::ChainCanonicalityLease;
 use crate::config::Config;
+use async_trait::async_trait;
 use cid::Cid;
 use ed25519_dalek::SigningKey;
+use hkdf::Hkdf;
 use libp2p::core::transport::Boxed;
 use libp2p::core::{muxing::StreamMuxerBox, upgrade};
 use libp2p::futures::StreamExt;
@@ -15,6 +17,7 @@ use libp2p::{
 };
 use multibase::Base;
 use rust_ipns::Record as IpnsRecord;
+use sha2::Sha256;
 use std::collections::VecDeque;
 use std::str;
 use std::time::Duration;
@@ -23,6 +26,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
+use zeroize::{Zeroize, Zeroizing};
+
+pub const V4_POI_IPNS_KDF_SALT: &[u8] = b"railgun-indexer/ipns-key-derivation/v1";
+pub const V4_POI_IPNS_KDF_INFO: &[u8] = b"poi-artifact/chunked-manifest/v4";
 
 const IPNS_RECORD_KEY_PREFIX: &[u8] = b"/ipns/";
 const IPFS_PATH_PREFIX: &str = "/ipfs/";
@@ -103,6 +110,33 @@ pub struct IpnsPublisherTask {
     requests: mpsc::Receiver<PublishRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V4PoiPublicIdentity {
+    pub ed25519_public_key: [u8; 32],
+    pub peer_id: PeerId,
+    pub ipns_name: String,
+}
+
+#[async_trait]
+pub trait ManifestIpnsPublisher: Send + Sync {
+    async fn publish_manifest_cid(
+        &self,
+        manifest_cid: &str,
+        sequence: u64,
+    ) -> Result<IpnsPublication, IpnsError>;
+}
+
+#[async_trait]
+impl ManifestIpnsPublisher for IpnsPublisher {
+    async fn publish_manifest_cid(
+        &self,
+        manifest_cid: &str,
+        sequence: u64,
+    ) -> Result<IpnsPublication, IpnsError> {
+        self.publish_manifest_cid(manifest_cid, sequence).await
+    }
+}
+
 #[derive(Debug)]
 struct PublishRequest {
     manifest_cid: String,
@@ -121,6 +155,21 @@ impl IpnsPublisher {
         config: IpnsPublisherConfig,
     ) -> Result<(Self, IpnsPublisherTask), IpnsError> {
         let keypair = identity_keypair_from_signing_key(signing_key)?;
+        Self::from_identity_keypair(keypair, config)
+    }
+
+    pub fn new_v4_poi(
+        poi_publisher_signing_key: &SigningKey,
+        config: IpnsPublisherConfig,
+    ) -> Result<(Self, IpnsPublisherTask), IpnsError> {
+        let keypair = identity_keypair_from_v4_poi_signing_key(poi_publisher_signing_key)?;
+        Self::from_identity_keypair(keypair, config)
+    }
+
+    fn from_identity_keypair(
+        keypair: identity::Keypair,
+        config: IpnsPublisherConfig,
+    ) -> Result<(Self, IpnsPublisherTask), IpnsError> {
         let peer_id = PeerId::from(keypair.public());
         let ipns_name = ipns_name(peer_id)?;
         let (request_tx, request_rx) = mpsc::channel(IPNS_PUBLISH_QUEUE_CAPACITY);
@@ -198,8 +247,33 @@ impl IpnsPublisher {
     }
 }
 
+pub fn validate_publisher_identities(
+    legacy_poi: &IpnsPublisher,
+    v4_poi: &IpnsPublisher,
+    chain_indexed: &IpnsPublisher,
+) -> Result<(), IpnsError> {
+    for (left_label, left, right_label, right) in [
+        ("legacy POI", legacy_poi, "v4 POI", v4_poi),
+        ("legacy POI", legacy_poi, "chain-indexed", chain_indexed),
+        ("v4 POI", v4_poi, "chain-indexed", chain_indexed),
+    ] {
+        if left.peer_id == right.peer_id {
+            return Err(IpnsError::PublisherIdentityCollision {
+                left: left_label,
+                right: right_label,
+                peer_id: left.peer_id,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl IpnsPublisherTask {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<(), IpnsError> {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let mut swarm = build_swarm(&self.keypair, &self.config)?;
         dial_bootstrap_peers(&mut swarm, &self.config)?;
         start_bootstrap(&mut swarm);
@@ -220,6 +294,9 @@ impl IpnsPublisherTask {
         let mut bootstrap_completed = false;
 
         loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
             let now = time::Instant::now();
             expire_active_publish(&mut active, now);
             maybe_start_publish(
@@ -234,6 +311,12 @@ impl IpnsPublisherTask {
             let next_wake = next_publish_wake(&pending, active.as_ref(), time::Instant::now());
 
             tokio::select! {
+                biased;
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
                 () = sleep_until_wake(next_wake), if next_wake.is_some() => {}
                 _ = bootstrap_interval.tick() => {
                     dial_bootstrap_peers(&mut swarm, &self.config)?;
@@ -261,11 +344,6 @@ impl IpnsPublisherTask {
                         &mut active,
                         &mut bootstrap_completed,
                     );
-                }
-                result = shutdown.changed() => {
-                    if result.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
                 }
             }
         }
@@ -370,11 +448,43 @@ pub fn ipns_name(peer_id: PeerId) -> Result<String, IpnsError> {
         .map_err(IpnsError::IpnsName)
 }
 
+pub fn v4_poi_public_identity(
+    poi_publisher_signing_key: &SigningKey,
+) -> Result<V4PoiPublicIdentity, IpnsError> {
+    let keypair = identity_keypair_from_v4_poi_signing_key(poi_publisher_signing_key)?;
+    let ed25519_public_key = keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|_| IpnsError::UnexpectedIdentityType)?
+        .to_bytes();
+    let peer_id = PeerId::from(keypair.public());
+
+    Ok(V4PoiPublicIdentity {
+        ed25519_public_key,
+        peer_id,
+        ipns_name: ipns_name(peer_id)?,
+    })
+}
+
 fn identity_keypair_from_signing_key(
     signing_key: &SigningKey,
 ) -> Result<identity::Keypair, IpnsError> {
-    let mut bytes = signing_key.to_bytes();
-    identity::Keypair::ed25519_from_bytes(&mut bytes).map_err(IpnsError::Identity)
+    let mut seed = Zeroizing::new(signing_key.to_bytes());
+    identity::Keypair::ed25519_from_bytes(&mut *seed).map_err(IpnsError::Identity)
+}
+
+fn identity_keypair_from_v4_poi_signing_key(
+    poi_publisher_signing_key: &SigningKey,
+) -> Result<identity::Keypair, IpnsError> {
+    let poi_publisher_seed = Zeroizing::new(poi_publisher_signing_key.to_bytes());
+    let (mut prk, hkdf) =
+        Hkdf::<Sha256>::extract(Some(V4_POI_IPNS_KDF_SALT), poi_publisher_seed.as_ref());
+    prk.as_mut_slice().zeroize();
+    let mut child_seed = Zeroizing::new([0_u8; 32]);
+    hkdf.expand(V4_POI_IPNS_KDF_INFO, &mut *child_seed)
+        .map_err(|_| IpnsError::KdfOutputLength)?;
+    drop(hkdf);
+    identity::Keypair::ed25519_from_bytes(&mut *child_seed).map_err(IpnsError::Identity)
 }
 
 fn maybe_start_publish(
@@ -651,7 +761,7 @@ fn earliest_instant(current: Option<time::Instant>, candidate: time::Instant) ->
 }
 
 fn next_retry_at(request: &PublishRequest, now: time::Instant) -> Option<time::Instant> {
-    if request.is_expired(now) {
+    if request.response.is_closed() || request.is_expired(now) {
         return None;
     }
     let remaining = request.deadline.duration_since(now);
@@ -871,6 +981,16 @@ pub enum IpnsError {
     MissingPeerId(Multiaddr),
     #[error("publisher signing key cannot be converted to a libp2p ed25519 identity")]
     Identity(#[source] identity::DecodingError),
+    #[error("publisher identity is not ed25519")]
+    UnexpectedIdentityType,
+    #[error("v4 POI IPNS HKDF output length is invalid")]
+    KdfOutputLength,
+    #[error("{left} and {right} publisher identities collide at peer ID {peer_id}")]
+    PublisherIdentityCollision {
+        left: &'static str,
+        right: &'static str,
+        peer_id: PeerId,
+    },
     #[error("invalid manifest CID {cid}")]
     InvalidManifestCid {
         cid: String,
@@ -927,6 +1047,83 @@ mod tests {
     use super::*;
 
     const EMPTY_RAW_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const VECTOR_ROOT_SEED: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    const VECTOR_CHILD_PUBLIC_KEY: [u8; 32] = [
+        0x56, 0xf6, 0xdf, 0x31, 0x02, 0xdf, 0x04, 0x67, 0xda, 0x6a, 0x5a, 0xdc, 0x7e, 0xf6, 0xff,
+        0x57, 0x7f, 0xab, 0xf2, 0x94, 0x4f, 0xd1, 0xbd, 0x60, 0x6f, 0x6a, 0x47, 0x46, 0x4f, 0x22,
+        0xab, 0xc9,
+    ];
+    const VECTOR_PEER_ID: &str = "12D3KooWFfqZkgZyH41hEVExsTkwAEVk9bTmHdLTP99uD1uwWo52";
+    const VECTOR_IPNS_NAME: &str = "k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft";
+
+    #[test]
+    fn v4_poi_hkdf_vector_matches_shared_public_identity() {
+        assert_eq!(
+            V4_POI_IPNS_KDF_SALT,
+            b"railgun-indexer/ipns-key-derivation/v1"
+        );
+        assert_eq!(V4_POI_IPNS_KDF_INFO, b"poi-artifact/chunked-manifest/v4");
+        let root_key = SigningKey::from_bytes(&VECTOR_ROOT_SEED);
+        let identity = v4_poi_public_identity(&root_key).expect("v4 public identity");
+        let legacy_keypair =
+            identity_keypair_from_signing_key(&root_key).expect("legacy identity keypair");
+        let legacy_peer_id = PeerId::from(legacy_keypair.public());
+
+        assert_eq!(identity.ed25519_public_key, VECTOR_CHILD_PUBLIC_KEY);
+        assert_eq!(identity.peer_id.to_string(), VECTOR_PEER_ID);
+        assert_eq!(identity.ipns_name, VECTOR_IPNS_NAME);
+        assert_ne!(identity.peer_id, legacy_peer_id);
+    }
+
+    #[test]
+    fn altered_v4_poi_hkdf_domains_produce_different_identities() {
+        let production = test_derived_publisher(
+            &VECTOR_ROOT_SEED,
+            V4_POI_IPNS_KDF_SALT,
+            V4_POI_IPNS_KDF_INFO,
+        );
+        let altered_salt = test_derived_publisher(
+            &VECTOR_ROOT_SEED,
+            b"railgun-indexer/ipns-key-derivation/v2",
+            V4_POI_IPNS_KDF_INFO,
+        );
+        let altered_info = test_derived_publisher(
+            &VECTOR_ROOT_SEED,
+            V4_POI_IPNS_KDF_SALT,
+            b"poi-artifact/chunked-manifest/v5",
+        );
+
+        assert_ne!(production.peer_id(), altered_salt.peer_id());
+        assert_ne!(production.peer_id(), altered_info.peer_id());
+    }
+
+    #[test]
+    fn every_publisher_identity_collision_is_rejected() {
+        let (legacy, _legacy_task) =
+            IpnsPublisher::new(&SigningKey::from_bytes(&[1; 32]), test_config())
+                .expect("legacy publisher");
+        let (v4, _v4_task) = IpnsPublisher::new(&SigningKey::from_bytes(&[2; 32]), test_config())
+            .expect("v4 publisher");
+        let (chain, _chain_task) =
+            IpnsPublisher::new(&SigningKey::from_bytes(&[3; 32]), test_config())
+                .expect("chain publisher");
+        for (legacy_candidate, v4_candidate, chain_candidate) in [
+            (&legacy, &legacy, &chain),
+            (&legacy, &v4, &legacy),
+            (&legacy, &v4, &v4),
+        ] {
+            assert!(matches!(
+                validate_publisher_identities(legacy_candidate, v4_candidate, chain_candidate),
+                Err(IpnsError::PublisherIdentityCollision { .. })
+            ));
+        }
+
+        validate_publisher_identities(&legacy, &v4, &chain).expect("three distinct identities");
+    }
 
     #[test]
     fn signed_record_uses_publisher_key_and_ipfs_path_value() {
@@ -1094,6 +1291,26 @@ mod tests {
     }
 
     #[test]
+    fn canceled_active_publish_request_is_not_retried() {
+        let now = time::Instant::now();
+        let timeout = Duration::from_mins(1);
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        let request = PublishRequest {
+            manifest_cid: EMPTY_RAW_CID.to_string(),
+            sequence: 1,
+            timeout,
+            deadline: now + timeout,
+            not_before: now,
+            attempts_started: 1,
+            response: response_tx,
+            canonicality_lease: None,
+        };
+
+        assert_eq!(next_retry_at(&request, now), None);
+    }
+
+    #[test]
     fn next_publish_wake_uses_retry_time_without_spinning_when_ready() {
         let now = time::Instant::now();
         let timeout = Duration::from_mins(1);
@@ -1142,5 +1359,40 @@ mod tests {
             other => panic!("unexpected publish result: {other:?}"),
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_actor_start_admits_no_ipns_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let (publisher, publisher_task) = IpnsPublisher::new(&signing_key, test_config())?;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+
+        publisher_task.run(shutdown_rx).await?;
+        let result = publisher.publish_manifest_cid(EMPTY_RAW_CID, 1).await;
+
+        assert!(matches!(result, Err(IpnsError::PublisherUnavailable)));
+        Ok(())
+    }
+
+    fn test_config() -> IpnsPublisherConfig {
+        IpnsPublisherConfig {
+            bootstrap_peers: Vec::new(),
+            record_lifetime: Duration::from_hours(1),
+            record_ttl: Duration::from_mins(1),
+            publish_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn test_derived_publisher(root_seed: &[u8; 32], salt: &[u8], info: &[u8]) -> IpnsPublisher {
+        let hkdf = Hkdf::<Sha256>::new(Some(salt), root_seed);
+        let mut child_seed = Zeroizing::new([0_u8; 32]);
+        hkdf.expand(info, &mut *child_seed)
+            .expect("32-byte HKDF test output");
+        let keypair =
+            identity::Keypair::ed25519_from_bytes(&mut *child_seed).expect("derived test identity");
+        IpnsPublisher::from_identity_keypair(keypair, test_config())
+            .expect("test publisher")
+            .0
     }
 }

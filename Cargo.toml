@@ -19,22 +19,24 @@ ed25519-dalek = "2"
 eyre = "0.6"
 futures-util = "0.3"
 humantime-serde = "1"
+hkdf = "0.13"
 libp2p = "0.56"
 reqwest = { version = "0.13", features = ["socks", "gzip", "deflate", "brotli", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.11"
+sha2 = { version = "0.11", features = ["zeroize"] }
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2"
+zeroize = "1"
 zstd = "0.13"
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "104c898d70d6af56b16e47fa8c32cda6f5eaaa9a" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "104c898d70d6af56b16e47fa8c32cda6f5eaaa9a" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "104c898d70d6af56b16e47fa8c32cda6f5eaaa9a" }
-railgun-indexed-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "104c898d70d6af56b16e47fa8c32cda6f5eaaa9a" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
+railgun-indexed-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
 
 [profile.release]
 opt-level = 3

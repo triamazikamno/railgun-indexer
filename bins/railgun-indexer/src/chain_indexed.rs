@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +23,8 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use railgun_indexer_core::audit::{
-    Audit, ChainCanonicalityCoordinator, IndexedArtifactPublicationKind, PinLifecycleCoordinator,
+    Audit, ChainCanonicalityCoordinator, ChainCanonicalityLease, IndexedArtifactPublicationKind,
+    PinLifecycleCoordinator, PinOwnershipLease,
 };
 use railgun_indexer_core::chain_indexer::{
     ChainIndexedBlockHeader, ChainLogIndexingOutcome, ChainLogIndexingRange, index_chain_log_range,
@@ -43,7 +45,7 @@ use railgun_indexer_core::merkle_checkpoint::{
 use railgun_indexer_core::public_txid::{
     prepare_public_txid_chunk, public_txid_checkpoint_root, public_txid_chunk_plan_item,
 };
-use railgun_indexer_core::publish::ipfs::{IpfsClient, pin_indexed_chunk, pin_manifest};
+use railgun_indexer_core::publish::ipfs::{IpfsClient, IpfsError, pin_indexed_chunk, pin_manifest};
 use railgun_indexer_core::publish::ipns::IpnsPublisher;
 use railgun_indexer_core::store::{
     IndexedDatasetKind as StoreDatasetKind, Store, StoredIndexedBlockHeader, StoredPublicTxidRow,
@@ -416,17 +418,33 @@ pub(crate) async fn run_publication_loop(
         canonicality,
         last_ipns_sequence: None,
         ipns_sequence_loaded: false,
+        shutdown: shutdown.clone(),
     };
+    match scheduler.reconcile_pending_manifest().await {
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                error = %format_report_chain(&error),
+                "chain-indexed pending publication reconciliation failed"
+            );
+        }
+    }
+    if shutdown_requested(&shutdown) {
+        return Ok(());
+    }
     if sleep_or_shutdown(interval, &mut shutdown).await {
         return Ok(());
     }
 
     loop {
-        if let Err(error) = scheduler.publish_cycle(SystemTime::now()).await {
-            warn!(
-                error = %format_report_chain(&error),
-                "chain-indexed artifact publication cycle failed"
-            );
+        match scheduler.publish_cycle(SystemTime::now()).await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(
+                    error = %format_report_chain(&error),
+                    "chain-indexed artifact publication cycle failed"
+                );
+            }
         }
 
         if sleep_or_shutdown(interval, &mut shutdown).await {
@@ -746,6 +764,7 @@ struct ChainIndexedPublicationScheduler {
     canonicality: ChainCanonicalityCoordinator,
     last_ipns_sequence: Option<u64>,
     ipns_sequence_loaded: bool,
+    shutdown: watch::Receiver<bool>,
 }
 
 struct PublishedCatalog {
@@ -770,7 +789,28 @@ fn extend_published_catalogs(
 }
 
 impl ChainIndexedPublicationScheduler {
+    fn ensure_publication_running(&self) -> Result<()> {
+        if shutdown_requested(&self.shutdown) {
+            Err(eyre!(
+                "publication stopped at a cooperative shutdown boundary"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn acquire_pin_ownership(&self) -> Result<PinOwnershipLease> {
+        self.ensure_publication_running()?;
+        self.pin_lifecycle
+            .try_acquire_pin_ownership()
+            .ok_or_else(|| eyre!("pin ownership admission is closed for shutdown"))
+    }
+
     async fn publish_cycle(&mut self, now: SystemTime) -> Result<()> {
+        self.ensure_publication_running()?;
+        if self.reconcile_pending_manifest().await? {
+            return Ok(());
+        }
         let configured_chains = self.config.chain_indexed.chains.clone();
         let published_chains = join_all(
             configured_chains
@@ -782,6 +822,7 @@ impl ChainIndexedPublicationScheduler {
         let mut chains = Vec::new();
         let mut artifact_cids = BTreeSet::new();
         for (chain, result) in configured_chains.iter().zip(published_chains) {
+            self.ensure_publication_running()?;
             match result {
                 Ok(Some(published)) => {
                     chains.push(published.entry);
@@ -822,39 +863,60 @@ impl ChainIndexedPublicationScheduler {
         manifest
             .sign_manifest(&self.signing_key)
             .wrap_err("sign chain-indexed manifest")?;
-        let manifest_bytes =
-            serde_json::to_vec(&manifest).wrap_err("serialize chain-indexed manifest")?;
+        let manifest_json =
+            serde_json::to_string(&manifest).wrap_err("serialize chain-indexed manifest")?;
+        let manifest_bytes = manifest_json.as_bytes();
         let byte_size = u64::try_from(manifest_bytes.len())
             .wrap_err("chain-indexed manifest byte size overflow")?;
-        let manifest_hash = content_hash(&manifest_bytes);
+        let manifest_hash = content_hash(manifest_bytes);
         let artifact_cids = artifact_cids.into_iter().collect::<Vec<_>>();
         let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
         self.ensure_indexed_artifacts_available(&artifact_cids)
             .await?;
-        let manifest_cid = pin_manifest(self.ipfs_client.as_ref(), &manifest_bytes)
-            .await
-            .wrap_err("pin chain-indexed manifest")?;
+        let ownership = self.acquire_pin_ownership()?;
+        let manifest_cid = match pin_manifest(self.ipfs_client.as_ref(), manifest_bytes).await {
+            Ok(cid) => cid,
+            Err(error) => {
+                ownership.settle();
+                return Err(error).wrap_err("pin chain-indexed manifest");
+            }
+        };
 
-        let mut tx = self
-            .store
-            .begin()
+        let audit_result = async {
+            let mut tx = self
+                .store
+                .begin()
+                .await
+                .wrap_err("begin chain-indexed manifest audit transaction")?;
+            Audit::record_indexed_manifest_pin(
+                &mut tx,
+                &manifest_cid,
+                &artifact_cids,
+                sequence,
+                byte_size,
+                &manifest_hash,
+                INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
+                &manifest_json,
+            )
             .await
-            .wrap_err("begin chain-indexed manifest audit transaction")?;
-        Audit::record_indexed_manifest_pin(
-            &mut tx,
-            &manifest_cid,
-            &artifact_cids,
-            sequence,
-            byte_size,
-            &manifest_hash,
-            INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
-        )
-        .await
-        .wrap_err("record chain-indexed manifest pin")?;
-        tx.commit()
-            .await
-            .wrap_err("commit chain-indexed manifest pin audit")?;
+            .wrap_err("record chain-indexed manifest pin")?;
+            tx.commit()
+                .await
+                .wrap_err("commit chain-indexed manifest pin audit")
+        }
+        .await;
+        if let Err(error) = audit_result {
+            self.cleanup_uncommitted_pin_while_locked(
+                &manifest_cid,
+                "chain-indexed manifest",
+                ownership,
+            )
+            .await;
+            return Err(error);
+        }
+        ownership.settle();
         drop(pin_lifecycle_guard);
+        self.ensure_publication_running()?;
 
         let manifest_cid_string = manifest_cid.to_string();
         self.ipns_publisher
@@ -865,12 +927,13 @@ impl ChainIndexedPublicationScheduler {
             )
             .await
             .wrap_err("publish chain-indexed manifest CID to IPNS")?;
+        self.ensure_publication_running()?;
         let mut tx = self
             .store
             .begin()
             .await
             .wrap_err("begin chain-indexed manifest IPNS audit transaction")?;
-        Audit::record_indexed_manifest_ipns_publication(&mut tx, &manifest_cid)
+        Audit::record_indexed_manifest_ipns_publication(&mut tx, &manifest_cid, sequence)
             .await
             .wrap_err("record chain-indexed manifest IPNS publication")?;
         tx.commit()
@@ -889,6 +952,98 @@ impl ChainIndexedPublicationScheduler {
             "published chain-indexed manifest"
         );
         Ok(())
+    }
+
+    async fn reconcile_pending_manifest(&mut self) -> Result<bool> {
+        let ipns_publisher = self.ipns_publisher.clone();
+        self.reconcile_pending_manifest_with(move |cid, sequence, canonicality_lease| async move {
+            ipns_publisher
+                .publish_manifest_cid_with_lease(&cid, sequence, canonicality_lease)
+                .await
+                .wrap_err("reconcile pending chain-indexed manifest IPNS publication")?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn reconcile_pending_manifest_with<PublishIpns, PublishFuture>(
+        &mut self,
+        publish_ipns: PublishIpns,
+    ) -> Result<bool>
+    where
+        PublishIpns: FnOnce(String, u64, ChainCanonicalityLease) -> PublishFuture,
+        PublishFuture: Future<Output = Result<()>>,
+    {
+        self.ensure_publication_running()?;
+        let Some(pending) = Audit::pending_indexed_manifest_publication(
+            self.store.pool(),
+            &self.signing_key.verifying_key().to_bytes(),
+        )
+        .await
+        .wrap_err("load pending chain-indexed manifest")?
+        else {
+            return Ok(false);
+        };
+        let configured_chains = self.config.chain_indexed.chains.clone();
+        let canonicality_guard = self.canonicality.publication_lease().await;
+        self.validate_combined_manifest_snapshot(&configured_chains, &pending.manifest.chains)
+            .await
+            .wrap_err("revalidate pending chain-indexed manifest watermarks")?;
+        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
+        self.ensure_indexed_artifacts_available(&pending.artifact_cids)
+            .await?;
+        let manifest_cid = pending
+            .cid
+            .parse::<cid::Cid>()
+            .wrap_err("parse pending chain-indexed manifest CID")?;
+        let ownership = self.acquire_pin_ownership()?;
+        let returned_cid =
+            match pin_manifest(self.ipfs_client.as_ref(), pending.manifest_json.as_bytes()).await {
+                Ok(cid) => cid,
+                Err(error) => {
+                    ownership.settle();
+                    return Err(error).wrap_err("re-pin pending chain-indexed manifest");
+                }
+            };
+        if returned_cid != manifest_cid {
+            self.cleanup_uncommitted_pin_while_locked(
+                &returned_cid,
+                "mismatched chain-indexed reconciliation manifest",
+                ownership,
+            )
+            .await;
+            return Err(IpfsError::CidMismatch {
+                service: self.ipfs_client.service_name().to_string(),
+                expected: Box::new(manifest_cid),
+                returned: Box::new(returned_cid),
+            }
+            .into());
+        }
+        ownership.settle();
+        drop(pin_lifecycle_guard);
+        self.ensure_publication_running()?;
+        publish_ipns(
+            pending.cid.clone(),
+            pending.sequence,
+            canonicality_guard.clone(),
+        )
+        .await?;
+        self.ensure_publication_running()?;
+        let mut tx = self
+            .store
+            .begin()
+            .await
+            .wrap_err("begin pending chain-indexed manifest activation")?;
+        Audit::record_indexed_manifest_ipns_publication(&mut tx, &manifest_cid, pending.sequence)
+            .await
+            .wrap_err("activate reconciled chain-indexed manifest")?;
+        tx.commit()
+            .await
+            .wrap_err("commit reconciled chain-indexed manifest activation")?;
+        drop(canonicality_guard);
+        self.last_ipns_sequence = Some(pending.sequence);
+        self.ipns_sequence_loaded = true;
+        Ok(true)
     }
 
     async fn validate_combined_manifest_snapshot(
@@ -1472,6 +1627,7 @@ impl ChainIndexedPublicationScheduler {
         format_version: u16,
         bytes: &[u8],
     ) -> Result<String> {
+        self.ensure_publication_running()?;
         let _pin_lifecycle = self.pin_lifecycle.lock().await;
         let reusable = Audit::live_indexed_artifact_cid(
             self.store.pool(),
@@ -1485,42 +1641,68 @@ impl ChainIndexedPublicationScheduler {
         )
         .await
         .wrap_err("lookup reusable indexed artifact CID")?;
-        let cid = if let Some(cid) = reusable {
+        let (cid, ownership) = if let Some(cid) = reusable {
             if self
                 .ipfs_client
                 .contains(&cid)
                 .await
                 .wrap_err("check reusable indexed artifact availability")?
             {
-                cid
+                (cid, None)
             } else {
                 warn!(%cid, "reusable indexed artifact CID is missing; repinning");
-                self.pin_indexed_artifact(artifact_kind, bytes).await?
+                let ownership = self.acquire_pin_ownership()?;
+                match self.pin_indexed_artifact(artifact_kind, bytes).await {
+                    Ok(returned) => (returned, Some(ownership)),
+                    Err(error) => {
+                        ownership.settle();
+                        return Err(error);
+                    }
+                }
             }
         } else {
-            self.pin_indexed_artifact(artifact_kind, bytes).await?
+            let ownership = self.acquire_pin_ownership()?;
+            match self.pin_indexed_artifact(artifact_kind, bytes).await {
+                Ok(returned) => (returned, Some(ownership)),
+                Err(error) => {
+                    ownership.settle();
+                    return Err(error);
+                }
+            }
         };
-        let mut tx = self
-            .store
-            .begin()
+        let audit_result = async {
+            let mut tx = self
+                .store
+                .begin()
+                .await
+                .wrap_err("begin indexed artifact audit transaction")?;
+            Audit::record_indexed_artifact_pin(
+                &mut tx,
+                artifact_kind,
+                dataset_kind,
+                scope,
+                range,
+                &cid,
+                byte_size,
+                content_hash,
+                format_version,
+            )
             .await
-            .wrap_err("begin indexed artifact audit transaction")?;
-        Audit::record_indexed_artifact_pin(
-            &mut tx,
-            artifact_kind,
-            dataset_kind,
-            scope,
-            range,
-            &cid,
-            byte_size,
-            content_hash,
-            format_version,
-        )
-        .await
-        .wrap_err("record indexed artifact pin")?;
-        tx.commit()
-            .await
-            .wrap_err("commit indexed artifact audit")?;
+            .wrap_err("record indexed artifact pin")?;
+            tx.commit().await.wrap_err("commit indexed artifact audit")
+        }
+        .await;
+        if let Err(error) = audit_result {
+            if let Some(ownership) = ownership {
+                self.cleanup_uncommitted_pin_while_locked(&cid, "indexed artifact", ownership)
+                    .await;
+            }
+            return Err(error);
+        }
+        if let Some(ownership) = ownership {
+            ownership.settle();
+        }
+        self.ensure_publication_running()?;
         Ok(cid.to_string())
     }
 
@@ -1539,6 +1721,51 @@ impl ChainIndexedPublicationScheduler {
                 pin_manifest(self.ipfs_client.as_ref(), bytes)
                     .await
                     .wrap_err("pin indexed artifact catalog")
+            }
+        }
+    }
+
+    async fn cleanup_uncommitted_pin_while_locked(
+        &self,
+        cid: &cid::Cid,
+        label: &'static str,
+        ownership: PinOwnershipLease,
+    ) {
+        match Audit::publication_cid_is_referenced(self.store.pool(), cid).await {
+            Ok(true) => {
+                warn!(%cid, label, "preserving uncommitted pin because it is already referenced");
+                ownership.settle();
+            }
+            Ok(false) => match self.ipfs_client.unpin(cid).await {
+                Ok(()) => ownership.settle(),
+                Err(error) => {
+                    warn!(%cid, label, %error, "failed to clean up uncommitted provider pin");
+                    if Audit::record_pin_cleanup_debt(
+                        self.store.pool(),
+                        cid,
+                        self.ipfs_client.service_name(),
+                        &error.to_string(),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        ownership.settle();
+                    }
+                }
+            },
+            Err(error) => {
+                warn!(%cid, label, %error, "preserving uncommitted pin because reference recheck failed");
+                if Audit::record_pin_cleanup_debt(
+                    self.store.pool(),
+                    cid,
+                    self.ipfs_client.service_name(),
+                    &error.to_string(),
+                )
+                .await
+                .is_ok()
+                {
+                    ownership.settle();
+                }
             }
         }
     }
@@ -1893,7 +2120,299 @@ fn provider_error(source: TransportError) -> eyre::Report {
 mod tests {
     use super::*;
     use alloy::primitives::Address;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use async_trait::async_trait;
+    use cid::Cid;
+    use railgun_indexer_core::publish::ipfs::raw_block_cid;
+    use railgun_indexer_core::publish::ipns::IpnsPublisherConfig;
+    use railgun_indexer_core::store::run_migrations;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::ContainerAsync;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn pending_reconciliation_rejects_rotated_signer_before_provider_or_ipns() -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        let old_signing_key = SigningKey::from_bytes(&[71; 32]);
+        let current_signing_key = SigningKey::from_bytes(&[72; 32]);
+        let (manifest_cid, _) =
+            record_pending_indexed_manifest(&store, &old_signing_key, 11, None).await?;
+        let ipfs = Arc::new(ReconciliationIpfs::default());
+        let mut scheduler =
+            reconciliation_scheduler(store.clone(), ipfs.clone(), current_signing_key)?;
+        let ipns_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&ipns_calls);
+
+        let error = scheduler
+            .reconcile_pending_manifest_with(move |_, _, _| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("current signer must reject a pending manifest signed by the old key");
+
+        assert!(
+            format_report_chain(&error).contains("publisher public key mismatch"),
+            "unexpected reconciliation error: {error:?}"
+        );
+        assert_eq!(ipfs.pin_count(), 0);
+        assert_eq!(ipfs.unpin_count(), 0);
+        assert_eq!(ipns_calls.load(Ordering::SeqCst), 0);
+        assert!(indexed_manifest_is_pending(store.pool(), &manifest_cid, 11).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn pending_reconciliation_cleans_unreferenced_provider_cid_mismatch_without_ipns()
+    -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        let signing_key = SigningKey::from_bytes(&[73; 32]);
+        let (manifest_cid, manifest_json) =
+            record_pending_indexed_manifest(&store, &signing_key, 12, None).await?;
+        let returned_cid = raw_block_cid(b"provider returned a different packaged CID")?;
+        let ipfs = Arc::new(ReconciliationIpfs::returning(returned_cid));
+        let mut scheduler = reconciliation_scheduler(store.clone(), ipfs.clone(), signing_key)?;
+        let ipns_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&ipns_calls);
+
+        let error = scheduler
+            .reconcile_pending_manifest_with(move |_, _, _| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("provider CID mismatch must fail closed");
+
+        assert!(matches!(
+            error.downcast_ref::<IpfsError>(),
+            Some(IpfsError::CidMismatch {
+                expected,
+                returned,
+                ..
+            }) if expected.as_ref() == &manifest_cid && returned.as_ref() == &returned_cid
+        ));
+        assert_eq!(ipfs.pinned_bytes(), vec![manifest_json.into_bytes()]);
+        assert_eq!(ipfs.unpin_count(), 1);
+        assert_eq!(ipns_calls.load(Ordering::SeqCst), 0);
+        assert!(indexed_manifest_is_pending(store.pool(), &manifest_cid, 12).await?);
+        assert_eq!(scheduler.pin_lifecycle.active_pin_owners(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn pending_reconciliation_preserves_referenced_mismatching_provider_cid() -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        let signing_key = SigningKey::from_bytes(&[77; 32]);
+        let (manifest_cid, _) =
+            record_pending_indexed_manifest(&store, &signing_key, 15, None).await?;
+        let returned_cid = raw_block_cid(b"independently referenced returned CID")?;
+        let scope = ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: 1,
+            railgun_contract: Address::from([0xcc; 20]),
+        };
+        let range = IndexedArtifactRange {
+            kind: IndexedArtifactRangeKind::Block,
+            start: 1,
+            end: 1,
+        };
+        let mut tx = store.begin().await?;
+        Audit::record_indexed_artifact_pin(
+            &mut tx,
+            IndexedArtifactPublicationKind::Chunk,
+            IndexedDatasetKind::WalletScan,
+            &scope,
+            &range,
+            &returned_cid,
+            1,
+            &[1; 32],
+            1,
+        )
+        .await?;
+        tx.commit().await?;
+        let ipfs = Arc::new(ReconciliationIpfs::returning(returned_cid));
+        let mut scheduler = reconciliation_scheduler(store.clone(), ipfs.clone(), signing_key)?;
+        let ipns_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&ipns_calls);
+
+        let _error = scheduler
+            .reconcile_pending_manifest_with(move |_, _, _| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("provider CID mismatch must fail closed");
+
+        assert_eq!(ipfs.unpin_count(), 0);
+        assert_eq!(ipns_calls.load(Ordering::SeqCst), 0);
+        assert!(indexed_manifest_is_pending(store.pool(), &manifest_cid, 15).await?);
+        assert_eq!(scheduler.pin_lifecycle.active_pin_owners(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn pending_reconciliation_records_cleanup_debt_when_mismatch_unpin_fails() -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        let signing_key = SigningKey::from_bytes(&[78; 32]);
+        let (manifest_cid, _) =
+            record_pending_indexed_manifest(&store, &signing_key, 16, None).await?;
+        let returned_cid = raw_block_cid(b"returned CID whose cleanup fails")?;
+        let ipfs = Arc::new(ReconciliationIpfs::returning(returned_cid));
+        ipfs.fail_unpin.store(true, Ordering::SeqCst);
+        let mut scheduler = reconciliation_scheduler(store.clone(), ipfs.clone(), signing_key)?;
+        let ipns_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&ipns_calls);
+
+        let _error = scheduler
+            .reconcile_pending_manifest_with(move |_, _, _| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("provider CID mismatch must fail closed");
+
+        let debt: Option<String> =
+            sqlx::query_scalar("SELECT cid FROM pin_cleanup_debt WHERE cid = $1")
+                .bind(returned_cid.to_string())
+                .fetch_optional(store.pool())
+                .await?;
+        assert_eq!(debt, Some(returned_cid.to_string()));
+        assert_eq!(ipns_calls.load(Ordering::SeqCst), 0);
+        assert!(indexed_manifest_is_pending(store.pool(), &manifest_cid, 16).await?);
+        assert_eq!(scheduler.pin_lifecycle.active_pin_owners(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn pending_reconciliation_repins_exact_body_before_ipns_and_activates() -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        let signing_key = SigningKey::from_bytes(&[74; 32]);
+        let trusted_publisher_pubkey = signing_key.verifying_key().to_bytes();
+        let provider_packaged_cid = raw_block_cid(b"provider-packaged manifest CID")?;
+        let (manifest_cid, manifest_json) =
+            record_pending_indexed_manifest(&store, &signing_key, 13, Some(provider_packaged_cid))
+                .await?;
+        assert_ne!(manifest_cid, raw_block_cid(manifest_json.as_bytes())?);
+        let ipfs = Arc::new(ReconciliationIpfs::returning(provider_packaged_cid));
+        let mut scheduler = reconciliation_scheduler(store.clone(), ipfs.clone(), signing_key)?;
+        let ipns_calls = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::clone(&ipns_calls);
+
+        assert!(
+            scheduler
+                .reconcile_pending_manifest_with(move |cid, sequence, _lease| async move {
+                    calls.lock().expect("IPNS calls lock").push((cid, sequence));
+                    Ok(())
+                })
+                .await?
+        );
+
+        assert_eq!(ipfs.pinned_bytes(), vec![manifest_json.into_bytes()]);
+        assert_eq!(ipfs.unpin_count(), 0);
+        assert_eq!(
+            *ipns_calls.lock().expect("IPNS calls lock"),
+            vec![(manifest_cid.to_string(), 13)]
+        );
+        assert!(!indexed_manifest_is_pending(store.pool(), &manifest_cid, 13).await?);
+        assert!(
+            Audit::pending_indexed_manifest_publication(store.pool(), &trusted_publisher_pubkey,)
+                .await?
+                .is_none()
+        );
+        assert_eq!(scheduler.last_ipns_sequence, Some(13));
+        assert!(scheduler.ipns_sequence_loaded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn pending_reconciliation_shutdown_after_ipns_leaves_durable_pending_unactivated()
+    -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        let signing_key = SigningKey::from_bytes(&[75; 32]);
+        let (manifest_cid, _) =
+            record_pending_indexed_manifest(&store, &signing_key, 14, None).await?;
+        let ipfs = Arc::new(ReconciliationIpfs::default());
+        let mut scheduler = reconciliation_scheduler(store.clone(), ipfs, signing_key)?;
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        scheduler.shutdown = shutdown;
+
+        let error = scheduler
+            .reconcile_pending_manifest_with(move |_, _, _lease| async move {
+                shutdown_tx.send(true).expect("request shutdown after IPNS");
+                Ok(())
+            })
+            .await
+            .expect_err("shutdown must stop before activation");
+
+        assert!(error.to_string().contains("cooperative shutdown boundary"));
+        assert!(indexed_manifest_is_pending(store.pool(), &manifest_cid, 14).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker PostgreSQL"]
+    async fn fresh_indexed_artifact_pin_is_cleaned_when_audit_commit_fails() -> Result<()> {
+        let (_postgres, store) = reconciliation_store().await?;
+        sqlx::query(
+            r"
+            CREATE FUNCTION reject_indexed_artifact_audit() RETURNS trigger AS $$
+            BEGIN RAISE EXCEPTION 'forced indexed artifact audit failure'; END;
+            $$ LANGUAGE plpgsql
+            ",
+        )
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_indexed_artifact_audit \
+             BEFORE INSERT ON published_indexed_artifacts \
+             FOR EACH ROW EXECUTE FUNCTION reject_indexed_artifact_audit()",
+        )
+        .execute(store.pool())
+        .await?;
+        let signing_key = SigningKey::from_bytes(&[76; 32]);
+        let ipfs = Arc::new(ReconciliationIpfs::default());
+        let scheduler = reconciliation_scheduler(store.clone(), ipfs.clone(), signing_key)?;
+        let scope = ChainScope {
+            chain_type: ChainType::Evm,
+            chain_id: 1,
+            railgun_contract: Address::from([0xbb; 20]),
+        };
+        let range = IndexedArtifactRange {
+            kind: IndexedArtifactRangeKind::Block,
+            start: 1,
+            end: 1,
+        };
+        let bytes = b"fresh indexed artifact";
+
+        let _error = scheduler
+            .reuse_or_pin_indexed_artifact(
+                IndexedArtifactPublicationKind::Chunk,
+                IndexedDatasetKind::WalletScan,
+                &scope,
+                &range,
+                u64::try_from(bytes.len())?,
+                &content_hash(bytes),
+                1,
+                bytes,
+            )
+            .await
+            .expect_err("forced audit failure must fail publication");
+
+        assert_eq!(ipfs.pin_count(), 1);
+        assert_eq!(ipfs.unpin_count(), 1);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM published_indexed_artifacts")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(rows, 0);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn replacement_watermark_is_rejected_inside_publication_lease() {
@@ -2187,6 +2706,177 @@ mod tests {
             latest_indexed_block(&latest_indexed, IndexedDatasetKind::Commitments),
             None
         );
+    }
+
+    async fn reconciliation_store() -> Result<(ContainerAsync<Postgres>, Store)> {
+        let node = Postgres::default()
+            .start()
+            .await
+            .wrap_err("start Docker PostgreSQL; this ignored test requires Docker")?;
+        let connection_string = format!(
+            "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+            node.get_host_port_ipv4(5432).await?
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&connection_string)
+            .await?;
+        run_migrations(&pool).await?;
+        Ok((node, Store::new(pool)))
+    }
+
+    fn reconciliation_scheduler(
+        store: Store,
+        ipfs_client: Arc<ReconciliationIpfs>,
+        signing_key: SigningKey,
+    ) -> Result<ChainIndexedPublicationScheduler> {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../../../config.railgun-indexer.example.yaml"))
+                .wrap_err("parse example config for reconciliation test")?;
+        config.chain_indexed.chains.clear();
+        let (ipns_publisher, _ipns_task) = IpnsPublisher::new(
+            &signing_key,
+            IpnsPublisherConfig {
+                bootstrap_peers: Vec::new(),
+                record_lifetime: Duration::from_mins(1),
+                record_ttl: Duration::from_secs(30),
+                publish_timeout: Duration::from_secs(1),
+            },
+        )?;
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        Ok(ChainIndexedPublicationScheduler {
+            config,
+            store,
+            ipfs_client,
+            signing_key,
+            ipns_publisher,
+            pin_lifecycle: PinLifecycleCoordinator::default(),
+            canonicality: ChainCanonicalityCoordinator::default(),
+            last_ipns_sequence: None,
+            ipns_sequence_loaded: false,
+            shutdown,
+        })
+    }
+
+    async fn record_pending_indexed_manifest(
+        store: &Store,
+        signing_key: &SigningKey,
+        sequence: u64,
+        audited_cid: Option<Cid>,
+    ) -> Result<(Cid, String)> {
+        let mut manifest = railgun_indexer_core::manifest::IndexedArtifactManifest::new(
+            1_700_000_000_000,
+            sequence,
+            PublisherIdentity::ed25519(FixedBytes::ZERO),
+            Vec::new(),
+        );
+        manifest.sign_manifest(signing_key)?;
+        let manifest_json = serde_json::to_string(&manifest)?;
+        let manifest_cid = match audited_cid {
+            Some(cid) => cid,
+            None => raw_block_cid(manifest_json.as_bytes())?,
+        };
+        let mut tx = store.begin().await?;
+        Audit::record_indexed_manifest_pin(
+            &mut tx,
+            &manifest_cid,
+            &[],
+            sequence,
+            u64::try_from(manifest_json.len())?,
+            &content_hash(manifest_json.as_bytes()),
+            INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
+            &manifest_json,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((manifest_cid, manifest_json))
+    }
+
+    async fn indexed_manifest_is_pending(
+        pool: &sqlx::PgPool,
+        cid: &Cid,
+        sequence: u64,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            r"
+            SELECT ipns_published_at IS NULL
+               AND superseded_at IS NULL
+               AND unpinned_at IS NULL
+               AND reconciliation_invalidated_at IS NULL
+            FROM published_indexed_manifests
+            WHERE cid = $1 AND ipns_sequence = $2
+            ",
+        )
+        .bind(cid.to_string())
+        .bind(i64::try_from(sequence)?)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    #[derive(Debug, Default)]
+    struct ReconciliationIpfs {
+        returned_cid: Option<Cid>,
+        pinned: Mutex<Vec<Vec<u8>>>,
+        unpin_count: AtomicUsize,
+        fail_unpin: AtomicBool,
+    }
+
+    impl ReconciliationIpfs {
+        fn returning(returned_cid: Cid) -> Self {
+            Self {
+                returned_cid: Some(returned_cid),
+                pinned: Mutex::new(Vec::new()),
+                unpin_count: AtomicUsize::new(0),
+                fail_unpin: AtomicBool::new(false),
+            }
+        }
+
+        fn pinned_bytes(&self) -> Vec<Vec<u8>> {
+            self.pinned.lock().expect("pinned bytes lock").clone()
+        }
+
+        fn pin_count(&self) -> usize {
+            self.pinned.lock().expect("pinned bytes lock").len()
+        }
+
+        fn unpin_count(&self) -> usize {
+            self.unpin_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl IpfsClient for ReconciliationIpfs {
+        fn service_name(&self) -> &'static str {
+            "reconciliation-test"
+        }
+
+        async fn pin_bytes(&self, bytes: &[u8]) -> Result<Cid, IpfsError> {
+            self.pinned
+                .lock()
+                .expect("pinned bytes lock")
+                .push(bytes.to_vec());
+            match self.returned_cid {
+                Some(cid) => Ok(cid),
+                None => raw_block_cid(bytes),
+            }
+        }
+
+        async fn unpin(&self, _cid: &Cid) -> Result<(), IpfsError> {
+            self.unpin_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_unpin.load(Ordering::SeqCst) {
+                Err(IpfsError::UnpinFailed {
+                    service: self.service_name().to_string(),
+                    cid: Box::new(*_cid),
+                    source: Box::new(std::io::Error::other("forced unpin failure")),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn contains(&self, _cid: &Cid) -> Result<bool, IpfsError> {
+            Ok(true)
+        }
     }
 
     fn chunk_descriptor(

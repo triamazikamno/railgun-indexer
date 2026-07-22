@@ -317,7 +317,7 @@ mod tests {
             .find(|section| section.section_id == COMMITMENT_RECORD_SECTION_ID)
             .expect("commitment section exists");
         assert_eq!(section.offset, 0);
-        let bytes = envelope.payload.get(0..8).expect("record count bytes");
+        let bytes = envelope.payload().get(0..8).expect("record count bytes");
         u64::from_le_bytes(bytes.try_into().expect("u64 count"))
     }
 

@@ -1,15 +1,15 @@
+use crate::config::DEFAULT_POI_TXID_VERSION;
 use crate::scrape::page_size::PageSizeAdapter;
 use crate::scrape::retry::RetryPolicy;
 use crate::status::SharedStatus;
 use crate::store::{Store, StoreError, StoredBlockedShield};
-use crate::verify::{VerifyError, verify_blocked_shield};
-use alloy_primitives::{FixedBytes, U256, hex};
-use broadcaster_core::transact::MERKLE_ZERO_VALUE;
+use crate::verify::{VerifyError, verify_blocked_shield, verify_poi_event};
+use alloy_primitives::{FixedBytes, hex};
 use broadcaster_core::tree::normalize_tree_position;
 use poi::artifacts::SnapshotEvent;
 use poi::cache::{PoiCache, PoiCacheError, PoiCacheIdentity};
 use poi::error::PoiRpcError;
-use poi::poi::{PoiEventType, PoiRpcClient, SignedBlockedShield};
+use poi::poi::{PoiRpcClient, SignedBlockedShield};
 use reqwest::StatusCode;
 use std::error::Error;
 use std::time::Duration;
@@ -18,8 +18,6 @@ use tokio::sync::watch;
 use tracing::info;
 
 const EVM_CHAIN_TYPE: u8 = 0;
-const POSEIDON_TXID_VERSION: &str = "V2_PoseidonMerkle";
-
 pub struct ScrapeWorker {
     list_key: FixedBytes<32>,
     chain_id: u64,
@@ -29,13 +27,14 @@ pub struct ScrapeWorker {
     retry_policy: RetryPolicy,
     store: Store,
     polite_interval: Duration,
+    txid_version: String,
     status: Option<SharedStatus>,
     cache: Option<PoiCache>,
 }
 
 impl ScrapeWorker {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         list_key: FixedBytes<32>,
         chain_id: u64,
         upstream_url: String,
@@ -54,9 +53,16 @@ impl ScrapeWorker {
             retry_policy,
             store,
             polite_interval,
+            txid_version: DEFAULT_POI_TXID_VERSION.to_string(),
             status: None,
             cache: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_txid_version(mut self, txid_version: impl Into<String>) -> Self {
+        self.txid_version = txid_version.into();
+        self
     }
 
     #[must_use]
@@ -82,11 +88,16 @@ impl ScrapeWorker {
 
     pub async fn sync_next_page(&mut self) -> Result<SyncPageOutcome, ScrapeError> {
         let start_index = self.next_start_index().await?;
-        let end_index = exclusive_end_index(start_index, self.page_size.current_size())?;
-        let leaves = self
+        let end_exclusive = exclusive_end_index(start_index, self.page_size.current_size())?;
+        let end_index = end_exclusive
+            .checked_sub(1)
+            .ok_or(ScrapeError::IndexOverflow {
+                last_event_index: start_index,
+            })?;
+        let events = self
             .rpc_client
-            .poi_merkletree_leaves(
-                POSEIDON_TXID_VERSION,
+            .poi_events(
+                &self.txid_version,
                 EVM_CHAIN_TYPE,
                 self.chain_id,
                 &self.list_key,
@@ -95,19 +106,43 @@ impl ScrapeWorker {
             )
             .await?;
 
-        let leaves = trim_zero_padding(&leaves);
-        if leaves.is_empty() {
+        if events.is_empty() {
             return Ok(SyncPageOutcome::CaughtUp);
         }
 
-        let last_event_index = start_index
-            .checked_add(leaves.len() as u64)
-            .and_then(|next_index| next_index.checked_sub(1))
-            .ok_or(ScrapeError::IndexOverflow {
-                last_event_index: start_index,
+        let list_key = self.list_key_bytes();
+        let mut snapshot_events = Vec::with_capacity(events.len());
+        for (offset, event) in events.iter().enumerate() {
+            let expected =
+                start_index
+                    .checked_add(offset as u64)
+                    .ok_or(ScrapeError::IndexOverflow {
+                        last_event_index: start_index,
+                    })?;
+            if event.signed_poi_event.index != expected {
+                return Err(ScrapeError::NonContiguousEvent {
+                    expected,
+                    actual: event.signed_poi_event.index,
+                });
+            }
+            verify_poi_event(&event.signed_poi_event, &list_key).map_err(|source| {
+                ScrapeError::InvalidEventSignature {
+                    event_index: event.signed_poi_event.index,
+                    source,
+                }
             })?;
+            snapshot_events.push(SnapshotEvent {
+                event_index: event.signed_poi_event.index,
+                blinded_commitment: event.signed_poi_event.blinded_commitment.0,
+                signature: decode_event_signature(&event.signed_poi_event.signature)?,
+                event_type: event.signed_poi_event.event_type,
+            });
+        }
+        let last_event_index = snapshot_events
+            .last()
+            .ok_or(ScrapeError::CacheUnavailable)?
+            .event_index;
         let mut cache = self.cached_poi_cache().await?.clone();
-        let snapshot_events = leaf_snapshot_events(start_index, leaves)?;
         cache.apply_verified_artifact_events(&snapshot_events)?;
         if !cache.validate_roots(&self.rpc_client).await? {
             return Err(ScrapeError::RootRejected);
@@ -120,22 +155,34 @@ impl ScrapeWorker {
         let last_tip_merkleroot = hex::encode_prefixed(last_tip_merkleroot);
 
         let mut tx = self.store.begin().await?;
-        Store::insert_event_leaves(&mut tx, &self.list_key, self.chain_id, start_index, leaves)
-            .await?;
-        Store::advance_chain_tip(
+        let signed_events = events
+            .iter()
+            .map(|event| event.signed_poi_event.clone())
+            .collect::<Vec<_>>();
+        Store::insert_events(&mut tx, &self.list_key, self.chain_id, &signed_events).await?;
+        let durable_tip = Store::last_event_index_in_transaction(
             &mut tx,
             &self.list_key,
             self.chain_id,
             &self.upstream_url,
-            last_event_index,
-            Some(&last_tip_merkleroot),
         )
         .await?;
+        if durable_tip.is_none_or(|tip| last_event_index >= tip) {
+            Store::advance_chain_tip(
+                &mut tx,
+                &self.list_key,
+                self.chain_id,
+                &self.upstream_url,
+                last_event_index,
+                Some(&last_tip_merkleroot),
+            )
+            .await?;
+        }
         tx.commit().await.map_err(StoreError::Sqlx)?;
         self.cache = Some(cache);
 
         Ok(SyncPageOutcome::Ingested {
-            count: leaves.len(),
+            count: events.len(),
             last_event_index,
         })
     }
@@ -426,7 +473,7 @@ impl ScrapeWorker {
         let records = self
             .rpc_client
             .blocked_shields(
-                POSEIDON_TXID_VERSION,
+                &self.txid_version,
                 EVM_CHAIN_TYPE,
                 self.chain_id,
                 &self.list_key,
@@ -445,6 +492,13 @@ impl ScrapeWorker {
     }
 
     async fn next_start_index(&self) -> Result<u64, ScrapeError> {
+        if let Some(index) = self
+            .store
+            .first_incomplete_event_index(&self.list_key, self.chain_id)
+            .await?
+        {
+            return Ok(index);
+        }
         let Some(last_event_index) = self
             .store
             .last_event_index(&self.list_key, self.chain_id, &self.upstream_url)
@@ -469,7 +523,7 @@ impl ScrapeWorker {
         let mut cache = PoiCache::new(PoiCacheIdentity::new(
             EVM_CHAIN_TYPE,
             self.chain_id,
-            POSEIDON_TXID_VERSION,
+            self.txid_version.clone(),
             self.list_key,
         ));
         let Some(last_event_index) = self
@@ -481,15 +535,15 @@ impl ScrapeWorker {
         };
         let events = self
             .store
-            .page_event_range(&self.list_key, self.chain_id, 0, last_event_index)
+            .page_event_range_for_hydration(&self.list_key, self.chain_id, 0, last_event_index)
             .await?;
         let snapshot_events = events
             .into_iter()
             .map(|event| SnapshotEvent {
                 event_index: event.event_index,
                 blinded_commitment: event.blinded_commitment,
-                signature: [0; 64],
-                event_type: PoiEventType::Shield,
+                signature: event.signature,
+                event_type: event.event_type,
             })
             .collect::<Vec<_>>();
         cache.apply_verified_artifact_events(&snapshot_events)?;
@@ -573,6 +627,12 @@ pub enum ScrapeError {
     PoiRpc(#[from] PoiRpcError),
     #[error("POI signature verification failed")]
     Verify(#[from] VerifyError),
+    #[error("POI event {event_index} signature verification failed")]
+    InvalidEventSignature {
+        event_index: u64,
+        #[source]
+        source: VerifyError,
+    },
     #[error("POI cache operation failed")]
     Cache(#[from] PoiCacheError),
     #[error("store operation failed")]
@@ -581,6 +641,10 @@ pub enum ScrapeError {
     CacheUnavailable,
     #[error("POI leaf roots were rejected by upstream")]
     RootRejected,
+    #[error("POI event index is not contiguous: expected {expected}, got {actual}")]
+    NonContiguousEvent { expected: u64, actual: u64 },
+    #[error("invalid POI event signature encoding")]
+    EventSignature,
     #[error("replayed POI root missing for tree {tree_number}")]
     MissingRoot { tree_number: u32 },
     #[error("invalid POI leaf hex {leaf}")]
@@ -616,7 +680,7 @@ pub enum ScrapeError {
 impl ScrapeError {
     fn is_retryable(&self) -> bool {
         match self {
-            Self::PoiRpc(PoiRpcError::Post(_)) => true,
+            Self::PoiRpc(PoiRpcError::Post { .. }) => true,
             Self::PoiRpc(PoiRpcError::HttpStatus { status, .. }) => {
                 status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS
             }
@@ -633,6 +697,13 @@ fn exclusive_end_index(start_index: u64, page_size: usize) -> Result<u64, Scrape
         })
 }
 
+fn decode_event_signature(signature: &str) -> Result<[u8; 64], ScrapeError> {
+    hex::decode(signature.strip_prefix("0x").unwrap_or(signature))
+        .map_err(|_| ScrapeError::EventSignature)?
+        .try_into()
+        .map_err(|_| ScrapeError::EventSignature)
+}
+
 fn stored_blocked_shields(records: &[StoredBlockedShield]) -> Vec<SignedBlockedShield> {
     records
         .iter()
@@ -643,43 +714,6 @@ fn stored_blocked_shields(records: &[StoredBlockedShield]) -> Vec<SignedBlockedS
             signature: hex::encode(record.signature),
         })
         .collect()
-}
-
-fn leaf_snapshot_events(
-    start_index: u64,
-    leaves: &[U256],
-) -> Result<Vec<SnapshotEvent>, ScrapeError> {
-    leaves
-        .iter()
-        .enumerate()
-        .map(|(offset, leaf)| {
-            let event_index =
-                start_index
-                    .checked_add(offset as u64)
-                    .ok_or(ScrapeError::IndexOverflow {
-                        last_event_index: start_index,
-                    })?;
-            Ok(SnapshotEvent {
-                event_index,
-                blinded_commitment: leaf.to_be_bytes::<32>(),
-                signature: [0; 64],
-                event_type: PoiEventType::Shield,
-            })
-        })
-        .collect()
-}
-
-fn trim_zero_padding(leaves: &[U256]) -> &[U256] {
-    for (index, leaf) in leaves.iter().enumerate() {
-        if leaf.to_be_bytes::<32>() == merkle_zero_leaf() {
-            return &leaves[..index];
-        }
-    }
-    leaves
-}
-
-const fn merkle_zero_leaf() -> [u8; 32] {
-    MERKLE_ZERO_VALUE.to_be_bytes::<32>()
 }
 
 fn format_error_chain(error: &(dyn Error + 'static)) -> String {
@@ -723,33 +757,5 @@ async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bo
     tokio::select! {
         () = tokio::time::sleep(duration) => shutdown_requested(shutdown),
         result = shutdown.changed() => result.is_err() || shutdown_requested(shutdown),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{merkle_zero_leaf, trim_zero_padding};
-    use alloy_primitives::U256;
-
-    fn leaf(byte: u8) -> U256 {
-        U256::from_be_bytes([byte; 32])
-    }
-
-    #[test]
-    fn trim_zero_padding_returns_real_leaf_prefix() {
-        let leaves = vec![leaf(1), U256::from_be_bytes(merkle_zero_leaf()), leaf(2)];
-
-        let trimmed = trim_zero_padding(&leaves);
-
-        assert_eq!(trimmed, &leaves[..1]);
-    }
-
-    #[test]
-    fn trim_zero_padding_treats_first_zero_as_empty_page() {
-        let leaves = vec![U256::from_be_bytes(merkle_zero_leaf())];
-
-        let trimmed = trim_zero_padding(&leaves);
-
-        assert!(trimmed.is_empty());
     }
 }

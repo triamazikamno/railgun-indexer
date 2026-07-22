@@ -11,17 +11,19 @@ pub const SUPPORTED_CHAIN_IDS: &[u64] = &[1, 56, 137, 42161];
 
 const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
-const POSTGRES_BACKGROUND_CONNECTION_HEADROOM: usize = 4;
+const POSTGRES_BACKGROUND_CONNECTION_HEADROOM: usize = 5;
 const UPSTREAM_MAX_PAGE_SIZE: usize = 100;
 const DEFAULT_CHAIN_INDEXED_DATASET_COUNT: usize = 4;
 const DEFAULT_CHAIN_INDEXED_TAIL_SAFETY_INTERVAL: Duration = Duration::from_mins(5);
 const DEFAULT_CHAIN_INDEXED_TAIL_SAFETY_BLOCK_SPAN: u64 = 1_000;
+pub const DEFAULT_POI_TXID_VERSION: &str = "V2_PoseidonMerkle";
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub upstream_url: String,
     pub list_keys: Vec<FixedBytes<32>>,
     pub chain_ids: Vec<u64>,
+    pub txid_version: String,
     pub postgres_connection_string: String,
     pub ipfs_endpoint: String,
     pub publisher_signing_key_path: PathBuf,
@@ -71,6 +73,8 @@ pub struct PoiDatasetConfig {
     pub upstream_url: String,
     pub list_keys: Vec<FixedBytes<32>>,
     pub chain_ids: Vec<u64>,
+    #[serde(default = "default_poi_txid_version")]
+    pub txid_version: String,
     pub page_size_max: usize,
     pub retry_budget: usize,
     pub polite_interval: humantime_serde::Serde<Duration>,
@@ -131,6 +135,7 @@ impl From<ConfigFile> for Config {
             upstream_url: poi.upstream_url,
             list_keys: poi.list_keys,
             chain_ids: poi.chain_ids,
+            txid_version: poi.txid_version,
             postgres_connection_string: railgun_indexer.postgres_connection_string,
             ipfs_endpoint: railgun_indexer.ipfs_endpoint,
             publisher_signing_key_path: railgun_indexer.publisher_signing_key_path,
@@ -162,6 +167,9 @@ impl Config {
         }
         if self.chain_ids.is_empty() {
             return Err(ConfigValidationError::EmptyChainIds);
+        }
+        if self.txid_version.trim().is_empty() {
+            return Err(ConfigValidationError::EmptyPoiTxidVersion);
         }
         for chain_id in &self.chain_ids {
             if !SUPPORTED_CHAIN_IDS.contains(chain_id) {
@@ -332,6 +340,8 @@ pub enum ConfigValidationError {
     EmptyListKeys,
     #[error("chain_ids must contain at least one supported chain id")]
     EmptyChainIds,
+    #[error("poi.txid_version must not be empty")]
+    EmptyPoiTxidVersion,
     #[error("unsupported chain id {0}; supported chain ids are 1, 56, 137, 42161")]
     UnknownChainId(u64),
     #[error("postgres connection attempt timed out after {0:?}")]
@@ -416,6 +426,10 @@ fn default_chain_indexed_datasets() -> Vec<IndexedDatasetKind> {
     datasets
 }
 
+fn default_poi_txid_version() -> String {
+    DEFAULT_POI_TXID_VERSION.to_string()
+}
+
 fn default_chain_indexed_tail_safety_interval() -> humantime_serde::Serde<Duration> {
     DEFAULT_CHAIN_INDEXED_TAIL_SAFETY_INTERVAL.into()
 }
@@ -433,6 +447,7 @@ mod tests {
             upstream_url: "https://ppoi.example.invalid".to_string(),
             list_keys: vec![FixedBytes::from([1_u8; 32])],
             chain_ids: vec![1],
+            txid_version: DEFAULT_POI_TXID_VERSION.to_string(),
             postgres_connection_string: "not a postgres connection string".to_string(),
             ipfs_endpoint: "https://s3.filebase.com".to_string(),
             publisher_signing_key_path: PathBuf::from("publisher.key"),
@@ -507,6 +522,7 @@ mod tests {
                 "upstream_url": "https://ppoi.example.invalid",
                 "list_keys": ["0x0101010101010101010101010101010101010101010101010101010101010101"],
                 "chain_ids": [1],
+                "txid_version": "V2_PoseidonMerkle",
                 "page_size_max": 100,
                 "retry_budget": 5,
                 "polite_interval": "1s",
@@ -554,6 +570,7 @@ mod tests {
             PathBuf::from("secrets/railgun-indexer-chain-indexed-publisher.key")
         );
         assert_eq!(config.chain_ids, vec![1]);
+        assert_eq!(config.txid_version, DEFAULT_POI_TXID_VERSION);
         assert_eq!(config.per_pair_concurrency_limit, 4);
         assert!(config.chain_indexed.enabled);
         assert_eq!(config.chain_indexed.chains.len(), 1);
@@ -658,7 +675,7 @@ mod tests {
         let mut config = valid_config();
         config.per_pair_concurrency_limit = 4;
 
-        assert_eq!(config.postgres_max_connections().expect("pool size"), 12);
+        assert_eq!(config.postgres_max_connections().expect("pool size"), 13);
     }
 
     #[test]

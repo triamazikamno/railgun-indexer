@@ -1,13 +1,12 @@
 use crate::manifest::{IndexedArtifactError, IndexedArtifactManifest, ManifestError, content_hash};
 use crate::publish::ipfs::{IpfsClient, IpfsError, pin_manifest};
-use crate::publish::ipns::{IpnsError, IpnsPublication, IpnsPublisher};
-use async_trait::async_trait;
+use crate::publish::ipns::{IpnsError, ManifestIpnsPublisher};
 use ed25519_dalek::SigningKey;
 use thiserror::Error;
 
 pub async fn publish_indexed_artifact_manifest(
     ipfs_client: &dyn IpfsClient,
-    ipns_publisher: &dyn IndexedManifestIpnsPublisher,
+    ipns_publisher: &dyn ManifestIpnsPublisher,
     signing_key: &SigningKey,
     mut manifest: IndexedArtifactManifest,
 ) -> Result<PublishedIndexedArtifactManifest, IndexedManifestPublicationError> {
@@ -30,26 +29,6 @@ pub async fn publish_indexed_artifact_manifest(
         ipns_name: publication.ipns_name,
         sequence: publication.sequence,
     })
-}
-
-#[async_trait]
-pub trait IndexedManifestIpnsPublisher: Send + Sync {
-    async fn publish_manifest_cid(
-        &self,
-        manifest_cid: &str,
-        sequence: u64,
-    ) -> Result<IpnsPublication, IpnsError>;
-}
-
-#[async_trait]
-impl IndexedManifestIpnsPublisher for IpnsPublisher {
-    async fn publish_manifest_cid(
-        &self,
-        manifest_cid: &str,
-        sequence: u64,
-    ) -> Result<IpnsPublication, IpnsError> {
-        self.publish_manifest_cid(manifest_cid, sequence).await
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +58,9 @@ mod tests {
     use super::*;
     use crate::manifest::{INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION, PublisherIdentity};
     use crate::publish::ipfs::{IpfsError, raw_block_cid};
+    use crate::publish::ipns::IpnsPublication;
     use alloy_primitives::FixedBytes;
+    use async_trait::async_trait;
     use cid::Cid;
     use libp2p::PeerId;
     use std::sync::Mutex;
@@ -170,7 +151,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl IndexedManifestIpnsPublisher for RecordingIpnsPublisher {
+    impl ManifestIpnsPublisher for RecordingIpnsPublisher {
         async fn publish_manifest_cid(
             &self,
             manifest_cid: &str,

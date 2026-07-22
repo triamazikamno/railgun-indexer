@@ -386,7 +386,7 @@ fn verify_bytes(bytes: &[u8], cid: &str, sha256: &FixedBytes<32>, byte_size: u64
 }
 
 fn parse_commitment_payload(envelope: &ChunkEnvelope) -> Result<Vec<CommitmentRow>> {
-    let mut cursor = Cursor::new(&envelope.payload);
+    let mut cursor = Cursor::new(envelope.payload());
     let count = cursor.read_u64()?;
     let count_usize = usize::try_from(count).wrap_err("commitment row count overflow")?;
     let mut rows = Vec::with_capacity(count_usize);
@@ -416,7 +416,7 @@ fn parse_merkle_checkpoint_payload(
     descriptor: &IndexedArtifactDescriptor,
     envelope: &ChunkEnvelope,
 ) -> Result<MerkleCheckpointArtifact> {
-    let mut cursor = Cursor::new(&envelope.payload);
+    let mut cursor = Cursor::new(envelope.payload());
     let tree_number = cursor.read_u32()?;
     let leaf_count = cursor.read_u64()?;
     let root = cursor.read_fixed_32()?;
@@ -455,7 +455,7 @@ fn parse_wallet_payload(envelope: &ChunkEnvelope) -> Result<WalletArtifacts> {
             .checked_add(len)
             .ok_or_else(|| eyre!("wallet section range overflow"))?;
         let bytes = envelope
-            .payload
+            .payload()
             .get(start..end)
             .ok_or_else(|| eyre!("wallet section outside payload"))?;
         let mut cursor = Cursor::new(bytes);

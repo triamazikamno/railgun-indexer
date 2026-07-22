@@ -1,25 +1,19 @@
-use alloy_primitives::{FixedBytes, hex};
+use alloy_primitives::{FixedBytes, U256, hex};
 use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 use railgun_indexer_core::blocked::BlockedShieldsArtifact;
 use railgun_indexer_core::manifest::{ArtifactDescriptor, Manifest, ManifestEntry};
-use railgun_indexer_core::snapshot::{Lifecycle, SnapshotKind, SnapshotReader};
-use railgun_indexer_core::store::{Store, run_migrations};
+use railgun_indexer_core::snapshot::{Lifecycle, LifecycleError, SnapshotKind, SnapshotReader};
+use railgun_indexer_core::store::{Store, StoreError, run_migrations};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::BTreeMap;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 #[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
 async fn lifecycle_manifest_base_and_deltas_replay_full_event_set()
 -> Result<(), Box<dyn std::error::Error>> {
-    let node = match Postgres::default().start().await {
-        Ok(node) => node,
-        Err(err) if is_docker_unavailable(&err) => {
-            eprintln!("skipping lifecycle test: Docker is unavailable");
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let node = Postgres::default().start().await?;
     let connection_string = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/postgres",
         node.get_host_port_ipv4(5432).await?
@@ -60,12 +54,10 @@ async fn lifecycle_manifest_base_and_deltas_replay_full_event_set()
     let delta_1 = SnapshotReader::read(&delta_1_bytes)?;
     let delta_2 = SnapshotReader::read(&delta_2_bytes)?;
     let rebuilt_base = SnapshotReader::read(&lifecycle.build_base(&list_key, 1, 4).await?)?;
-    let blocked_artifact = BlockedShieldsArtifact::read(
-        &lifecycle
-            .build_blocked_shields_artifact(&list_key, 1)
-            .await?
-            .to_bytes()?,
-    )?;
+    let blocked_artifact = lifecycle
+        .build_blocked_shields_artifact(&list_key, 1)
+        .await?;
+    let blocked_artifact = BlockedShieldsArtifact::read(&blocked_artifact.bytes)?;
 
     let replayed = base
         .events
@@ -111,6 +103,73 @@ async fn lifecycle_manifest_base_and_deltas_replay_full_event_set()
     assert_eq!(entry.current_tip_index, 4);
     assert_eq!(entry.current_tip_merkleroot, FixedBytes::from([99; 32]));
     assert_eq!(replayed_from_manifest, vec![0, 1, 2, 3, 4]);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn incomplete_event_data_fails_shared_reads_and_snapshot_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = Postgres::default().start().await?;
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+
+    let store = Store::new(pool);
+    let list_key = FixedBytes::from([9_u8; 32]);
+    let upstream_url = "https://ppoi.example.invalid";
+    let mut tx = store.begin().await?;
+    Store::insert_events(&mut tx, &list_key, 1, &[signed_event(0, 1)]).await?;
+    Store::insert_event_leaves(
+        &mut tx,
+        &list_key,
+        1,
+        1,
+        &[U256::from(2_u8), U256::from(3_u8)],
+    )
+    .await?;
+    Store::advance_chain_tip(
+        &mut tx,
+        &list_key,
+        1,
+        upstream_url,
+        2,
+        Some(&hex_bytes(99, 32)),
+    )
+    .await?;
+    tx.commit().await?;
+
+    let page_error = store
+        .page_event_range(&list_key, 1, 0, 2)
+        .await
+        .expect_err("incomplete rows must fail rather than filter or truncate");
+    assert!(matches!(
+        page_error,
+        StoreError::IncompletePoiEvent {
+            chain_id: 1,
+            event_index: 1
+        }
+    ));
+
+    let lifecycle = Lifecycle::new(store, upstream_url.to_string(), 0, [7; 32]);
+    let publication_error = lifecycle
+        .build_base(&list_key, 1, 2)
+        .await
+        .expect_err("snapshot publication must fail on incomplete event data");
+    assert!(matches!(
+        publication_error,
+        LifecycleError::Store(StoreError::IncompletePoiEvent {
+            chain_id: 1,
+            event_index: 1
+        })
+    ));
 
     Ok(())
 }
@@ -167,9 +226,4 @@ fn signed_blocked_shield() -> SignedBlockedShield {
 
 fn hex_bytes(byte: u8, len: usize) -> String {
     hex::encode_prefixed(vec![byte; len])
-}
-
-fn is_docker_unavailable(error: &impl std::fmt::Debug) -> bool {
-    let message = format!("{error:?}");
-    message.contains("SocketNotFoundError") || message.contains("Connection refused")
 }

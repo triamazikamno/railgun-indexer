@@ -23,6 +23,7 @@ pub struct Orchestrator {
     upstream_url_string: String,
     list_keys: Vec<FixedBytes<32>>,
     chain_ids: Vec<u64>,
+    txid_version: String,
     page_size_max: usize,
     retry_budget: usize,
     polite_interval: Duration,
@@ -46,6 +47,7 @@ impl Orchestrator {
             upstream_url_string: config.upstream_url.clone(),
             list_keys: config.list_keys.clone(),
             chain_ids: config.chain_ids.clone(),
+            txid_version: config.txid_version.clone(),
             page_size_max: config.page_size_max,
             retry_budget: config.retry_budget,
             polite_interval: *config.polite_interval,
@@ -204,7 +206,8 @@ impl Orchestrator {
             ),
             self.store.clone(),
             self.polite_interval,
-        );
+        )
+        .with_txid_version(self.txid_version.clone());
         if let Some(status) = &self.status {
             worker.with_status(status.clone())
         } else {

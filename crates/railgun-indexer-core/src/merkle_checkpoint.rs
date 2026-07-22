@@ -34,7 +34,7 @@ pub fn prepare_merkle_checkpoint_artifact(
     compression: CompressionAlgorithm,
 ) -> Result<PublishedMerkleCheckpointArtifact, MerkleCheckpointArtifactError> {
     validate_checkpoint(checkpoint)?;
-    let root = checkpoint_root(checkpoint)?;
+    let root = checkpoint_root(checkpoint);
     let range = checkpoint_range(checkpoint)?;
     let payload = encode_merkle_checkpoint(checkpoint, root)?;
     let payload_len = u64::try_from(payload.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
@@ -87,6 +87,7 @@ pub fn prepare_merkle_checkpoint_artifact(
             start_block: None,
             end_block: None,
             last_indexed_block: Some(checkpoint.last_indexed_block),
+            ..DatasetDescriptorMetadata::default()
         },
     };
 
@@ -160,28 +161,32 @@ fn encode_merkle_checkpoint(
     Ok(bytes)
 }
 
-fn checkpoint_root(
-    checkpoint: &MerkleCheckpointArtifact,
-) -> Result<[u8; 32], MerkleCheckpointArtifactError> {
-    let leaf_count = usize::try_from(TREE_LEAF_COUNT).map_err(|_| ChunkError::PayloadTooLarge)?;
-    let mut layer = vec![MERKLE_ZERO_VALUE; leaf_count];
-    for (index, leaf) in checkpoint.leaves.iter().enumerate() {
-        layer[index] = U256::from_be_bytes(*leaf);
-    }
+fn checkpoint_root(checkpoint: &MerkleCheckpointArtifact) -> [u8; 32] {
+    let mut layer = checkpoint
+        .leaves
+        .iter()
+        .copied()
+        .map(U256::from_be_bytes)
+        .collect::<Vec<_>>();
+    let mut empty_subtree_root = MERKLE_ZERO_VALUE;
 
     for _ in 0..TREE_DEPTH {
+        if !layer.len().is_multiple_of(2) {
+            layer.push(empty_subtree_root);
+        }
         let mut parents = Vec::with_capacity(layer.len() / 2);
         for pair in layer.chunks_exact(2) {
             parents.push(poseidon(vec![pair[0], pair[1]]));
         }
         layer = parents;
+        empty_subtree_root = poseidon(vec![empty_subtree_root, empty_subtree_root]);
     }
 
-    Ok(layer
+    layer
         .first()
         .copied()
         .unwrap_or(MERKLE_ZERO_VALUE)
-        .to_be_bytes::<32>())
+        .to_be_bytes::<32>()
 }
 
 fn write_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -231,6 +236,7 @@ mod tests {
     use crate::publish::ipfs::{IpfsError, raw_block_cid};
     use async_trait::async_trait;
     use cid::Cid;
+    use merkletree::tree::DenseMerkleTree;
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -238,10 +244,16 @@ mod tests {
         let ipfs = RecordingIpfsClient::default();
         let checkpoint = MerkleCheckpointArtifact {
             tree_number: 2,
-            leaf_count: 2,
+            leaf_count: 3,
             last_indexed_block: 123,
-            leaves: vec![[0x11; 32], [0x22; 32]],
+            leaves: vec![[0x11; 32], [0x22; 32], [0x33; 32]],
         };
+        let expected_root = DenseMerkleTree::from_ordered_leaves(
+            checkpoint.leaves.iter().copied().map(U256::from_be_bytes),
+            checkpoint.leaf_count,
+        )
+        .root()
+        .to_be_bytes::<32>();
 
         let published = publish_merkle_checkpoint_artifact(
             &ipfs,
@@ -261,17 +273,15 @@ mod tests {
             IndexedArtifactRangeKind::TreePosition
         );
         assert_eq!(published.descriptor.range.start, 2 * TREE_LEAF_COUNT);
-        assert_eq!(published.descriptor.range.end, 2 * TREE_LEAF_COUNT + 1);
-        assert_eq!(published.descriptor.row_count, 2);
+        assert_eq!(published.descriptor.range.end, 2 * TREE_LEAF_COUNT + 2);
+        assert_eq!(published.descriptor.row_count, 3);
         assert_eq!(published.descriptor.metadata.tree_number, Some(2));
-        assert_eq!(published.descriptor.metadata.leaf_count, Some(2));
+        assert_eq!(published.descriptor.metadata.leaf_count, Some(3));
         assert_eq!(published.descriptor.metadata.checkpoint_block, Some(123));
         assert_eq!(published.descriptor.metadata.last_indexed_block, Some(123));
         assert_eq!(
             published.descriptor.metadata.root,
-            Some(FixedBytes::from(
-                checkpoint_root(&checkpoint).expect("checkpoint root")
-            ))
+            Some(FixedBytes::from(expected_root))
         );
         assert_eq!(
             published.descriptor.byte_size,
@@ -283,8 +293,9 @@ mod tests {
             decode_merkle_checkpoint_artifact(&published.descriptor, &published.compressed_bytes)
                 .expect("decode checkpoint");
         assert_eq!(envelope.header.sections.len(), 1);
-        assert_eq!(read_u32(&envelope.payload, 0), 2);
-        assert_eq!(read_u64(&envelope.payload, 4), 2);
+        assert_eq!(read_u32(envelope.payload(), 0), 2);
+        assert_eq!(read_u64(envelope.payload(), 4), 3);
+        assert_eq!(read_fixed_32(envelope.payload(), 12), expected_root);
     }
 
     #[tokio::test]
@@ -330,6 +341,12 @@ mod tests {
                 .try_into()
                 .expect("u64 checkpoint field"),
         )
+    }
+
+    fn read_fixed_32(bytes: &[u8], offset: usize) -> [u8; 32] {
+        bytes[offset..offset + 32]
+            .try_into()
+            .expect("32-byte checkpoint field")
     }
 
     fn scope() -> ChainScope {

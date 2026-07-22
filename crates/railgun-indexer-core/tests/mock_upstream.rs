@@ -120,12 +120,10 @@ async fn indexer_mock_upstream_produces_decodable_leaf_snapshot()
 
     let lifecycle = Lifecycle::new(store, upstream_url, 0, [7; 32]);
     let snapshot = SnapshotReader::read(&lifecycle.build_base(&state.list_key, 1, 3).await?)?;
-    let blocked_artifact = BlockedShieldsArtifact::read(
-        &lifecycle
-            .build_blocked_shields_artifact(&state.list_key, 1)
-            .await?
-            .to_bytes()?,
-    )?;
+    let blocked_artifact = lifecycle
+        .build_blocked_shields_artifact(&state.list_key, 1)
+        .await?;
+    let blocked_artifact = BlockedShieldsArtifact::read(&blocked_artifact.bytes)?;
 
     assert_eq!(snapshot.events.len(), 4);
     assert_eq!(snapshot.blocked_shields.len(), 0);
@@ -287,11 +285,11 @@ async fn scrape_worker_shrinks_page_size_after_page_timeouts()
 
     let stored_events = store.page_event_range(&state.list_key, 1, 0, 10).await?;
     assert_eq!(stored_events.len(), 4);
-    assert_eq!(worker.page_size().current_size(), 2);
     assert_eq!(
         state.event_requests(),
-        vec![(0, 4), (0, 2), (2, 4), (4, 8), (4, 6)]
+        vec![(0, 3), (0, 1), (2, 3), (4, 7), (4, 5)]
     );
+    assert_eq!(worker.page_size().current_size(), 2);
 
     server.abort();
     Ok(())
@@ -346,7 +344,7 @@ async fn scrape_worker_ingests_mock_upstream_and_resumes_after_restart()
             .await?,
         Some(2)
     );
-    assert_eq!(state.event_requests(), vec![(0, 2), (2, 4), (3, 5)]);
+    assert_eq!(state.event_requests(), vec![(0, 1), (2, 3), (3, 4)]);
 
     server.abort();
     Ok(())
@@ -434,7 +432,7 @@ impl MockState {
             .lock()
             .expect("requests lock poisoned")
             .iter()
-            .filter(|request| request.method == "ppoi_poi_merkletree_leaves")
+            .filter(|request| request.method == "ppoi_poi_events")
             .filter_map(|request| request.range)
             .collect()
     }
@@ -649,7 +647,8 @@ fn worker_with_timeout(
         poi::poi::PoiRpcClient::with_http_client(
             Url::parse(upstream_url).expect("valid upstream URL"),
             http,
-        ),
+        )
+        .with_request_timeout(timeout),
         PageSizeAdapter::new(current_page_size, max_page_size, min_page_size),
         RetryPolicy::new(1, Duration::ZERO, Duration::ZERO),
         store,

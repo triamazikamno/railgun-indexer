@@ -7,9 +7,16 @@ use broadcaster_core::contracts::railgun::{
 };
 use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 use cid::Cid;
+use ed25519_dalek::SigningKey;
+use poi::artifacts::ArtifactDescriptor;
+use poi::artifacts::v4::{
+    ArtifactEncoding, BlockedShieldsDescriptor, CheckpointCatalogDescriptor, Compression,
+    FORMAT_VERSION, ManifestEntry, Scope,
+};
 use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 use railgun_indexer_core::audit::{
-    Audit, IndexedArtifactPublicationKind, PinLifecycleCoordinator, Retention,
+    Audit, IndexedArtifactPublicationKind, PinLifecycleCoordinator, PoiArtifactPublicationKind,
+    PoiManifestChannel, Retention,
 };
 use railgun_indexer_core::chain_logs::{
     IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment, IndexedLogBatch,
@@ -17,14 +24,14 @@ use railgun_indexer_core::chain_logs::{
     IndexedTransactCommitment,
 };
 use railgun_indexer_core::manifest::{
-    ChainScope, ChainType, IndexedArtifactRange, IndexedArtifactRangeKind,
-    IndexedDatasetKind as ManifestIndexedDatasetKind,
+    ChainScope, ChainType, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
+    IndexedDatasetKind as ManifestIndexedDatasetKind, PublisherIdentity, content_hash,
 };
 use railgun_indexer_core::publish::ipfs::{IpfsClient, IpfsError, raw_block_cid};
 use railgun_indexer_core::snapshot::SnapshotKind;
 use railgun_indexer_core::store::{
-    IndexedDatasetKind, Store, StoredCommitmentFamily, StoredWalletScanTimestampBackfill,
-    run_migrations,
+    IndexedDatasetKind, Store, StoreError, StoredCommitmentFamily,
+    StoredWalletScanTimestampBackfill, run_migrations,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,8 +70,8 @@ async fn migrations_apply_and_tables_roundtrip() -> Result<(), Box<dyn std::erro
 
     sqlx::query(
         "INSERT INTO poi_events \
-         (list_key, chain_id, event_index, blinded_commitment, signature, event_type) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (list_key, chain_id, event_index, blinded_commitment, signature, event_type, event_data_complete) \
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE)",
     )
     .bind(&list_key)
     .bind(1_i64)
@@ -393,7 +400,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     .execute(&pool)
     .await?;
     sqlx::query(
-        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 11, now())",
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 19, now())",
     )
     .execute(&pool)
     .await?;
@@ -401,7 +408,613 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     run_migrations(&pool).await?;
 
     assert!(!table_exists(&pool, "poi_events").await?);
-    assert_eq!(schema_version(&pool).await?, 11);
+    assert_eq!(schema_version(&pool).await?, 19);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn v18_empty_and_chain_indexed_only_databases_admit_one_exact_txid_identity_concurrently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V18 POI identity concurrency test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    sqlx::query(
+        "INSERT INTO indexer_state (key, value) VALUES ('chain_indexed_ipns_last_sequence', 9)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO chain_indexing_progress (chain_type, chain_id, railgun_contract, \
+         dataset_kind, indexed_through_block, indexed_through_block_hash) \
+         VALUES (0, 1, '0x0000000000000000000000000000000000000001', \
+         'wallet_scan', 10, $1)",
+    )
+    .bind([9_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+    let first = Store::new(pool.clone());
+    let second = Store::new(pool.clone());
+    let (first_result, second_result) = tokio::join!(
+        first.admit_poi_txid_version("V2_PoseidonMerkle"),
+        second.admit_poi_txid_version("V2_PoseidonMerkle")
+    );
+    first_result?;
+    second_result?;
+    let identities: Vec<String> =
+        sqlx::query_scalar("SELECT txid_version FROM poi_dataset_identity")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(identities, vec!["V2_PoseidonMerkle".to_string()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn v18_populated_legacy_poi_requires_explicit_exact_adoption_without_corpus_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V18 populated POI identity test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    sqlx::query(
+        "INSERT INTO chain_tips (list_key, chain_id, upstream_url, last_event_index) \
+         VALUES ($1, 1, 'https://legacy.example.invalid', 7)",
+    )
+    .bind([7_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+    let store = Store::new(pool.clone());
+    assert!(matches!(
+        store
+            .admit_poi_txid_version("V2_PoseidonMerkle")
+            .await
+            .expect_err("populated fence-less database must fail closed"),
+        StoreError::PoiTxidVersionAdoptionRequired { .. }
+    ));
+    assert_eq!(row_count(&pool, "poi_dataset_identity").await?, 0);
+    store.adopt_poi_txid_version("V2_PoseidonMerkle").await?;
+    store.adopt_poi_txid_version("V2_PoseidonMerkle").await?;
+    assert_eq!(row_count(&pool, "chain_tips").await?, 1);
+    assert!(matches!(
+        store
+            .adopt_poi_txid_version("OtherVersion")
+            .await
+            .expect_err("identity overwrite must fail"),
+        StoreError::PoiTxidVersionMismatch { .. }
+    ));
+    assert!(matches!(
+        store
+            .admit_poi_txid_version("OtherVersion")
+            .await
+            .expect_err("later config mismatch must fail"),
+        StoreError::PoiTxidVersionMismatch { .. }
+    ));
+    assert_eq!(row_count(&pool, "chain_tips").await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn v19_cleanup_debt_is_persisted_and_retried_by_retention()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V19 cleanup-debt retry test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    let cid = raw_block_cid(b"cleanup debt")?;
+    Audit::record_pin_cleanup_debt(&pool, &cid, "recording", "forced unpin failure").await?;
+    assert_eq!(row_count(&pool, "pin_cleanup_debt").await?, 1);
+
+    let ipfs = RecordingIpfsClient::default();
+    let sweep = Retention::sweep(
+        &pool,
+        &ipfs,
+        UNIX_EPOCH + Duration::from_secs(1),
+        Duration::ZERO,
+    )
+    .await?;
+
+    assert!(sweep.unpinned_cids.contains(&cid));
+    assert_eq!(row_count(&pool, "pin_cleanup_debt").await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn v15_invalidates_preexisting_pending_reconciliation_until_newer_channel_activation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V15 pending reconciliation migration test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    sqlx::query("DROP INDEX published_manifests_one_pending")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP INDEX published_poi_v4_manifests_one_pending")
+        .execute(&pool)
+        .await?;
+    sqlx::query("ALTER TABLE published_manifests DROP COLUMN reconciliation_invalidated_at")
+        .execute(&pool)
+        .await?;
+    sqlx::query("ALTER TABLE published_poi_v4_manifests DROP COLUMN reconciliation_invalidated_at")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX published_manifests_one_pending \
+         ON published_manifests ((TRUE)) \
+         WHERE ipns_published_at IS NULL AND superseded_at IS NULL AND unpinned_at IS NULL",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX published_poi_v4_manifests_one_pending \
+         ON published_poi_v4_manifests ((TRUE)) \
+         WHERE ipns_published_at IS NULL AND superseded_at IS NULL AND unpinned_at IS NULL",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE poi_indexer_schema_version SET version = 14 WHERE id = TRUE")
+        .execute(&pool)
+        .await?;
+
+    let old_legacy = raw_block_cid(b"pre-v15 pending legacy")?;
+    let old_v4 = raw_block_cid(b"pre-v15 pending v4")?;
+    sqlx::query(
+        "INSERT INTO published_manifests \
+         (cid, ipns_sequence, byte_size, content_hash, format_version) \
+         VALUES ($1, 40, 64, $2, 2)",
+    )
+    .bind(old_legacy.to_string())
+    .bind([1_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO published_poi_v4_manifests \
+         (cid, ipns_sequence, byte_size, content_hash, format_version) \
+         VALUES ($1, 40, 64, $2, 4)",
+    )
+    .bind(old_v4.to_string())
+    .bind([2_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+    let store = Store::new(pool.clone());
+    store.record_ipns_sequence(40).await?;
+
+    run_migrations(&pool).await?;
+
+    assert_eq!(schema_version(&pool).await?, 19);
+    let legacy_invalidated: Option<i64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM reconciliation_invalidated_at)::BIGINT \
+         FROM published_manifests WHERE cid = $1",
+    )
+    .bind(old_legacy.to_string())
+    .fetch_one(&pool)
+    .await?;
+    let v4_invalidated: Option<i64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM reconciliation_invalidated_at)::BIGINT \
+         FROM published_poi_v4_manifests WHERE cid = $1",
+    )
+    .bind(old_v4.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert!(legacy_invalidated.is_some());
+    assert!(v4_invalidated.is_some());
+    assert!(Audit::pending_manifest_publication(&pool).await?.is_none());
+    assert!(
+        Audit::pending_poi_artifact_manifest_publication(&pool)
+            .await?
+            .is_none()
+    );
+
+    let equal_legacy = raw_block_cid(b"post-v15 equal-sequence legacy")?;
+    let lower_v4 = raw_block_cid(b"post-v15 lower-sequence v4")?;
+    let mut tx = store.begin().await?;
+    Audit::record_manifest_pin(&mut tx, &equal_legacy, 40, 64, &[3; 32], 2).await?;
+    Audit::record_poi_artifact_manifest_pin(&mut tx, &lower_v4, &[], &[], 39, 64, &[4; 32]).await?;
+    tx.commit().await?;
+    assert_eq!(
+        Audit::pending_manifest_publication(&pool)
+            .await?
+            .expect("new legacy pending remains reconcilable")
+            .cid,
+        equal_legacy.to_string()
+    );
+    assert_eq!(
+        Audit::pending_poi_artifact_manifest_publication(&pool)
+            .await?
+            .expect("new POI artifact pending remains reconcilable")
+            .cid,
+        lower_v4.to_string()
+    );
+
+    let mut tx = store.begin().await?;
+    let equal_error = Audit::record_manifest_ipns_publication(&mut tx, &equal_legacy, 40)
+        .await
+        .expect_err("equal sequence must not replace invalidated legacy pending");
+    assert!(matches!(
+        equal_error,
+        railgun_indexer_core::audit::AuditError::ReconciliationSequenceNotNewer {
+            channel: "legacy",
+            sequence: 40,
+            invalidated_sequence: 40,
+            ..
+        }
+    ));
+    tx.rollback().await?;
+    let mut tx = store.begin().await?;
+    let lower_error = Audit::record_poi_artifact_manifest_ipns_publication(&mut tx, &lower_v4, 39)
+        .await
+        .expect_err("lower sequence must not replace invalidated POI artifact pending");
+    assert!(matches!(
+        lower_error,
+        railgun_indexer_core::audit::AuditError::ReconciliationSequenceNotNewer {
+            channel: "v4",
+            sequence: 39,
+            invalidated_sequence: 40,
+            ..
+        }
+    ));
+    tx.rollback().await?;
+
+    sqlx::query("UPDATE published_manifests SET superseded_at = now() WHERE cid = $1")
+        .bind(equal_legacy.to_string())
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE published_poi_v4_manifests SET superseded_at = now() WHERE cid = $1")
+        .bind(lower_v4.to_string())
+        .execute(&pool)
+        .await?;
+    let next_sequence = store.reserve_poi_publication_sequence(1).await?;
+    assert_eq!(next_sequence, 41);
+    let new_legacy = old_legacy;
+    let new_v4 = old_v4;
+    let mut tx = store.begin().await?;
+    Audit::record_manifest_pin(&mut tx, &new_legacy, next_sequence, 64, &[1; 32], 2).await?;
+    Audit::record_poi_artifact_manifest_pin(
+        &mut tx,
+        &new_v4,
+        &[],
+        &[],
+        next_sequence,
+        64,
+        &[2; 32],
+    )
+    .await?;
+    tx.commit().await?;
+
+    let mut tx = store.begin().await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &new_legacy, next_sequence).await?;
+    tx.commit().await?;
+    let old_v4_superseded: Option<i64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM superseded_at)::BIGINT \
+         FROM published_poi_v4_manifests \
+         WHERE cid = $1 AND reconciliation_invalidated_at IS NOT NULL",
+    )
+    .bind(old_v4.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        old_v4_superseded, None,
+        "legacy activation is channel-local"
+    );
+
+    let mut tx = store.begin().await?;
+    Audit::record_poi_artifact_manifest_ipns_publication(&mut tx, &new_v4, next_sequence).await?;
+    tx.commit().await?;
+    let old_rows: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT \
+         (SELECT EXTRACT(EPOCH FROM superseded_at)::BIGINT FROM published_manifests \
+          WHERE cid = $1 AND reconciliation_invalidated_at IS NOT NULL), \
+         (SELECT EXTRACT(EPOCH FROM superseded_at)::BIGINT FROM published_poi_v4_manifests \
+          WHERE cid = $2 AND reconciliation_invalidated_at IS NOT NULL)",
+    )
+    .bind(old_legacy.to_string())
+    .bind(old_v4.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert!(old_rows.0.is_some());
+    assert!(old_rows.1.is_some());
+    assert!(Audit::pending_manifest_publication(&pool).await?.is_none());
+    assert!(
+        Audit::pending_poi_artifact_manifest_publication(&pool)
+            .await?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn v14_tracks_event_hydration_independently_of_zero_shield_signature()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V14 event hydration migration test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    sqlx::query("ALTER TABLE poi_events DROP COLUMN event_data_complete")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE poi_indexer_schema_version SET version = 13 WHERE id = TRUE")
+        .execute(&pool)
+        .await?;
+
+    let list_key = FixedBytes::from([1_u8; 32]);
+    for (event_index, signature) in [(0_i64, vec![0_u8; 64]), (1, vec![3_u8; 64])] {
+        sqlx::query(
+            "INSERT INTO poi_events \
+             (list_key, chain_id, event_index, blinded_commitment, signature, event_type) \
+             VALUES ($1, 1, $2, $3, $4, 0)",
+        )
+        .bind(list_key.as_slice())
+        .bind(event_index)
+        .bind([2_u8; 32].as_slice())
+        .bind(signature)
+        .execute(&pool)
+        .await?;
+    }
+
+    run_migrations(&pool).await?;
+    let hydration = sqlx::query_as::<_, (i64, bool)>(
+        "SELECT event_index, event_data_complete FROM poi_events ORDER BY event_index",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(hydration, vec![(0, false), (1, true)]);
+
+    let store = Store::new(pool);
+    assert_eq!(
+        store.first_incomplete_event_index(&list_key, 1).await?,
+        Some(0)
+    );
+    assert!(matches!(
+        store
+            .page_event_range(&list_key, 1, 0, 1)
+            .await
+            .expect_err("incomplete migrated event must fail the shared read boundary"),
+        StoreError::IncompletePoiEvent {
+            chain_id: 1,
+            event_index: 0
+        }
+    ));
+    let complete_unsigned_shield = SignedPoiEvent {
+        index: 0,
+        blinded_commitment: FixedBytes::from([2_u8; 32]),
+        signature: "00".repeat(64),
+        event_type: PoiEventType::Shield,
+    };
+    let mut tx = store.begin().await?;
+    Store::insert_events(
+        &mut tx,
+        &list_key,
+        1,
+        std::slice::from_ref(&complete_unsigned_shield),
+    )
+    .await?;
+    tx.commit().await?;
+    assert_eq!(
+        store.first_incomplete_event_index(&list_key, 1).await?,
+        None
+    );
+    assert_eq!(store.page_event_range(&list_key, 1, 0, 1).await?.len(), 2);
+
+    let mut tx = store.begin().await?;
+    Store::insert_events(
+        &mut tx,
+        &list_key,
+        1,
+        std::slice::from_ref(&complete_unsigned_shield),
+    )
+    .await?;
+    Store::insert_event_leaves(&mut tx, &list_key, 1, 0, &[U256::from_be_bytes([2_u8; 32])])
+        .await?;
+    tx.commit().await?;
+
+    let mut tx = store.begin().await?;
+    let conflict = Store::insert_events(
+        &mut tx,
+        &list_key,
+        1,
+        &[SignedPoiEvent {
+            blinded_commitment: FixedBytes::from([9_u8; 32]),
+            ..complete_unsigned_shield.clone()
+        }],
+    )
+    .await
+    .expect_err("complete unsigned Shield must be immutable");
+    assert!(matches!(
+        conflict,
+        StoreError::PoiEventConflict {
+            chain_id: 1,
+            event_index: 0
+        }
+    ));
+    tx.rollback().await?;
+
+    let mut tx = store.begin().await?;
+    let conflict = Store::insert_event_leaves(&mut tx, &list_key, 1, 0, &[U256::from(9_u8)])
+        .await
+        .expect_err("differing leaf must not mutate a complete event");
+    assert!(matches!(
+        conflict,
+        StoreError::PoiEventConflict {
+            chain_id: 1,
+            event_index: 0
+        }
+    ));
+    tx.rollback().await?;
+
+    let mut tx = store.begin().await?;
+    Store::insert_event_leaves(&mut tx, &list_key, 1, 2, &[U256::from(4_u8)]).await?;
+    Store::insert_event_leaves(&mut tx, &list_key, 1, 2, &[U256::from(4_u8)]).await?;
+    tx.commit().await?;
+    assert_eq!(
+        store.first_incomplete_event_index(&list_key, 1).await?,
+        Some(2)
+    );
+    assert!(matches!(
+        store
+            .page_event_range(&list_key, 1, 0, 2)
+            .await
+            .expect_err("placeholder must not be returned as complete event data"),
+        StoreError::IncompletePoiEvent {
+            chain_id: 1,
+            event_index: 2
+        }
+    ));
+
+    let mut tx = store.begin().await?;
+    let conflict = Store::insert_event_leaves(&mut tx, &list_key, 1, 2, &[U256::from(5_u8)])
+        .await
+        .expect_err("differing placeholder leaf must conflict");
+    assert!(matches!(
+        conflict,
+        StoreError::PoiEventConflict {
+            chain_id: 1,
+            event_index: 2
+        }
+    ));
+    tx.rollback().await?;
+
+    let mut tx = store.begin().await?;
+    let conflict = Store::insert_events(
+        &mut tx,
+        &list_key,
+        1,
+        &[SignedPoiEvent {
+            index: 2,
+            blinded_commitment: FixedBytes::from([6_u8; 32]),
+            signature: "07".repeat(64),
+            event_type: PoiEventType::Transact,
+        }],
+    )
+    .await
+    .expect_err("hydration must match the placeholder commitment");
+    assert!(matches!(
+        conflict,
+        StoreError::PoiEventConflict {
+            chain_id: 1,
+            event_index: 2
+        }
+    ));
+    tx.rollback().await?;
+    assert_eq!(
+        store.first_incomplete_event_index(&list_key, 1).await?,
+        Some(2)
+    );
+
+    let hydrated_event = SignedPoiEvent {
+        index: 2,
+        blinded_commitment: FixedBytes::from(U256::from(4_u8).to_be_bytes::<32>()),
+        signature: "07".repeat(64),
+        event_type: PoiEventType::Transact,
+    };
+    let mut tx = store.begin().await?;
+    Store::insert_events(&mut tx, &list_key, 1, std::slice::from_ref(&hydrated_event)).await?;
+    tx.commit().await?;
+
+    let restarted_store = Store::new(store.pool().clone());
+    assert_eq!(
+        restarted_store
+            .first_incomplete_event_index(&list_key, 1)
+            .await?,
+        None
+    );
+    assert_eq!(
+        restarted_store
+            .page_event_range(&list_key, 1, 0, 2)
+            .await?
+            .len(),
+        3
+    );
+
+    let mut tx = restarted_store.begin().await?;
+    Store::insert_events(&mut tx, &list_key, 1, std::slice::from_ref(&hydrated_event)).await?;
+    tx.commit().await?;
+
+    let mut tx = restarted_store.begin().await?;
+    let conflict = Store::insert_events(
+        &mut tx,
+        &list_key,
+        1,
+        &[SignedPoiEvent {
+            event_type: PoiEventType::Unshield,
+            ..hydrated_event
+        }],
+    )
+    .await
+    .expect_err("hydrated event may not transition again");
+    assert!(matches!(
+        conflict,
+        StoreError::PoiEventConflict {
+            chain_id: 1,
+            event_index: 2
+        }
+    ));
+    tx.rollback().await?;
 
     Ok(())
 }
@@ -458,7 +1071,7 @@ async fn v11_conservatively_backfills_active_manifest_artifact_references()
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 11);
+    assert_eq!(schema_version(&pool).await?, 19);
     let references: Vec<(String, String)> = sqlx::query_as(
         r"
         SELECT manifest.cid, reference.artifact_cid
@@ -483,6 +1096,7 @@ async fn v11_conservatively_backfills_active_manifest_artifact_references()
         96,
         &[3_u8; 32],
         1,
+        "{}",
     )
     .await
     .expect_err("manifest with missing artifact rejected");
@@ -494,6 +1108,399 @@ async fn v11_conservatively_backfills_active_manifest_artifact_references()
         }
     ));
     tx.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn v15_to_v17_invalidates_bodyless_indexed_pending_and_replaces_at_higher_same_cid()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V15-to-V17 indexed reconciliation test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&connection_string)
+        .await?;
+    let trusted_publisher_pubkey = indexed_manifest_signing_key().verifying_key().to_bytes();
+    run_migrations(&pool).await?;
+    sqlx::query("DROP INDEX IF EXISTS published_indexed_manifests_one_pending")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE published_indexed_manifests DROP COLUMN reconciliation_invalidated_at",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("ALTER TABLE published_indexed_manifests DROP COLUMN manifest_json")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE poi_indexer_schema_version SET version = 15 WHERE id = TRUE")
+        .execute(&pool)
+        .await?;
+
+    let store = Store::new(pool.clone());
+    store.record_chain_indexed_ipns_sequence(4).await?;
+    let manifest_cid = raw_block_cid(b"v15 bodyless indexed pending")?;
+    let old_artifact_cid = raw_block_cid(b"v15 bodyless indexed artifact")?;
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Catalog,
+        ManifestIndexedDatasetKind::WalletScan,
+        &indexed_scope(),
+        &IndexedArtifactRange {
+            kind: IndexedArtifactRangeKind::Block,
+            start: 0,
+            end: 0,
+        },
+        &old_artifact_cid,
+        64,
+        &[11; 32],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    let old_manifest_id: i64 = sqlx::query_scalar(
+        r"
+        INSERT INTO published_indexed_manifests (
+            cid, ipns_sequence, byte_size, content_hash, format_version
+        ) VALUES ($1, 17, 64, $2, 1)
+        RETURNING id
+        ",
+    )
+    .bind(manifest_cid.to_string())
+    .bind([12_u8; 32].as_slice())
+    .fetch_one(&pool)
+    .await?;
+    insert_indexed_manifest_edge(&pool, old_manifest_id, &old_artifact_cid).await?;
+
+    run_migrations(&pool).await?;
+
+    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(17));
+    assert!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await?
+            .is_none()
+    );
+    let old_state: (bool, bool, bool) = sqlx::query_as(
+        "SELECT reconciliation_invalidated_at IS NOT NULL, \
+                superseded_at IS NOT NULL, unpinned_at IS NOT NULL \
+         FROM published_indexed_manifests WHERE id = $1",
+    )
+    .bind(old_manifest_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(old_state, (true, false, false));
+    assert_eq!(
+        indexed_manifest_edge_count(&pool, old_manifest_id).await?,
+        1
+    );
+
+    age_indexed_rows(&pool, 100).await?;
+    let ipfs = RecordingIpfsClient::default();
+    let protected = Retention::sweep(
+        &pool,
+        &ipfs,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+    assert!(protected.unpinned_cids.is_empty());
+
+    let (equal_manifest, equal_json) = signed_indexed_manifest(17)?;
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &manifest_cid,
+        &[],
+        17,
+        u64::try_from(equal_json.len())?,
+        &content_hash(equal_json.as_bytes()),
+        equal_manifest.format_version,
+        &equal_json,
+    )
+    .await?;
+    let equal_error = Audit::record_indexed_manifest_ipns_publication(&mut tx, &manifest_cid, 17)
+        .await
+        .expect_err("equal sequence must not replace invalidated indexed pending");
+    assert!(matches!(
+        equal_error,
+        railgun_indexer_core::audit::AuditError::ReconciliationSequenceNotNewer {
+            channel: "chain-indexed",
+            sequence: 17,
+            invalidated_sequence: 17,
+            ..
+        }
+    ));
+    tx.rollback().await?;
+
+    let (replacement, replacement_json) = signed_indexed_manifest(18)?;
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &manifest_cid,
+        &[],
+        18,
+        u64::try_from(replacement_json.len())?,
+        &content_hash(replacement_json.as_bytes()),
+        replacement.format_version,
+        &replacement_json,
+    )
+    .await?;
+    tx.commit().await?;
+    let pending = Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+        .await?
+        .expect("body-bearing replacement remains restart-reconcilable");
+    assert_eq!(pending.manifest, replacement);
+    assert_eq!(
+        pending.manifest_json.as_bytes(),
+        replacement_json.as_bytes()
+    );
+    let (blocked, blocked_json) = signed_indexed_manifest(19)?;
+    let mut tx = store.begin().await?;
+    let blocked_error = Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &raw_block_cid(b"second ordinary indexed pending")?,
+        &[],
+        19,
+        u64::try_from(blocked_json.len())?,
+        &content_hash(blocked_json.as_bytes()),
+        blocked.format_version,
+        &blocked_json,
+    )
+    .await
+    .expect_err("ordinary unresolved indexed pending must block new admission");
+    assert!(matches!(
+        blocked_error,
+        railgun_indexer_core::audit::AuditError::UnresolvedPendingManifest {
+            channel: "chain-indexed",
+            sequence: 18,
+            ..
+        }
+    ));
+    tx.rollback().await?;
+
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &manifest_cid, 18).await?;
+    tx.commit().await?;
+    let states: Vec<(i64, bool, bool, bool)> = sqlx::query_as(
+        "SELECT ipns_sequence, ipns_published_at IS NOT NULL, \
+                superseded_at IS NOT NULL, unpinned_at IS NOT NULL \
+         FROM published_indexed_manifests WHERE cid = $1 ORDER BY ipns_sequence",
+    )
+    .bind(manifest_cid.to_string())
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        states,
+        vec![(17, false, true, false), (18, true, false, false)]
+    );
+
+    age_indexed_rows(&pool, 100).await?;
+    let eligible = Retention::sweep(
+        &pool,
+        &ipfs,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+    assert_eq!(eligible.unpinned_cids, vec![old_artifact_cid]);
+    assert!(!ipfs.unpinned_cids().contains(&manifest_cid.to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn v16_to_v17_invalidates_bodyless_indexed_pending_without_lowering_sequence_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V16-to-V17 indexed reconciliation test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    sqlx::query("DROP INDEX IF EXISTS published_indexed_manifests_one_pending")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE published_indexed_manifests DROP COLUMN reconciliation_invalidated_at",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE poi_indexer_schema_version SET version = 16 WHERE id = TRUE")
+        .execute(&pool)
+        .await?;
+    let store = Store::new(pool.clone());
+    store.record_chain_indexed_ipns_sequence(30).await?;
+    let cid = raw_block_cid(b"v16 bodyless indexed pending")?;
+    let manifest_id = insert_raw_indexed_pending(&pool, &cid, 22, None, 64, &[21; 32]).await?;
+
+    run_migrations(&pool).await?;
+
+    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(30));
+    let state: (bool, bool, bool) = sqlx::query_as(
+        "SELECT reconciliation_invalidated_at IS NOT NULL, \
+                superseded_at IS NOT NULL, unpinned_at IS NOT NULL \
+         FROM published_indexed_manifests WHERE id = $1",
+    )
+    .bind(manifest_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(state, (true, false, false));
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_schema_indexed_pending_bodies_fail_closed_on_every_identity_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping indexed pending body validation test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    let trusted_publisher_pubkey = indexed_manifest_signing_key().verifying_key().to_bytes();
+    run_migrations(&pool).await?;
+
+    let cid = raw_block_cid(b"current schema indexed pending")?;
+    let null_id = insert_raw_indexed_pending(&pool, &cid, 40, None, 64, &[31; 32]).await?;
+    assert!(matches!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await
+            .expect_err("current-schema null body must fail closed"),
+        railgun_indexer_core::audit::AuditError::MissingIndexedManifestBody { .. }
+    ));
+    delete_indexed_manifest(&pool, null_id).await?;
+
+    let corrupt = "{";
+    let corrupt_id = insert_raw_indexed_pending(
+        &pool,
+        &cid,
+        41,
+        Some(corrupt),
+        u64::try_from(corrupt.len())?,
+        &content_hash(corrupt.as_bytes()),
+    )
+    .await?;
+    assert!(matches!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await
+            .expect_err("corrupt JSON body must fail closed"),
+        railgun_indexer_core::audit::AuditError::Json(_)
+    ));
+    delete_indexed_manifest(&pool, corrupt_id).await?;
+
+    let (_, valid_json) = signed_indexed_manifest(42)?;
+    let hash_mismatch_id = insert_raw_indexed_pending(
+        &pool,
+        &cid,
+        42,
+        Some(&valid_json),
+        u64::try_from(valid_json.len())?,
+        &[32; 32],
+    )
+    .await?;
+    assert!(matches!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await
+            .expect_err("body/hash mismatch must fail closed"),
+        railgun_indexer_core::audit::AuditError::IndexedManifestBodyMismatch { .. }
+    ));
+    delete_indexed_manifest(&pool, hash_mismatch_id).await?;
+
+    let (mut bad_signature, _) = signed_indexed_manifest(43)?;
+    bad_signature.sequence = 44;
+    let bad_signature_json = serde_json::to_string(&bad_signature)?;
+    let bad_signature_id = insert_raw_indexed_pending(
+        &pool,
+        &cid,
+        44,
+        Some(&bad_signature_json),
+        u64::try_from(bad_signature_json.len())?,
+        &content_hash(bad_signature_json.as_bytes()),
+    )
+    .await?;
+    assert!(matches!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await
+            .expect_err("signature mismatch must fail closed"),
+        railgun_indexer_core::audit::AuditError::IndexedManifest(_)
+    ));
+    delete_indexed_manifest(&pool, bad_signature_id).await?;
+
+    let wrong_signing_key = SigningKey::from_bytes(&[92; 32]);
+    let (_, wrong_signer_json) = signed_indexed_manifest_with_key(45, &wrong_signing_key)?;
+    let wrong_signer_id = insert_raw_indexed_pending(
+        &pool,
+        &cid,
+        45,
+        Some(&wrong_signer_json),
+        u64::try_from(wrong_signer_json.len())?,
+        &content_hash(wrong_signer_json.as_bytes()),
+    )
+    .await?;
+    assert!(matches!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await
+            .expect_err("internally valid wrong signer must fail closed"),
+        railgun_indexer_core::audit::AuditError::IndexedManifest(
+            railgun_indexer_core::manifest::IndexedArtifactError::PublisherKeyMismatch { .. }
+        )
+    ));
+    delete_indexed_manifest(&pool, wrong_signer_id).await?;
+
+    let (_, sequence_json) = signed_indexed_manifest(45)?;
+    let sequence_id = insert_raw_indexed_pending(
+        &pool,
+        &cid,
+        46,
+        Some(&sequence_json),
+        u64::try_from(sequence_json.len())?,
+        &content_hash(sequence_json.as_bytes()),
+    )
+    .await?;
+    assert!(matches!(
+        Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
+            .await
+            .expect_err("stored/body sequence mismatch must fail closed"),
+        railgun_indexer_core::audit::AuditError::IndexedManifestSequenceMismatch {
+            stored: 46,
+            body: 45,
+            ..
+        }
+    ));
+    delete_indexed_manifest(&pool, sequence_id).await?;
     Ok(())
 }
 
@@ -1105,6 +2112,15 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     store.record_ipns_sequence(5).await?;
     store.record_ipns_sequence(4).await?;
     assert_eq!(store.last_ipns_sequence().await?, Some(5));
+    let partially_failed_cycle = store.reserve_poi_publication_sequence(5).await?;
+    assert_eq!(partially_failed_cycle, 6);
+    let restarted_store = Store::new(pool.clone());
+    assert_eq!(
+        restarted_store.reserve_poi_publication_sequence(1).await?,
+        7
+    );
+    restarted_store.record_ipns_sequence(20).await?;
+    assert_eq!(store.reserve_poi_publication_sequence(10).await?, 21);
 
     let mut tx = store.begin().await?;
     Store::insert_events(&mut tx, &list_key, 1, &events).await?;
@@ -1189,7 +2205,6 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     let new_blocked_cid = raw_block_cid(b"new blocked")?;
     let old_manifest_cid = raw_block_cid(b"old manifest")?;
     let new_manifest_cid = raw_block_cid(b"new manifest")?;
-    let abandoned_manifest_cid = raw_block_cid(b"abandoned manifest")?;
     let failed_manifest_cid = raw_block_cid(b"failed manifest")?;
     let indexed_artifact_cid = raw_block_cid(b"indexed wallet scan chunk")?;
     let old_indexed_manifest_cid = raw_block_cid(b"old indexed manifest")?;
@@ -1278,10 +2293,9 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     )
     .await?;
     Audit::record_manifest_pin(&mut tx, &old_manifest_cid, 10, 96, &[12_u8; 32], 2).await?;
-    Audit::record_manifest_ipns_publication(&mut tx, &old_manifest_cid).await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &old_manifest_cid, 10).await?;
     Audit::record_manifest_pin(&mut tx, &new_manifest_cid, 11, 112, &[13_u8; 32], 2).await?;
-    Audit::record_manifest_ipns_publication(&mut tx, &new_manifest_cid).await?;
-    Audit::record_manifest_pin(&mut tx, &abandoned_manifest_cid, 12, 88, &[14_u8; 32], 2).await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &new_manifest_cid, 11).await?;
     Audit::record_manifest_pin(&mut tx, &failed_manifest_cid, 13, 80, &[15_u8; 32], 2).await?;
     Audit::record_indexed_artifact_pin(
         &mut tx,
@@ -1307,9 +2321,10 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         96,
         &[22_u8; 32],
         1,
+        "{}",
     )
     .await?;
-    Audit::record_indexed_manifest_ipns_publication(&mut tx, &old_indexed_manifest_cid).await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &old_indexed_manifest_cid, 20).await?;
     Audit::record_indexed_manifest_pin(
         &mut tx,
         &new_indexed_manifest_cid,
@@ -1318,9 +2333,10 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         112,
         &[23_u8; 32],
         1,
+        "{}",
     )
     .await?;
-    Audit::record_indexed_manifest_ipns_publication(&mut tx, &new_indexed_manifest_cid).await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &new_indexed_manifest_cid, 21).await?;
     tx.commit().await?;
 
     let (total_publications, superseded_publications): (i64, i64) = sqlx::query_as(
@@ -1349,9 +2365,9 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         )
         .fetch_one(&pool)
         .await?;
-    assert_eq!(total_manifests, 4);
+    assert_eq!(total_manifests, 3);
     assert_eq!(active_manifests, 1);
-    assert_eq!(superseded_manifests, 2);
+    assert_eq!(superseded_manifests, 1);
     let (indexed_artifacts, active_indexed_manifests, superseded_indexed_manifests): (
         i64,
         i64,
@@ -1434,7 +2450,6 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     .await?;
     let mut unpinned = ipfs_client.unpinned_cids();
     let mut expected = vec![
-        abandoned_manifest_cid.to_string(),
         old_manifest_cid.to_string(),
         old_indexed_manifest_cid.to_string(),
         old_base_cid.to_string(),
@@ -1445,7 +2460,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     assert_eq!(unpinned, expected);
     assert_eq!(sorted_cids(sweep.unpinned_cids), expected);
     assert_eq!(row_count(&pool, "published_snapshots").await?, 4);
-    assert_eq!(row_count(&pool, "published_manifests").await?, 4);
+    assert_eq!(row_count(&pool, "published_manifests").await?, 3);
     assert_eq!(row_count(&pool, "published_indexed_artifacts").await?, 1);
     assert_eq!(row_count(&pool, "published_indexed_manifests").await?, 2);
     let live_indexed_artifact_count: i64 = sqlx::query_scalar(
@@ -1470,18 +2485,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     assert_eq!(current_pending_count, 1);
 
     let mut tx = store.begin().await?;
-    let unpinned_publication =
-        Audit::record_manifest_ipns_publication(&mut tx, &abandoned_manifest_cid)
-            .await
-            .expect_err("unpinned manifest must not be marked IPNS-published");
-    tx.rollback().await?;
-    assert!(matches!(
-        unpinned_publication,
-        railgun_indexer_core::audit::AuditError::UnpinnedManifest { .. }
-    ));
-
-    let mut tx = store.begin().await?;
-    Audit::record_manifest_ipns_publication(&mut tx, &failed_manifest_cid).await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &failed_manifest_cid, 13).await?;
     tx.commit().await?;
     let invalid_published_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM published_manifests \
@@ -1503,6 +2507,455 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     .await?;
     assert!(second_sweep.unpinned_cids.is_empty());
     assert_eq!(ipfs_client.unpinned_cids(), expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn v4_graph_retention_protects_active_pending_and_shared_descendants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = Postgres::default().start().await?;
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    let store = Store::new(pool.clone());
+    let scope = Scope::new(FixedBytes::from([71; 32]), 0, 1, "V2_PoseidonMerkle");
+    let shared_catalog = raw_block_cid(b"v4 shared catalog")?;
+    let old_only = raw_block_cid(b"v4 old only")?;
+    let active_only = raw_block_cid(b"v4 active only")?;
+    let pending_only = raw_block_cid(b"v4 pending only")?;
+    let old_manifest = raw_block_cid(b"v4 old manifest")?;
+    let active_manifest = raw_block_cid(b"v4 active manifest")?;
+    let pending_manifest = raw_block_cid(b"v4 pending manifest")?;
+
+    let mut tx = store.begin().await?;
+    for (kind, cid, hash) in [
+        (
+            PoiArtifactPublicationKind::CheckpointCatalog,
+            shared_catalog,
+            [1; 32],
+        ),
+        (
+            PoiArtifactPublicationKind::BlockedShields,
+            old_only,
+            [2; 32],
+        ),
+        (
+            PoiArtifactPublicationKind::BlockedShields,
+            active_only,
+            [3; 32],
+        ),
+        (
+            PoiArtifactPublicationKind::BlockedShields,
+            pending_only,
+            [4; 32],
+        ),
+    ] {
+        Audit::record_poi_artifact_pin(
+            &mut tx,
+            kind,
+            &scope,
+            None,
+            &cid,
+            64,
+            &hash,
+            None,
+            &format!("{{\"cid\":\"{cid}\"}}"),
+        )
+        .await?;
+    }
+    let old_entry = empty_v4_entry(&scope, &shared_catalog, &old_only);
+    Audit::record_poi_artifact_manifest_pin(
+        &mut tx,
+        &old_manifest,
+        std::slice::from_ref(&old_entry),
+        &[shared_catalog.to_string(), old_only.to_string()],
+        1,
+        128,
+        &[5; 32],
+    )
+    .await?;
+    Audit::record_poi_artifact_manifest_ipns_publication(&mut tx, &old_manifest, 1).await?;
+    let active_entry = empty_v4_entry(&scope, &shared_catalog, &active_only);
+    Audit::record_poi_artifact_manifest_pin(
+        &mut tx,
+        &active_manifest,
+        std::slice::from_ref(&active_entry),
+        &[shared_catalog.to_string(), active_only.to_string()],
+        2,
+        128,
+        &[6; 32],
+    )
+    .await?;
+    Audit::record_poi_artifact_manifest_ipns_publication(&mut tx, &active_manifest, 2).await?;
+    let pending_entry = empty_v4_entry(&scope, &shared_catalog, &pending_only);
+    Audit::record_poi_artifact_manifest_pin(
+        &mut tx,
+        &pending_manifest,
+        std::slice::from_ref(&pending_entry),
+        &[shared_catalog.to_string(), pending_only.to_string()],
+        3,
+        128,
+        &[7; 32],
+    )
+    .await?;
+    tx.commit().await?;
+
+    let reused = Audit::live_poi_artifact_cid(
+        &pool,
+        PoiArtifactPublicationKind::CheckpointCatalog,
+        &scope,
+        None,
+        64,
+        &[1; 32],
+        None,
+    )
+    .await?;
+    assert_eq!(reused, Some(shared_catalog));
+
+    sqlx::query(
+        "UPDATE published_poi_v4_artifacts SET published_at = to_timestamp(100), last_referenced_at = to_timestamp(100)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE published_poi_v4_manifests SET published_at = to_timestamp(100), superseded_at = to_timestamp(100) WHERE cid = $1",
+    )
+    .bind(old_manifest.to_string())
+    .execute(&pool)
+    .await?;
+
+    let ipfs = RecordingIpfsClient::default();
+    let sweep = Retention::sweep(
+        &pool,
+        &ipfs,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+    assert_eq!(
+        sorted_cids(sweep.unpinned_cids),
+        sorted_strings([old_manifest.to_string(), old_only.to_string()])
+    );
+    for protected in [
+        shared_catalog,
+        active_only,
+        active_manifest,
+        pending_only,
+        pending_manifest,
+    ] {
+        assert!(!ipfs.unpinned_cids().contains(&protected.to_string()));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn v15_invalidated_manifests_and_v4_descendants_wait_for_newer_channel_activation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping V15 graph retention test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    let store = Store::new(pool.clone());
+    let scope = Scope::new(FixedBytes::from([81; 32]), 0, 1, "V2_PoseidonMerkle");
+    let shared_catalog = raw_block_cid(b"v15 shared catalog")?;
+    let old_only = raw_block_cid(b"v15 old-only blocked")?;
+    let new_only = raw_block_cid(b"v15 new-only blocked")?;
+    let old_legacy = raw_block_cid(b"v15 invalidated legacy manifest")?;
+    let new_legacy = old_legacy;
+    let old_v4 = raw_block_cid(b"v15 invalidated v4 manifest")?;
+    let new_v4 = old_v4;
+
+    let mut tx = store.begin().await?;
+    Audit::record_poi_artifact_pin(
+        &mut tx,
+        PoiArtifactPublicationKind::CheckpointCatalog,
+        &scope,
+        None,
+        &shared_catalog,
+        64,
+        &[1; 32],
+        None,
+        &format!("{{\"cid\":\"{shared_catalog}\"}}"),
+    )
+    .await?;
+    Audit::record_poi_artifact_pin(
+        &mut tx,
+        PoiArtifactPublicationKind::BlockedShields,
+        &scope,
+        None,
+        &old_only,
+        64,
+        &[2; 32],
+        None,
+        &format!("{{\"cid\":\"{old_only}\"}}"),
+    )
+    .await?;
+    Audit::record_manifest_pin(&mut tx, &old_legacy, 1, 64, &[3; 32], 2).await?;
+    let old_entry = empty_v4_entry(&scope, &shared_catalog, &old_only);
+    Audit::record_poi_artifact_manifest_pin(
+        &mut tx,
+        &old_v4,
+        std::slice::from_ref(&old_entry),
+        &[shared_catalog.to_string(), old_only.to_string()],
+        1,
+        128,
+        &[4; 32],
+    )
+    .await?;
+    tx.commit().await?;
+    sqlx::query("DROP INDEX published_manifests_one_pending")
+        .execute(&pool)
+        .await?;
+    let ambiguous_legacy = raw_block_cid(b"ambiguous legacy recovery row")?;
+    sqlx::query(
+        "INSERT INTO published_manifests \
+         (cid, ipns_sequence, byte_size, content_hash, format_version) \
+         VALUES ($1, 0, 64, $2, 2)",
+    )
+    .bind(ambiguous_legacy.to_string())
+    .bind([9_u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+    let mut tx = store.begin().await?;
+    let ambiguous = Audit::invalidate_pending_poi_manifest_reconciliation(
+        &mut tx,
+        PoiManifestChannel::Legacy,
+        &old_legacy,
+        1,
+    )
+    .await
+    .expect_err("multiple unresolved rows must reject recovery as ambiguous");
+    assert!(matches!(
+        ambiguous,
+        railgun_indexer_core::audit::AuditError::AmbiguousPendingManifests {
+            channel: "legacy",
+            count: 2,
+        }
+    ));
+    tx.rollback().await?;
+    sqlx::query("DELETE FROM published_manifests WHERE cid = $1")
+        .bind(ambiguous_legacy.to_string())
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX published_manifests_one_pending \
+         ON published_manifests ((TRUE)) \
+         WHERE ipns_published_at IS NULL AND superseded_at IS NULL \
+           AND unpinned_at IS NULL AND reconciliation_invalidated_at IS NULL",
+    )
+    .execute(&pool)
+    .await?;
+    for (channel, cid, sequence) in [
+        (PoiManifestChannel::Legacy, old_v4, 1),
+        (PoiManifestChannel::Legacy, old_legacy, 2),
+        (
+            PoiManifestChannel::Legacy,
+            raw_block_cid(b"wrong recovery CID")?,
+            1,
+        ),
+    ] {
+        let mut tx = store.begin().await?;
+        let error =
+            Audit::invalidate_pending_poi_manifest_reconciliation(&mut tx, channel, &cid, sequence)
+                .await
+                .expect_err("recovery authorization must match channel, CID, and sequence exactly");
+        assert!(matches!(
+            error,
+            railgun_indexer_core::audit::AuditError::PendingManifestAuthorizationMismatch { .. }
+        ));
+        tx.rollback().await?;
+    }
+    let mut tx = store.begin().await?;
+    Audit::invalidate_pending_poi_manifest_reconciliation(
+        &mut tx,
+        PoiManifestChannel::Legacy,
+        &old_legacy,
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    let mut tx = store.begin().await?;
+    Audit::invalidate_pending_poi_manifest_reconciliation(
+        &mut tx,
+        PoiManifestChannel::V4,
+        &old_v4,
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    let mut tx = store.begin().await?;
+    let already_invalidated = Audit::invalidate_pending_poi_manifest_reconciliation(
+        &mut tx,
+        PoiManifestChannel::V4,
+        &old_v4,
+        1,
+    )
+    .await
+    .expect_err("already invalidated pending manifest must be rejected");
+    assert!(matches!(
+        already_invalidated,
+        railgun_indexer_core::audit::AuditError::PendingManifestNotRecoverable {
+            state: "already invalidated",
+            ..
+        }
+    ));
+    tx.rollback().await?;
+    let invalidated_state: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT reconciliation_invalidated_at IS NOT NULL, \
+                ipns_published_at IS NOT NULL, superseded_at IS NOT NULL, unpinned_at IS NOT NULL \
+         FROM published_poi_v4_manifests WHERE cid = $1 AND ipns_sequence = 1",
+    )
+    .bind(old_v4.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(invalidated_state, (true, false, false, false));
+    let reopened = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    assert!(
+        Audit::pending_manifest_publication(&reopened)
+            .await?
+            .is_none()
+    );
+    assert!(
+        Audit::pending_poi_artifact_manifest_publication(&reopened)
+            .await?
+            .is_none()
+    );
+    reopened.close().await;
+    sqlx::query(
+        "UPDATE published_poi_v4_artifacts \
+         SET published_at = to_timestamp(100), last_referenced_at = to_timestamp(100)",
+    )
+    .execute(&pool)
+    .await?;
+
+    let ipfs = RecordingIpfsClient::default();
+    let before_replacement = Retention::sweep(
+        &pool,
+        &ipfs,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+    assert!(before_replacement.unpinned_cids.is_empty());
+
+    let replacement_sequence = store.reserve_poi_publication_sequence(1).await?;
+    assert_eq!(replacement_sequence, 2);
+    let mut tx = store.begin().await?;
+    Audit::record_manifest_pin(&mut tx, &new_legacy, replacement_sequence, 64, &[5; 32], 2).await?;
+    Audit::record_poi_artifact_pin(
+        &mut tx,
+        PoiArtifactPublicationKind::CheckpointCatalog,
+        &scope,
+        None,
+        &shared_catalog,
+        64,
+        &[1; 32],
+        None,
+        &format!("{{\"cid\":\"{shared_catalog}\"}}"),
+    )
+    .await?;
+    Audit::record_poi_artifact_pin(
+        &mut tx,
+        PoiArtifactPublicationKind::BlockedShields,
+        &scope,
+        None,
+        &new_only,
+        64,
+        &[2; 32],
+        None,
+        &format!("{{\"cid\":\"{new_only}\"}}"),
+    )
+    .await?;
+    let new_entry = empty_v4_entry(&scope, &shared_catalog, &new_only);
+    Audit::record_poi_artifact_manifest_pin(
+        &mut tx,
+        &new_v4,
+        std::slice::from_ref(&new_entry),
+        &[shared_catalog.to_string(), new_only.to_string()],
+        replacement_sequence,
+        128,
+        &[6; 32],
+    )
+    .await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &new_legacy, replacement_sequence).await?;
+    Audit::record_poi_artifact_manifest_ipns_publication(&mut tx, &new_v4, replacement_sequence)
+        .await?;
+    tx.commit().await?;
+
+    let mut tx = store.begin().await?;
+    let active_error = Audit::invalidate_pending_poi_manifest_reconciliation(
+        &mut tx,
+        PoiManifestChannel::V4,
+        &new_v4,
+        replacement_sequence,
+    )
+    .await
+    .expect_err("active replacement must not be invalidated");
+    assert!(matches!(
+        active_error,
+        railgun_indexer_core::audit::AuditError::PendingManifestNotRecoverable {
+            state: "active",
+            ..
+        }
+    ));
+    tx.rollback().await?;
+
+    sqlx::query(
+        "UPDATE published_manifests SET superseded_at = to_timestamp(100) \
+         WHERE cid = $1 AND reconciliation_invalidated_at IS NOT NULL",
+    )
+    .bind(old_legacy.to_string())
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE published_poi_v4_manifests SET superseded_at = to_timestamp(100) \
+         WHERE cid = $1 AND reconciliation_invalidated_at IS NOT NULL",
+    )
+    .bind(old_v4.to_string())
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE published_poi_v4_artifacts SET last_referenced_at = to_timestamp(100)")
+        .execute(&pool)
+        .await?;
+
+    let after_replacement = Retention::sweep(
+        &pool,
+        &ipfs,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+    assert_eq!(
+        sorted_cids(after_replacement.unpinned_cids),
+        sorted_strings([old_only.to_string(),])
+    );
+    for retained in [new_legacy, new_v4, shared_catalog, new_only] {
+        assert!(!ipfs.unpinned_cids().contains(&retained.to_string()));
+    }
 
     Ok(())
 }
@@ -1778,9 +3231,11 @@ async fn retention_prunes_stale_indexed_artifacts() -> Result<(), Box<dyn std::e
         96,
         &[36_u8; 32],
         1,
+        "{}",
     )
     .await?;
-    Audit::record_indexed_manifest_ipns_publication(&mut tx, &active_indexed_manifest_cid).await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &active_indexed_manifest_cid, 10)
+        .await?;
     Audit::record_indexed_artifact_pin(
         &mut tx,
         IndexedArtifactPublicationKind::Catalog,
@@ -1801,6 +3256,7 @@ async fn retention_prunes_stale_indexed_artifacts() -> Result<(), Box<dyn std::e
         96,
         &[38_u8; 32],
         1,
+        "{}",
     )
     .await?;
     tx.commit().await?;
@@ -1862,7 +3318,8 @@ async fn retention_prunes_stale_indexed_artifacts() -> Result<(), Box<dyn std::e
     assert_eq!(preserved_unpinned_count, 0);
 
     let mut tx = store.begin().await?;
-    Audit::record_indexed_manifest_ipns_publication(&mut tx, &pending_indexed_manifest_cid).await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &pending_indexed_manifest_cid, 11)
+        .await?;
     tx.commit().await?;
     let superseded_sweep = Retention::sweep(
         &pool,
@@ -2002,9 +3459,96 @@ async fn retention_first_forces_concurrent_reuse_to_observe_unpinned_state()
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn v4_retention_first_forces_concurrent_reuse_to_observe_unpinned_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = Postgres::default().start().await?;
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+
+    let store = Store::new(pool.clone());
+    let scope = Scope::new(FixedBytes::from([91; 32]), 0, 1, "V2_PoseidonMerkle");
+    let cid = raw_block_cid(b"POI v4 retention race artifact")?;
+    let hash = [41_u8; 32];
+    let mut tx = store.begin().await?;
+    Audit::record_poi_artifact_pin(
+        &mut tx,
+        PoiArtifactPublicationKind::CheckpointCatalog,
+        &scope,
+        None,
+        &cid,
+        128,
+        &hash,
+        None,
+        "{}",
+    )
+    .await?;
+    tx.commit().await?;
+    sqlx::query("UPDATE published_poi_v4_artifacts SET last_referenced_at = to_timestamp(100)")
+        .execute(&pool)
+        .await?;
+
+    let coordinator = PinLifecycleCoordinator::default();
+    let ipfs_client = Arc::new(BlockingUnpinIpfsClient::default());
+    let retention_pool = pool.clone();
+    let retention_coordinator = coordinator.clone();
+    let retention_client = Arc::clone(&ipfs_client);
+    let retention = tokio::spawn(async move {
+        Retention::sweep_with_coordinator(
+            &retention_pool,
+            retention_client.as_ref(),
+            UNIX_EPOCH + Duration::from_secs(200),
+            Duration::from_secs(50),
+            &retention_coordinator,
+        )
+        .await
+    });
+    ipfs_client.unpin_entered.notified().await;
+
+    let reuse_pool = pool.clone();
+    let reuse_coordinator = coordinator.clone();
+    let reuse_scope = scope.clone();
+    let mut reuse = tokio::spawn(async move {
+        let _pin_lifecycle = reuse_coordinator.lock().await;
+        Audit::live_poi_artifact_cid(
+            &reuse_pool,
+            PoiArtifactPublicationKind::CheckpointCatalog,
+            &reuse_scope,
+            None,
+            128,
+            &hash,
+            None,
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut reuse)
+            .await
+            .is_err(),
+        "POI artifact reuse must wait while retention owns the pin lifecycle"
+    );
+
+    ipfs_client.allow_unpin.notify_one();
+    let sweep = retention.await??;
+    assert_eq!(sweep.unpinned_cids, vec![cid]);
+    assert_eq!(reuse.await??, None);
+    assert!(!ipfs_client.pinned.load(Ordering::SeqCst));
+    Ok(())
+}
+
 fn is_docker_unavailable(error: &impl std::fmt::Debug) -> bool {
     let message = format!("{error:?}");
-    message.contains("SocketNotFoundError") || message.contains("Connection refused")
+    message.contains("SocketNotFoundError")
+        || message.contains("Connection refused")
+        || message.to_ascii_lowercase().contains("permission denied")
 }
 
 async fn row_count(pool: &sqlx::PgPool, table: &str) -> Result<i64, sqlx::Error> {
@@ -2236,6 +3780,112 @@ const fn token_data() -> TokenData {
     }
 }
 
+fn signed_indexed_manifest(
+    sequence: u64,
+) -> Result<(IndexedArtifactManifest, String), Box<dyn std::error::Error>> {
+    let signing_key = indexed_manifest_signing_key();
+    signed_indexed_manifest_with_key(sequence, &signing_key)
+}
+
+fn signed_indexed_manifest_with_key(
+    sequence: u64,
+    signing_key: &SigningKey,
+) -> Result<(IndexedArtifactManifest, String), Box<dyn std::error::Error>> {
+    let mut manifest = IndexedArtifactManifest::new(
+        1_700_000_000_000,
+        sequence,
+        PublisherIdentity::ed25519(FixedBytes::ZERO),
+        Vec::new(),
+    );
+    manifest.sign_manifest(signing_key)?;
+    let json = serde_json::to_string(&manifest)?;
+    Ok((manifest, json))
+}
+
+fn indexed_manifest_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[91; 32])
+}
+
+async fn insert_raw_indexed_pending(
+    pool: &sqlx::PgPool,
+    cid: &Cid,
+    sequence: u64,
+    manifest_json: Option<&str>,
+    byte_size: u64,
+    hash: &[u8; 32],
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        r"
+        INSERT INTO published_indexed_manifests (
+            cid, ipns_sequence, byte_size, content_hash, format_version, manifest_json
+        ) VALUES ($1, $2, $3, $4, 1, $5)
+        RETURNING id
+        ",
+    )
+    .bind(cid.to_string())
+    .bind(i64::try_from(sequence)?)
+    .bind(i64::try_from(byte_size)?)
+    .bind(hash.as_slice())
+    .bind(manifest_json)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn insert_indexed_manifest_edge(
+    pool: &sqlx::PgPool,
+    manifest_id: i64,
+    artifact_cid: &Cid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO published_indexed_manifest_artifacts (manifest_id, artifact_cid) \
+         VALUES ($1, $2)",
+    )
+    .bind(manifest_id)
+    .bind(artifact_cid.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn indexed_manifest_edge_count(
+    pool: &sqlx::PgPool,
+    manifest_id: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM published_indexed_manifest_artifacts WHERE manifest_id = $1",
+    )
+    .bind(manifest_id)
+    .fetch_one(pool)
+    .await
+}
+
+async fn delete_indexed_manifest(pool: &sqlx::PgPool, manifest_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM published_indexed_manifests WHERE id = $1")
+        .bind(manifest_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn age_indexed_rows(pool: &sqlx::PgPool, seconds: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE published_indexed_manifests \
+         SET published_at = to_timestamp($1), \
+             superseded_at = CASE WHEN superseded_at IS NULL THEN NULL ELSE to_timestamp($1) END",
+    )
+    .bind(seconds)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE published_indexed_artifacts \
+         SET published_at = to_timestamp($1), last_referenced_at = to_timestamp($1)",
+    )
+    .bind(seconds)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct RecordingIpfsClient {
     unpinned: Mutex<Vec<Cid>>,
@@ -2314,4 +3964,48 @@ fn sorted_cids(cids: Vec<Cid>) -> Vec<String> {
         .collect::<Vec<_>>();
     cids.sort();
     cids
+}
+
+fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn empty_v4_entry(scope: &Scope, catalog_cid: &Cid, blocked_cid: &Cid) -> ManifestEntry {
+    ManifestEntry {
+        scope: scope.clone(),
+        event_count: 0,
+        current_tip_index: None,
+        current_root: None,
+        checkpoint_catalog: CheckpointCatalogDescriptor {
+            artifact: ArtifactDescriptor {
+                cid: catalog_cid.to_string(),
+                sha256: FixedBytes::from([1; 32]),
+                byte_size: 64,
+            },
+            format_version: FORMAT_VERSION,
+            scope: scope.clone(),
+            range: None,
+            row_count: 0,
+            chunk_count: 0,
+            encoding: ArtifactEncoding::CanonicalJson,
+            compression: Compression::Identity,
+            checkpoint_root: None,
+        },
+        current_tail: None,
+        retained_bridges: Vec::new(),
+        blocked_shields: BlockedShieldsDescriptor {
+            artifact: ArtifactDescriptor {
+                cid: blocked_cid.to_string(),
+                sha256: FixedBytes::from([2; 32]),
+                byte_size: 64,
+            },
+            format_version: FORMAT_VERSION,
+            scope: scope.clone(),
+            row_count: 0,
+            encoding: ArtifactEncoding::CanonicalJson,
+            compression: Compression::Identity,
+        },
+    }
 }

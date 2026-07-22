@@ -979,7 +979,7 @@ fn parse_public_txid_payload(
     {
         bail!("descriptor is not a public_txid txid_index chunk");
     }
-    let mut cursor = Cursor::new(&envelope.payload);
+    let mut cursor = Cursor::new(envelope.payload());
     let row_count = usize::try_from(descriptor.row_count).wrap_err("row count overflow")?;
     let mut rows = Vec::with_capacity(row_count);
     for _ in 0..row_count {

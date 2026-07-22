@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "released-poi-client-compat"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+autotests = false
+
+[[test]]
+name = "released_poi_client_compat"
+path = "released_poi_client.rs"
+
+[dependencies]
+alloy = "2"
+cid = "0.11"
+ed25519-dalek = "2"
+multihash-codetable = { version = "0.2", features = ["sha2"] }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "16642b6d9e084f7f1e2f9c9cb649fcca74da60b3" }
+serde_json = "1"
