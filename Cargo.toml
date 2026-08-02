@@ -33,10 +33,10 @@ url = "2"
 zeroize = "1"
 zstd = "0.13"
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
-railgun-indexed-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "68a45e9425e126d3f9712feb035259bad2ba154a" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "d47ab6f33cce80b2a7aafcdef78329aaa50346d7" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "d47ab6f33cce80b2a7aafcdef78329aaa50346d7" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "d47ab6f33cce80b2a7aafcdef78329aaa50346d7" }
+railgun-indexed-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "d47ab6f33cce80b2a7aafcdef78329aaa50346d7" }
 
 [profile.release]
 opt-level = 3

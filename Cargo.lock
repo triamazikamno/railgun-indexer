@@ -1871,7 +1871,7 @@ dependencies = [
 [[package]]
 name = "broadcaster-core"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=68a45e9425e126d3f9712feb035259bad2ba154a#68a45e9425e126d3f9712feb035259bad2ba154a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=d47ab6f33cce80b2a7aafcdef78329aaa50346d7#d47ab6f33cce80b2a7aafcdef78329aaa50346d7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4575,7 +4575,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 [[package]]
 name = "merkletree"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=68a45e9425e126d3f9712feb035259bad2ba154a#68a45e9425e126d3f9712feb035259bad2ba154a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=d47ab6f33cce80b2a7aafcdef78329aaa50346d7#d47ab6f33cce80b2a7aafcdef78329aaa50346d7"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -5185,7 +5185,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "poi"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=68a45e9425e126d3f9712feb035259bad2ba154a#68a45e9425e126d3f9712feb035259bad2ba154a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=d47ab6f33cce80b2a7aafcdef78329aaa50346d7#d47ab6f33cce80b2a7aafcdef78329aaa50346d7"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -5518,7 +5518,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "railgun-indexed-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=68a45e9425e126d3f9712feb035259bad2ba154a#68a45e9425e126d3f9712feb035259bad2ba154a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=d47ab6f33cce80b2a7aafcdef78329aaa50346d7#d47ab6f33cce80b2a7aafcdef78329aaa50346d7"
 dependencies = [
  "alloy-primitives",
  "ed25519-dalek",
