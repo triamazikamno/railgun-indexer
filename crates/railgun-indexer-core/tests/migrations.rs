@@ -1,4 +1,5 @@
 use alloy::primitives::{Address, Bytes, FixedBytes as AlloyFixedBytes, U256, Uint};
+use alloy::sol_types::SolValue;
 use alloy_primitives::{FixedBytes, hex};
 use async_trait::async_trait;
 use broadcaster_core::contracts::railgun::{
@@ -30,8 +31,8 @@ use railgun_indexer_core::manifest::{
 use railgun_indexer_core::publish::ipfs::{IpfsClient, IpfsError, raw_block_cid};
 use railgun_indexer_core::snapshot::SnapshotKind;
 use railgun_indexer_core::store::{
-    IndexedDatasetKind, Store, StoreError, StoredCommitmentFamily,
-    StoredWalletScanTimestampBackfill, run_migrations,
+    IndexedDatasetKind, PublicTxidUnshieldPreimageUpdate, Store, StoreError,
+    StoredCommitmentFamily, StoredWalletScanTimestampBackfill, run_migrations,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -400,7 +401,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     .execute(&pool)
     .await?;
     sqlx::query(
-        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 19, now())",
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 20, now())",
     )
     .execute(&pool)
     .await?;
@@ -408,7 +409,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     run_migrations(&pool).await?;
 
     assert!(!table_exists(&pool, "poi_events").await?);
-    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(schema_version(&pool).await?, 20);
 
     Ok(())
 }
@@ -633,7 +634,7 @@ async fn v15_invalidates_preexisting_pending_reconciliation_until_newer_channel_
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(schema_version(&pool).await?, 20);
     let legacy_invalidated: Option<i64> = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM reconciliation_invalidated_at)::BIGINT \
          FROM published_manifests WHERE cid = $1",
@@ -1071,7 +1072,7 @@ async fn v11_conservatively_backfills_active_manifest_artifact_references()
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(schema_version(&pool).await?, 20);
     let references: Vec<(String, String)> = sqlx::query_as(
         r"
         SELECT manifest.cid, reference.artifact_cid
@@ -1185,7 +1186,7 @@ async fn v15_to_v17_invalidates_bodyless_indexed_pending_and_replaces_at_higher_
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(schema_version(&pool).await?, 20);
     assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(17));
     assert!(
         Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
@@ -1357,7 +1358,7 @@ async fn v16_to_v17_invalidates_bodyless_indexed_pending_without_lowering_sequen
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 19);
+    assert_eq!(schema_version(&pool).await?, 20);
     assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(30));
     let state: (bool, bool, bool) = sqlx::query_as(
         "SELECT reconciliation_invalidated_at IS NOT NULL, \
@@ -1672,6 +1673,125 @@ async fn indexed_log_batch_persistence_is_idempotent() -> Result<(), Box<dyn std
         0
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn unshield_preimage_migration_backfill_and_new_ingest_roundtrip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping unshield preimage migration test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    let railgun_contract = Address::from([0xbb; 20]);
+    let preimage = commitment_preimage(0x55);
+    sqlx::query(
+        "ALTER TABLE indexed_public_txid_rows \
+         DROP CONSTRAINT IF EXISTS idx_public_txid_rows_unshield_preimage_check, \
+         DROP COLUMN IF EXISTS unshield_preimage",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE poi_indexer_schema_version SET version = 19 WHERE id = TRUE")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO indexed_public_txid_rows (\
+            chain_type, chain_id, railgun_contract, block_number, block_timestamp, block_hash, \
+            transaction_hash, first_log_index, last_log_index, railgun_transaction_index, row_id, \
+            merkle_root, nullifiers, commitments, bound_params_hash, has_unshield, utxo_tree_in, \
+            utxo_tree_out, utxo_batch_start_position_out\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+    )
+    .bind(0_i16)
+    .bind(1_i64)
+    .bind(railgun_contract.to_string())
+    .bind(100_i64)
+    .bind(1_700_000_100_i64)
+    .bind(vec![0xaa_u8; 32])
+    .bind(vec![0xcc_u8; 32])
+    .bind(1_i64)
+    .bind(5_i64)
+    .bind(0_i64)
+    .bind("0x64:0")
+    .bind(vec![0x20_u8; 32])
+    .bind(vec![0x21_u8; 32])
+    .bind(preimage.hash().to_be_bytes::<32>().to_vec())
+    .bind(vec![0x23_u8; 32])
+    .bind(true)
+    .bind(1_i64)
+    .bind(1_i64)
+    .bind(10_i64)
+    .execute(&pool)
+    .await?;
+
+    run_migrations(&pool).await?;
+    assert_eq!(schema_version(&pool).await?, 20);
+    let store = Store::new(pool);
+
+    let missing = store
+        .missing_public_txid_unshield_preimages(0, 1, railgun_contract, 0, 200)
+        .await?;
+    assert_eq!(missing.len(), 1);
+    let update = PublicTxidUnshieldPreimageUpdate {
+        id: missing[0].id.clone(),
+        railgun_transaction_index: missing[0].railgun_transaction_index,
+        transaction_hash: missing[0].transaction_hash,
+        unshield_preimage: preimage.abi_encode(),
+    };
+    let mut tx = store.begin().await?;
+    assert_eq!(
+        Store::backfill_public_txid_unshield_preimages(&mut tx, 0, 1, railgun_contract, &[update],)
+            .await?,
+        1
+    );
+    tx.commit().await?;
+    assert!(
+        store
+            .missing_public_txid_unshield_preimages(0, 1, railgun_contract, 0, 200)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .public_txid_rows(0, 1, railgun_contract, 0, 10)
+            .await?[0]
+            .unshield_preimage,
+        Some(preimage.abi_encode())
+    );
+
+    let direct_preimage = commitment_preimage(0x66);
+    let mut direct = indexed_log_batch_at(101);
+    direct.public_transactions[0].source.transaction_hash = AlloyFixedBytes::from([0xdd; 32]);
+    direct.public_transactions[0].has_unshield = true;
+    direct.public_transactions[0].unshield_preimage = Some(direct_preimage.abi_encode());
+    direct.public_transactions[0].commitments = vec![AlloyFixedBytes::from(
+        direct_preimage.hash().to_be_bytes::<32>(),
+    )];
+    let mut tx = store.begin().await?;
+    Store::persist_indexed_log_batch(&mut tx, 0, 1, railgun_contract, &direct).await?;
+    tx.commit().await?;
+    let rows = store
+        .public_txid_rows(0, 1, railgun_contract, 0, 10)
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[1].unshield_preimage,
+        Some(direct_preimage.abi_encode())
+    );
     Ok(())
 }
 
@@ -3679,6 +3799,7 @@ fn indexed_log_batch_at(block_number: u64) -> IndexedLogBatch {
             commitments: vec![AlloyFixedBytes::from([0x22; 32])],
             bound_params_hash: AlloyFixedBytes::from([0x23; 32]),
             has_unshield: false,
+            unshield_preimage: None,
             utxo_tree_in: 1,
             utxo_tree_out: 1,
             utxo_batch_start_position_out: 10,
@@ -3720,6 +3841,7 @@ fn sparse_commitment_batch() -> IndexedLogBatch {
             ],
             bound_params_hash: AlloyFixedBytes::from([0x37; 32]),
             has_unshield: false,
+            unshield_preimage: None,
             utxo_tree_in: 0,
             utxo_tree_out: 0,
             utxo_batch_start_position_out: 1,

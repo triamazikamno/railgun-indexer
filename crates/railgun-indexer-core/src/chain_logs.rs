@@ -444,6 +444,62 @@ pub async fn hydrate_public_transactions<P: Provider + ?Sized>(
     Ok(())
 }
 
+pub async fn resolve_public_transactions_by_hash<P: Provider + ?Sized>(
+    provider: &P,
+    railgun_contract: Address,
+    transaction_hash: FixedBytes<32>,
+) -> Result<Vec<ResolvedPublicTransaction>, ChainLogIngestionError> {
+    let transaction = provider
+        .get_transaction_by_hash(transaction_hash)
+        .await?
+        .ok_or(ChainLogIngestionError::MissingTransactionByHash { transaction_hash })?;
+    let mut decoded = decode_railgun_transactions(transaction.input())?.unwrap_or_default();
+    if decoded.is_empty() {
+        let summary = TransactOutputSummary {
+            source: IndexedLogSource {
+                block_number: 0,
+                block_timestamp: None,
+                block_hash: FixedBytes::ZERO,
+                transaction_hash,
+                log_index: 0,
+            },
+            first_log_index: 0,
+            last_log_index: 0,
+            output_commitments: Vec::new(),
+            nullifier_groups: Vec::new(),
+        };
+        if let Ok(trace) = debug_trace_transaction(provider, &summary).await {
+            collect_debug_trace_railgun_transactions(&trace, railgun_contract, &mut decoded)?;
+        }
+        if decoded.is_empty()
+            && let Ok(trace) = trace_transaction(provider, &summary).await
+        {
+            collect_trace_transaction_railgun_transactions(&trace, railgun_contract, &mut decoded)?;
+        }
+    }
+    if decoded.is_empty() {
+        return Err(ChainLogIngestionError::MissingRailgunCalldataByHash { transaction_hash });
+    }
+    decoded
+        .into_iter()
+        .enumerate()
+        .map(|(railgun_transaction_index, transaction)| {
+            Ok(ResolvedPublicTransaction {
+                railgun_transaction_index: u64::try_from(railgun_transaction_index).map_err(
+                    |_| ChainLogIngestionError::IntegerOverflow("railgun_transaction_index"),
+                )?,
+                merkle_root: transaction.merkle_root,
+                nullifiers: transaction.nullifiers,
+                commitments: transaction.commitments,
+                bound_params_hash: transaction.bound_params_hash,
+                has_unshield: transaction.has_unshield,
+                unshield_preimage: transaction.unshield_preimage,
+                utxo_tree_in: transaction.utxo_tree_in,
+            })
+        })
+        .collect()
+}
+
 pub async fn hydrate_indexed_log_source_timestamps<P: Provider + ?Sized>(
     provider: &P,
     batch: &mut IndexedLogBatch,
@@ -804,6 +860,7 @@ struct DecodedRailgunTransaction {
     commitments: Vec<FixedBytes<32>>,
     bound_params_hash: FixedBytes<32>,
     has_unshield: bool,
+    unshield_preimage: Option<Vec<u8>>,
     utxo_tree_in: u64,
     railgun_txid: U256,
 }
@@ -1083,6 +1140,7 @@ fn public_transactions_from_decoded(
             commitments: transaction.commitments.clone(),
             bound_params_hash: transaction.bound_params_hash,
             has_unshield: transaction.has_unshield,
+            unshield_preimage: transaction.unshield_preimage.clone(),
             utxo_tree_in: transaction.utxo_tree_in,
             utxo_tree_out,
             utxo_batch_start_position_out,
@@ -1405,13 +1463,16 @@ fn try_from_modern_transaction(
     call_kind: RailgunCallKind,
 ) -> Result<DecodedRailgunTransaction, ChainLogIngestionError> {
     let railgun_txid = compute_railgun_txid(&transaction, Some(DEFAULT_TXID_VERSION))?;
+    let has_unshield = transaction.boundParams.unshield != 0;
+    let unshield_preimage = has_unshield.then(|| transaction.unshieldPreimage.abi_encode());
     Ok(DecodedRailgunTransaction {
         call_kind,
         merkle_root: transaction.merkleRoot,
         nullifiers: transaction.nullifiers,
         commitments: transaction.commitments,
         bound_params_hash: transaction.boundParams.hash().into(),
-        has_unshield: transaction.boundParams.unshield != 0,
+        has_unshield,
+        unshield_preimage,
         utxo_tree_in: transaction.boundParams.treeNumber.into(),
         railgun_txid,
     })
@@ -1455,13 +1516,27 @@ fn try_from_legacy_transaction_with_kind(
             .collect::<Vec<_>>(),
         U256::from_be_bytes(bound_params_hash.0),
     );
+    let has_unshield = transaction.boundParams.withdraw != 0;
+    let unshield_preimage = has_unshield.then(|| {
+        CommitmentPreimage {
+            npk: FixedBytes::from(transaction.unshieldPreimage.npk.to_be_bytes::<32>()),
+            token: broadcaster_core::contracts::railgun::TokenData {
+                tokenType: transaction.unshieldPreimage.token.tokenType,
+                tokenAddress: transaction.unshieldPreimage.token.tokenAddress,
+                tokenSubID: transaction.unshieldPreimage.token.tokenSubID,
+            },
+            value: transaction.unshieldPreimage.value,
+        }
+        .abi_encode()
+    });
     DecodedRailgunTransaction {
         call_kind,
         merkle_root: legacy_public_txid_merkle_root(transaction.merkleRoot),
         nullifiers,
         commitments,
         bound_params_hash,
-        has_unshield: transaction.boundParams.withdraw != 0,
+        has_unshield,
+        unshield_preimage,
         utxo_tree_in: u64::from(transaction.boundParams.treeNumber),
         railgun_txid,
     }
@@ -1672,10 +1747,23 @@ pub struct IndexedPublicTransaction {
     pub commitments: Vec<FixedBytes<32>>,
     pub bound_params_hash: FixedBytes<32>,
     pub has_unshield: bool,
+    pub unshield_preimage: Option<Vec<u8>>,
     pub utxo_tree_in: u64,
     pub utxo_tree_out: u64,
     pub utxo_batch_start_position_out: u64,
     pub railgun_txid: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPublicTransaction {
+    pub railgun_transaction_index: u64,
+    pub merkle_root: FixedBytes<32>,
+    pub nullifiers: Vec<FixedBytes<32>>,
+    pub commitments: Vec<FixedBytes<32>>,
+    pub bound_params_hash: FixedBytes<32>,
+    pub has_unshield: bool,
+    pub unshield_preimage: Option<Vec<u8>>,
+    pub utxo_tree_in: u64,
 }
 
 struct TransactOutputSummary {
@@ -1749,6 +1837,8 @@ pub enum ChainLogIngestionError {
         first_log_index: u64,
         last_log_index: u64,
     },
+    #[error("transaction {transaction_hash} was not returned by RPC")]
+    MissingTransactionByHash { transaction_hash: FixedBytes<32> },
     #[error(
         "transaction {transaction_hash} emitted Railgun public transaction logs at block {block_number} ({block_hash}), log indexes {first_log_index}..={last_log_index}, but no supported Railgun calldata was found in the transaction or traces"
     )]
@@ -1759,6 +1849,8 @@ pub enum ChainLogIngestionError {
         first_log_index: u64,
         last_log_index: u64,
     },
+    #[error("transaction {transaction_hash} did not contain supported Railgun calldata")]
+    MissingRailgunCalldataByHash { transaction_hash: FixedBytes<32> },
     #[error(
         "transaction {transaction_hash} at block {block_number} decoded Railgun transaction index {railgun_transaction_index}, but none of its commitments matched the next emitted output commitment"
     )]
@@ -2085,6 +2177,10 @@ mod tests {
             14323
         );
         assert!(batch.public_transactions[1].has_unshield);
+        assert_eq!(
+            batch.public_transactions[1].unshield_preimage,
+            Some(commitment_preimage(0).abi_encode())
+        );
         assert_eq!(
             batch.public_transactions[1].commitments,
             vec![fixed_bytes_32(0xb0)]
@@ -2759,6 +2855,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolves_unshield_preimage_from_direct_transaction_by_hash() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let transaction_hash = fixed_bytes(LEGACY_TRANSACTION_HASH);
+        let calldata = transactCall {
+            _transactions: vec![railgun_transaction_with_commitments(
+                0x41,
+                vec![fixed_bytes_32(0xb0)],
+                true,
+            )],
+        }
+        .abi_encode();
+        asserter.push_success(&transaction_json_with_input(calldata));
+
+        let resolved =
+            resolve_public_transactions_by_hash(&provider, railgun_contract(), transaction_hash)
+                .await
+                .expect("resolve direct transaction");
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].has_unshield);
+        assert_eq!(
+            resolved[0].unshield_preimage,
+            Some(commitment_preimage(0).abi_encode())
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolves_unshield_preimage_from_wrapped_transaction_trace() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let transaction_hash = fixed_bytes(LEGACY_TRANSACTION_HASH);
+        let railgun_calldata = transactCall {
+            _transactions: vec![railgun_transaction_with_commitments(
+                0x41,
+                vec![fixed_bytes_32(0xb0)],
+                true,
+            )],
+        }
+        .abi_encode();
+        asserter.push_success(&transaction_json_with_input(vec![0xde, 0xad, 0xbe, 0xef]));
+        asserter.push_success(&json!({
+            "type": "CALL",
+            "to": "0x1111111111111111111111111111111111111111",
+            "input": "0xdeadbeef",
+            "calls": [{
+                "type": "CALL",
+                "to": railgun_contract().to_string(),
+                "input": hex::encode_prefixed(railgun_calldata),
+            }],
+        }));
+
+        let resolved =
+            resolve_public_transactions_by_hash(&provider, railgun_contract(), transaction_hash)
+                .await
+                .expect("resolve wrapped transaction");
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].has_unshield);
+        assert_eq!(
+            resolved[0].unshield_preimage,
+            Some(commitment_preimage(0).abi_encode())
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
     async fn hydrate_matches_legacy_unshield_rows_to_emitted_commitments() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
@@ -2862,6 +3026,17 @@ mod tests {
         assert_eq!(
             batch.public_transactions[2].utxo_batch_start_position_out,
             105
+        );
+        assert_eq!(
+            batch.public_transactions[1].unshield_preimage,
+            Some(
+                CommitmentPreimage {
+                    npk: FixedBytes::ZERO,
+                    token: token_data(),
+                    value: Uint::<120, 2>::ZERO,
+                }
+                .abi_encode()
+            )
         );
         assert!(asserter.read_q().is_empty());
     }

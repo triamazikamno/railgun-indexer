@@ -9,6 +9,8 @@ use crate::manifest::{
 use crate::publish::ipfs::{IpfsClient, IpfsError, pin_indexed_chunk};
 use crate::store::StoredPublicTxidRow;
 use alloy::primitives::{FixedBytes, U256};
+use alloy::sol_types::SolValue;
+use broadcaster_core::contracts::railgun::CommitmentPreimage;
 use broadcaster_core::transact::{
     compute_railgun_txid_parts, railgun_txid_leaf_hash_with_output_start,
 };
@@ -18,6 +20,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const PUBLIC_TXID_RECORD_SECTION_ID: u16 = 1;
+const PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID: u16 = 2;
 
 pub fn public_txid_chunk_plan_item(
     scope: &ChainScope,
@@ -26,15 +29,15 @@ pub fn public_txid_chunk_plan_item(
 ) -> Result<ChunkPlanItem, PublicTxidChunkError> {
     let range = public_txid_range(records)?;
     validate_single_txid_tree(&range)?;
-    let payload = encode_public_txid_records(records)?;
-    let payload_len = u64::try_from(payload.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
+    let record_payload = encode_public_txid_records(records)?;
+    let unshield_payload = encode_public_txid_unshield_preimages(records)?;
     let row_count = u64::try_from(records.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
     let compressed_bytes = encode_public_txid_envelope(
         scope.clone(),
         range.clone(),
         row_count,
-        payload_len,
-        payload,
+        &record_payload,
+        unshield_payload.as_deref(),
         compression,
     )?;
     Ok(ChunkPlanItem {
@@ -66,8 +69,8 @@ pub fn prepare_public_txid_chunk(
 ) -> Result<PublishedPublicTxidChunk, PublicTxidChunkError> {
     let range = public_txid_range(records)?;
     validate_single_txid_tree(&range)?;
-    let payload = encode_public_txid_records(records)?;
-    let payload_len = u64::try_from(payload.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
+    let record_payload = encode_public_txid_records(records)?;
+    let unshield_payload = encode_public_txid_unshield_preimages(records)?;
     let row_count = u64::try_from(records.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
     let max_block = records
         .iter()
@@ -78,8 +81,8 @@ pub fn prepare_public_txid_chunk(
         scope.clone(),
         range.clone(),
         row_count,
-        payload_len,
-        payload,
+        &record_payload,
+        unshield_payload.as_deref(),
         compression,
     );
     let compressed_bytes = compressed_bytes?;
@@ -121,10 +124,39 @@ fn encode_public_txid_envelope(
     scope: ChainScope,
     range: IndexedArtifactRange,
     row_count: u64,
-    payload_len: u64,
-    payload: Vec<u8>,
+    record_payload: &[u8],
+    unshield_payload: Option<&[u8]>,
     compression: CompressionAlgorithm,
 ) -> Result<Vec<u8>, ChunkError> {
+    let record_payload_len =
+        u64::try_from(record_payload.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
+    let unshield_payload_len = unshield_payload.map_or(Ok(0), |payload| {
+        u64::try_from(payload.len()).map_err(|_| ChunkError::PayloadTooLarge)
+    })?;
+    let payload_len = record_payload_len
+        .checked_add(unshield_payload_len)
+        .ok_or(ChunkError::PayloadTooLarge)?;
+    let mut payload = Vec::with_capacity(
+        record_payload
+            .len()
+            .saturating_add(unshield_payload.map_or(0, <[u8]>::len)),
+    );
+    payload.extend_from_slice(record_payload);
+    if let Some(unshield_payload) = unshield_payload {
+        payload.extend_from_slice(unshield_payload);
+    }
+    let mut sections = vec![ChunkSection {
+        section_id: PUBLIC_TXID_RECORD_SECTION_ID,
+        offset: 0,
+        byte_length: record_payload_len,
+    }];
+    if unshield_payload.is_some() {
+        sections.push(ChunkSection {
+            section_id: PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID,
+            offset: record_payload_len,
+            byte_length: unshield_payload_len,
+        });
+    }
     let envelope = ChunkEnvelope::new(
         ChunkEnvelopeHeader::new(
             IndexedDatasetKind::PublicTxid,
@@ -132,11 +164,7 @@ fn encode_public_txid_envelope(
             range,
             row_count,
             payload_len,
-            vec![ChunkSection {
-                section_id: PUBLIC_TXID_RECORD_SECTION_ID,
-                offset: 0,
-                byte_length: payload_len,
-            }],
+            sections,
         ),
         payload,
     );
@@ -228,6 +256,56 @@ fn encode_public_txid_records(records: &[StoredPublicTxidRow]) -> Result<Vec<u8>
     Ok(bytes)
 }
 
+fn encode_public_txid_unshield_preimages(
+    records: &[StoredPublicTxidRow],
+) -> Result<Option<Vec<u8>>, PublicTxidChunkError> {
+    let count = records.iter().filter(|record| record.has_unshield).count();
+    let mut bytes = Vec::with_capacity(count.saturating_mul(176).saturating_add(4));
+    write_u32(
+        &mut bytes,
+        u32::try_from(count).map_err(|_| ChunkError::PayloadTooLarge)?,
+    );
+    let mut missing = false;
+    for record in records {
+        let Some(encoded) = record.unshield_preimage.as_deref() else {
+            if record.has_unshield {
+                missing = true;
+            }
+            continue;
+        };
+        if !record.has_unshield {
+            return Err(PublicTxidChunkError::UnexpectedUnshieldPreimage {
+                txid_index: record.txid_index,
+            });
+        }
+        let preimage = CommitmentPreimage::abi_decode(encoded).map_err(|_| {
+            PublicTxidChunkError::InvalidUnshieldPreimage {
+                txid_index: record.txid_index,
+            }
+        })?;
+        let expected_commitment =
+            record
+                .commitments
+                .last()
+                .ok_or(PublicTxidChunkError::MissingUnshieldCommitment {
+                    txid_index: record.txid_index,
+                })?;
+        if preimage.hash().to_be_bytes::<32>() != *expected_commitment {
+            return Err(PublicTxidChunkError::UnshieldCommitmentMismatch {
+                txid_index: record.txid_index,
+            });
+        }
+        let encoded = preimage.abi_encode();
+        write_u64(&mut bytes, record.txid_index);
+        write_u16(
+            &mut bytes,
+            u16::try_from(encoded.len()).map_err(|_| ChunkError::PayloadTooLarge)?,
+        );
+        bytes.extend_from_slice(&encoded);
+    }
+    Ok((!missing).then_some(bytes))
+}
+
 fn public_txid_leaf_hash(record: &StoredPublicTxidRow) -> U256 {
     let nullifiers = record
         .nullifiers
@@ -307,6 +385,14 @@ pub enum PublicTxidChunkError {
     CrossesTxidTreeBoundary { start: u64, end: u64 },
     #[error("public TXID checkpoint rows must start at a TXID tree prefix, got {start}")]
     CheckpointDoesNotStartAtTreePrefix { start: u64 },
+    #[error("public TXID row {txid_index} has an unshield preimage without an unshield")]
+    UnexpectedUnshieldPreimage { txid_index: u64 },
+    #[error("public TXID row {txid_index} has an invalid unshield preimage")]
+    InvalidUnshieldPreimage { txid_index: u64 },
+    #[error("public TXID row {txid_index} has no unshield commitment")]
+    MissingUnshieldCommitment { txid_index: u64 },
+    #[error("public TXID row {txid_index} unshield preimage does not match its commitment")]
+    UnshieldCommitmentMismatch { txid_index: u64 },
     #[error("chunk encoding failed")]
     Chunk(#[from] ChunkError),
     #[error("IPFS pinning failed")]
@@ -316,9 +402,12 @@ pub enum PublicTxidChunkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::decode_chunk_bytes;
     use crate::manifest::ChainType;
     use crate::publish::ipfs::{IpfsError, raw_block_cid};
+    use alloy::primitives::{Address, Uint};
     use async_trait::async_trait;
+    use broadcaster_core::contracts::railgun::TokenData;
     use cid::Cid;
     use std::sync::Mutex;
 
@@ -397,6 +486,84 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn public_txid_chunk_adds_backward_compatible_unshield_sidecar() {
+        let preimage = unshield_preimage();
+        let mut unshield = record(1, 101);
+        unshield.has_unshield = true;
+        unshield.commitments = vec![preimage.hash().to_be_bytes::<32>()];
+        unshield.unshield_preimage = Some(preimage.abi_encode());
+        let records = vec![record(0, 100), unshield];
+        let checkpoint_root = public_txid_checkpoint_root(&records).expect("checkpoint root");
+
+        let published = prepare_public_txid_chunk(
+            scope(),
+            &records,
+            checkpoint_root,
+            CompressionAlgorithm::Zstd,
+        )
+        .expect("prepare chunk");
+        let envelope = decode_chunk_bytes(&published.descriptor, &published.compressed_bytes)
+            .expect("decode chunk");
+
+        assert_eq!(
+            envelope
+                .section_payload(PUBLIC_TXID_RECORD_SECTION_ID)
+                .expect("record section"),
+            encode_public_txid_records(&records).expect("legacy record encoding")
+        );
+        let sidecar = envelope
+            .section_payload(PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID)
+            .expect("unshield sidecar");
+        assert_eq!(
+            u32::from_le_bytes(sidecar[0..4].try_into().expect("sidecar count bytes")),
+            1
+        );
+        assert_eq!(
+            u64::from_le_bytes(sidecar[4..12].try_into().expect("sidecar index bytes")),
+            1
+        );
+        let encoded_len = usize::from(u16::from_le_bytes(
+            sidecar[12..14]
+                .try_into()
+                .expect("sidecar preimage length bytes"),
+        ));
+        assert_eq!(&sidecar[14..14 + encoded_len], preimage.abi_encode());
+    }
+
+    #[test]
+    fn public_txid_chunk_omits_sidecar_until_unshield_backfill_completes() {
+        let mut unshield = record(0, 100);
+        unshield.has_unshield = true;
+
+        let published =
+            prepare_public_txid_chunk(scope(), &[unshield], [0_u8; 32], CompressionAlgorithm::Zstd)
+                .expect("legacy-compatible chunk");
+        let envelope = decode_chunk_bytes(&published.descriptor, &published.compressed_bytes)
+            .expect("decode chunk");
+
+        assert!(matches!(
+            envelope.section_payload(PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID),
+            Err(ChunkError::SectionMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn public_txid_chunk_rejects_unshield_preimage_commitment_mismatch() {
+        let mut unshield = record(0, 100);
+        unshield.has_unshield = true;
+        unshield.unshield_preimage = Some(unshield_preimage().abi_encode());
+
+        let error =
+            prepare_public_txid_chunk(scope(), &[unshield], [0_u8; 32], CompressionAlgorithm::Zstd)
+                .expect_err("mismatched preimage must fail");
+
+        assert!(matches!(
+            error,
+            PublicTxidChunkError::UnshieldCommitmentMismatch { txid_index: 0 }
+        ));
+    }
+
     fn record(txid_index: u64, block_number: u64) -> StoredPublicTxidRow {
         StoredPublicTxidRow {
             txid_index,
@@ -412,6 +579,7 @@ mod tests {
             commitments: vec![[0x22; 32]],
             bound_params_hash: [0x33; 32],
             has_unshield: false,
+            unshield_preimage: None,
             utxo_tree_in: 3,
             utxo_tree_out: 4,
             utxo_batch_start_position_out: txid_index,
@@ -425,6 +593,18 @@ mod tests {
             railgun_contract: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .parse()
                 .expect("scope address"),
+        }
+    }
+
+    fn unshield_preimage() -> CommitmentPreimage {
+        CommitmentPreimage {
+            npk: FixedBytes::from([0x44; 32]),
+            token: TokenData {
+                tokenType: 0,
+                tokenAddress: Address::ZERO,
+                tokenSubID: U256::ZERO,
+            },
+            value: Uint::<120, 2>::from(5_u64),
         }
     }
 

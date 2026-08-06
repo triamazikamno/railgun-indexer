@@ -13,7 +13,7 @@ use tracing::info;
 
 pub(crate) const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
 const CHAIN_INDEXED_IPNS_SEQUENCE_STATE_KEY: &str = "chain_indexed_ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 19;
+const CURRENT_SCHEMA_VERSION: i32 = 20;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -861,7 +861,7 @@ impl Store {
                 Vec<u8>,
                 Vec<u8>,
                 Vec<u8>,
-                bool,
+                Option<Vec<u8>>,
                 i64,
                 i64,
                 i64,
@@ -882,7 +882,10 @@ impl Store {
                     nullifiers,
                     commitments,
                     bound_params_hash,
-                    has_unshield,
+                    CASE
+                        WHEN has_unshield THEN COALESCE(unshield_preimage, ''::bytea)
+                        ELSE NULL
+                    END AS unshield_data,
                     utxo_tree_in,
                     utxo_tree_out,
                     utxo_batch_start_position_out
@@ -905,7 +908,7 @@ impl Store {
                 nullifiers,
                 commitments,
                 bound_params_hash,
-                has_unshield,
+                unshield_data,
                 utxo_tree_in,
                 utxo_tree_out,
                 utxo_batch_start_position_out
@@ -939,11 +942,16 @@ impl Store {
                     nullifiers,
                     commitments,
                     bound_params_hash,
-                    has_unshield,
+                    unshield_data,
                     utxo_tree_in,
                     utxo_tree_out,
                     utxo_batch_start_position_out,
                 )| {
+                    let (has_unshield, unshield_preimage) = match unshield_data {
+                        None => (false, None),
+                        Some(bytes) if bytes.is_empty() => (true, None),
+                        Some(bytes) => (true, Some(bytes)),
+                    };
                     Ok(StoredPublicTxidRow {
                         txid_index: i64_to_u64(txid_index, "txid_index")?,
                         id,
@@ -958,6 +966,7 @@ impl Store {
                         commitments: fixed_bytes_vec("commitments", &commitments)?,
                         bound_params_hash: exact_array("bound_params_hash", &bound_params_hash)?,
                         has_unshield,
+                        unshield_preimage,
                         utxo_tree_in: i64_to_u64(utxo_tree_in, "utxo_tree_in")?,
                         utxo_tree_out: i64_to_u64(utxo_tree_out, "utxo_tree_out")?,
                         utxo_batch_start_position_out: i64_to_u64(
@@ -968,6 +977,143 @@ impl Store {
                 },
             )
             .collect()
+    }
+
+    pub async fn missing_public_txid_unshield_preimages(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        railgun_contract: Address,
+        start_block: u64,
+        end_block: u64,
+    ) -> Result<Vec<StoredMissingPublicTxidUnshieldPreimage>, StoreError> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                i64,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                i64,
+                i64,
+                i64,
+            ),
+        >(
+            r"
+            SELECT
+                row_id,
+                block_number,
+                railgun_transaction_index,
+                transaction_hash,
+                merkle_root,
+                nullifiers,
+                commitments,
+                bound_params_hash,
+                utxo_tree_in,
+                utxo_tree_out,
+                utxo_batch_start_position_out
+            FROM indexed_public_txid_rows
+            WHERE chain_type = $1
+                AND chain_id = $2
+                AND railgun_contract = $3
+                AND block_number BETWEEN $4 AND $5
+                AND has_unshield
+                AND unshield_preimage IS NULL
+            ORDER BY block_number, first_log_index, transaction_hash, railgun_transaction_index
+            ",
+        )
+        .bind(i16::from(chain_type))
+        .bind(u64_to_i64(chain_id, "chain_id")?)
+        .bind(railgun_contract.to_string())
+        .bind(u64_to_i64(start_block, "start_block")?)
+        .bind(u64_to_i64(end_block, "end_block")?)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    block_number,
+                    railgun_transaction_index,
+                    transaction_hash,
+                    merkle_root,
+                    nullifiers,
+                    commitments,
+                    bound_params_hash,
+                    utxo_tree_in,
+                    utxo_tree_out,
+                    utxo_batch_start_position_out,
+                )| {
+                    Ok(StoredMissingPublicTxidUnshieldPreimage {
+                        id,
+                        block_number: i64_to_u64(block_number, "block_number")?,
+                        railgun_transaction_index: i64_to_u64(
+                            railgun_transaction_index,
+                            "railgun_transaction_index",
+                        )?,
+                        transaction_hash: exact_array("transaction_hash", &transaction_hash)?,
+                        merkle_root: exact_array("merkle_root", &merkle_root)?,
+                        nullifiers: fixed_bytes_vec("nullifiers", &nullifiers)?,
+                        commitments: fixed_bytes_vec("commitments", &commitments)?,
+                        bound_params_hash: exact_array("bound_params_hash", &bound_params_hash)?,
+                        utxo_tree_in: i64_to_u64(utxo_tree_in, "utxo_tree_in")?,
+                        utxo_tree_out: i64_to_u64(utxo_tree_out, "utxo_tree_out")?,
+                        utxo_batch_start_position_out: i64_to_u64(
+                            utxo_batch_start_position_out,
+                            "utxo_batch_start_position_out",
+                        )?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn backfill_public_txid_unshield_preimages(
+        tx: &mut Transaction<'_, Postgres>,
+        chain_type: u8,
+        chain_id: u64,
+        railgun_contract: Address,
+        updates: &[PublicTxidUnshieldPreimageUpdate],
+    ) -> Result<u64, StoreError> {
+        let chain_type = i16::from(chain_type);
+        let chain_id = u64_to_i64(chain_id, "chain_id")?;
+        let railgun_contract = railgun_contract.to_string();
+        let mut updated = 0_u64;
+        for update in updates {
+            let result = sqlx::query(
+                r"
+                UPDATE indexed_public_txid_rows
+                SET unshield_preimage = $1
+                WHERE chain_type = $2
+                    AND chain_id = $3
+                    AND railgun_contract = $4
+                    AND transaction_hash = $5
+                    AND railgun_transaction_index = $6
+                    AND row_id = $7
+                    AND has_unshield
+                    AND unshield_preimage IS NULL
+                ",
+            )
+            .bind(&update.unshield_preimage)
+            .bind(chain_type)
+            .bind(chain_id)
+            .bind(&railgun_contract)
+            .bind(update.transaction_hash.as_slice())
+            .bind(u64_to_i64(
+                update.railgun_transaction_index,
+                "railgun_transaction_index",
+            )?)
+            .bind(&update.id)
+            .execute(&mut **tx)
+            .await?;
+            updated = updated.saturating_add(result.rows_affected());
+        }
+        Ok(updated)
     }
 
     pub async fn wallet_scan_rows(
@@ -2510,10 +2656,10 @@ impl Store {
                     chain_type, chain_id, railgun_contract, block_number, block_timestamp,
                     block_hash, transaction_hash, first_log_index, last_log_index,
                     railgun_transaction_index, row_id, merkle_root, nullifiers,
-                    commitments, bound_params_hash, has_unshield, utxo_tree_in,
+                    commitments, bound_params_hash, has_unshield, unshield_preimage, utxo_tree_in,
                     utxo_tree_out, utxo_batch_start_position_out
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 ON CONFLICT (chain_type, chain_id, railgun_contract, transaction_hash, railgun_transaction_index)
                 DO UPDATE SET
                     block_number = EXCLUDED.block_number,
@@ -2527,6 +2673,7 @@ impl Store {
                     commitments = EXCLUDED.commitments,
                     bound_params_hash = EXCLUDED.bound_params_hash,
                     has_unshield = EXCLUDED.has_unshield,
+                    unshield_preimage = EXCLUDED.unshield_preimage,
                     utxo_tree_in = EXCLUDED.utxo_tree_in,
                     utxo_tree_out = EXCLUDED.utxo_tree_out,
                     utxo_batch_start_position_out = EXCLUDED.utxo_batch_start_position_out
@@ -2551,6 +2698,7 @@ impl Store {
             .bind(commitments)
             .bind(item.bound_params_hash.as_slice())
             .bind(item.has_unshield)
+            .bind(item.unshield_preimage.as_ref())
             .bind(u64_to_i64(item.utxo_tree_in, "utxo_tree_in")?)
             .bind(u64_to_i64(item.utxo_tree_out, "utxo_tree_out")?)
             .bind(u64_to_i64(
@@ -2672,9 +2820,33 @@ pub struct StoredPublicTxidRow {
     pub commitments: Vec<[u8; 32]>,
     pub bound_params_hash: [u8; 32],
     pub has_unshield: bool,
+    pub unshield_preimage: Option<Vec<u8>>,
     pub utxo_tree_in: u64,
     pub utxo_tree_out: u64,
     pub utxo_batch_start_position_out: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMissingPublicTxidUnshieldPreimage {
+    pub id: String,
+    pub block_number: u64,
+    pub railgun_transaction_index: u64,
+    pub transaction_hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub nullifiers: Vec<[u8; 32]>,
+    pub commitments: Vec<[u8; 32]>,
+    pub bound_params_hash: [u8; 32],
+    pub utxo_tree_in: u64,
+    pub utxo_tree_out: u64,
+    pub utxo_batch_start_position_out: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicTxidUnshieldPreimageUpdate {
+    pub id: String,
+    pub railgun_transaction_index: u64,
+    pub transaction_hash: [u8; 32],
+    pub unshield_preimage: Vec<u8>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -3031,6 +3203,7 @@ const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[
     (17, V17_MIGRATIONS),
     (18, V18_MIGRATIONS),
     (19, V19_MIGRATIONS),
+    (20, V20_MIGRATIONS),
 ];
 
 const V4_MIGRATIONS: &[&str] = &[
@@ -3965,6 +4138,26 @@ const V19_MIGRATIONS: &[&str] = &[r"
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     "];
+
+const V20_MIGRATIONS: &[&str] = &[
+    r"
+    ALTER TABLE indexed_public_txid_rows
+        ADD COLUMN IF NOT EXISTS unshield_preimage BYTEA
+    ",
+    r"
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'idx_public_txid_rows_unshield_preimage_check'
+        ) THEN
+            ALTER TABLE indexed_public_txid_rows
+                ADD CONSTRAINT idx_public_txid_rows_unshield_preimage_check
+                CHECK (has_unshield OR unshield_preimage IS NULL) NOT VALID;
+        END IF;
+    END $$
+    ",
+];
 
 fn decode_fixed_hex<const N: usize>(
     field: &'static str,
