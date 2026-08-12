@@ -153,6 +153,22 @@ chain_indexed:
       start_block: 56109834
       v2_start_block: 0
       legacy_shield_block: 68196853
+      # Temporary Squid/PPOI compatibility for the published public-TXID feed.
+      # Remove this omission after the upstream sequence is corrected.
+      # See https://github.com/Railgun-Community/engine/issues/143 for more details.
+      # public_txid_compatibility_omissions:
+      #   - block_number: 491612310
+      #     transaction_hash: "0xcc51cc50038fa53505d05fea42506ec40a68d52ee83adddd4b275894ccd22cac"
+      #     railgun_transaction_index: 0
+      #   - block_number: 491644057
+      #     transaction_hash: "0x24f3eed23bececeaca55316cb7bae7d2a63f78640705bfaee9ccdb8ee342edfb"
+      #     railgun_transaction_index: 0
+      #   - block_number: 491943298
+      #     transaction_hash: "0xd555fe412c1fa826ba47d8edb7cecfcbb89cad54c7b351048cbad786dffe7689"
+      #     railgun_transaction_index: 0
+      #   - block_number: 491943298
+      #     transaction_hash: "0xd555fe412c1fa826ba47d8edb7cecfcbb89cad54c7b351048cbad786dffe7689"
+      #     railgun_transaction_index: 1
       datasets:
         - public_txid
         - wallet_scan

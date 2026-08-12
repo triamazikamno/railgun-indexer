@@ -1174,6 +1174,15 @@ impl ChainIndexedPublicationScheduler {
         scope: &ChainScope,
         max_block: u64,
     ) -> Result<Vec<PublishedCatalog>> {
+        self.validate_public_txid_compatibility_omissions(chain, max_block)
+            .await?;
+        if !chain.public_txid_compatibility_omissions.is_empty() {
+            warn!(
+                chain_id = chain.chain_id,
+                omission_count = chain.public_txid_compatibility_omissions.len(),
+                "publishing public TXID catalog with compatibility omissions"
+            );
+        }
         let mut offset = 0_u64;
         let mut chunks = Vec::new();
         loop {
@@ -1183,13 +1192,14 @@ impl ChainIndexedPublicationScheduler {
             );
             let rows = self
                 .store
-                .public_txid_rows_through_block(
+                .published_public_txid_rows_through_block(
                     EVM_CHAIN_TYPE,
                     chain.chain_id,
                     chain.railgun_contract,
                     offset,
                     row_limit,
                     max_block,
+                    &chain.public_txid_compatibility_omissions,
                 )
                 .await
                 .wrap_err("read public TXID rows for artifact publication")?;
@@ -1202,13 +1212,14 @@ impl ChainIndexedPublicationScheduler {
             for planned in planned_chunks {
                 let chunk_rows = self
                     .store
-                    .public_txid_rows_through_block(
+                    .published_public_txid_rows_through_block(
                         EVM_CHAIN_TYPE,
                         chain.chain_id,
                         chain.railgun_contract,
                         planned.range.start,
                         planned.row_count,
                         max_block,
+                        &chain.public_txid_compatibility_omissions,
                     )
                     .await
                     .wrap_err("read planned public TXID rows for artifact publication")?;
@@ -1242,6 +1253,39 @@ impl ChainIndexedPublicationScheduler {
         .await
     }
 
+    async fn validate_public_txid_compatibility_omissions(
+        &self,
+        chain: &ChainIndexedChainConfig,
+        max_block: u64,
+    ) -> Result<()> {
+        for omission in &chain.public_txid_compatibility_omissions {
+            if omission.block_number > max_block {
+                continue;
+            }
+            let match_count = self
+                .store
+                .public_txid_compatibility_omission_match_count(
+                    EVM_CHAIN_TYPE,
+                    chain.chain_id,
+                    chain.railgun_contract,
+                    omission,
+                )
+                .await
+                .wrap_err("validate public TXID compatibility omission")?;
+            if match_count != 1 {
+                return Err(eyre!(
+                    "public TXID compatibility omission for chain {} at block {} transaction {} inner index {} matched {} canonical rows; expected exactly one",
+                    chain.chain_id,
+                    omission.block_number,
+                    hex::encode_prefixed(omission.transaction_hash.as_slice()),
+                    omission.railgun_transaction_index,
+                    match_count,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn public_txid_checkpoint_root(
         &self,
         chain: &ChainIndexedChainConfig,
@@ -1259,13 +1303,14 @@ impl ChainIndexedPublicationScheduler {
             .ok_or_else(|| eyre!("public TXID checkpoint range overflow"))?;
         let checkpoint_rows = self
             .store
-            .public_txid_rows_through_block(
+            .published_public_txid_rows_through_block(
                 EVM_CHAIN_TYPE,
                 chain.chain_id,
                 chain.railgun_contract,
                 tree_start,
                 row_count,
                 max_block,
+                &chain.public_txid_compatibility_omissions,
             )
             .await
             .wrap_err("read public TXID checkpoint rows")?;

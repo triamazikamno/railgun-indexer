@@ -1,4 +1,5 @@
 use crate::chain_logs::{IndexedLogBatch, IndexedLogSource};
+use crate::config::PublicTxidCompatibilityOmission;
 use crate::snapshot::SnapshotKind;
 use alloy::primitives::Address;
 use alloy::sol_types::SolValue;
@@ -829,6 +830,62 @@ impl Store {
         .await
     }
 
+    pub async fn published_public_txid_rows_through_block(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        railgun_contract: Address,
+        offset: u64,
+        limit: u64,
+        max_block: u64,
+        omissions: &[PublicTxidCompatibilityOmission],
+    ) -> Result<Vec<StoredPublicTxidRow>, StoreError> {
+        self.public_txid_rows_with_max_block_and_omissions(
+            chain_type,
+            chain_id,
+            railgun_contract,
+            offset,
+            limit,
+            Some(max_block),
+            omissions,
+        )
+        .await
+    }
+
+    pub async fn public_txid_compatibility_omission_match_count(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        railgun_contract: Address,
+        omission: &PublicTxidCompatibilityOmission,
+    ) -> Result<u64, StoreError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT COUNT(*)
+            FROM indexed_public_txid_rows
+            WHERE chain_type = $1
+                AND chain_id = $2
+                AND railgun_contract = $3
+                AND block_number = $4
+                AND transaction_hash = $5
+                AND railgun_transaction_index = $6
+            ",
+        )
+        .bind(i16::from(chain_type))
+        .bind(u64_to_i64(chain_id, "chain_id")?)
+        .bind(railgun_contract.to_string())
+        .bind(u64_to_i64(omission.block_number, "omission_block_number")?)
+        .bind(omission.transaction_hash.as_slice())
+        .bind(u64_to_i64(
+            omission.railgun_transaction_index,
+            "omission_railgun_transaction_index",
+        )?)
+        .fetch_one(&self.pool)
+        .await?;
+
+        i64_to_u64(count, "public_txid_compatibility_omission_match_count")
+    }
+
     async fn public_txid_rows_with_max_block(
         &self,
         chain_type: u8,
@@ -838,6 +895,28 @@ impl Store {
         limit: u64,
         max_block: Option<u64>,
     ) -> Result<Vec<StoredPublicTxidRow>, StoreError> {
+        self.public_txid_rows_with_max_block_and_omissions(
+            chain_type,
+            chain_id,
+            railgun_contract,
+            offset,
+            limit,
+            max_block,
+            &[],
+        )
+        .await
+    }
+
+    async fn public_txid_rows_with_max_block_and_omissions(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        railgun_contract: Address,
+        offset: u64,
+        limit: u64,
+        max_block: Option<u64>,
+        omissions: &[PublicTxidCompatibilityOmission],
+    ) -> Result<Vec<StoredPublicTxidRow>, StoreError> {
         let chain_type = i16::from(chain_type);
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
         let railgun_contract = railgun_contract.to_string();
@@ -846,6 +925,23 @@ impl Store {
         let max_block = max_block
             .map(|block| u64_to_i64(block, "max_block"))
             .transpose()?;
+        let omission_blocks = omissions
+            .iter()
+            .map(|omission| u64_to_i64(omission.block_number, "omission_block_number"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let omission_hashes = omissions
+            .iter()
+            .map(|omission| omission.transaction_hash.to_vec())
+            .collect::<Vec<_>>();
+        let omission_indices = omissions
+            .iter()
+            .map(|omission| {
+                u64_to_i64(
+                    omission.railgun_transaction_index,
+                    "omission_railgun_transaction_index",
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let rows = sqlx::query_as::<
             _,
             (
@@ -894,6 +990,14 @@ impl Store {
                     AND chain_id = $2
                     AND railgun_contract = $3
                     AND ($6::BIGINT IS NULL OR block_number <= $6)
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM UNNEST($7::BIGINT[], $8::BYTEA[], $9::BIGINT[])
+                            AS omissions(block_number, transaction_hash, railgun_transaction_index)
+                        WHERE omissions.block_number = indexed_public_txid_rows.block_number
+                            AND omissions.transaction_hash = indexed_public_txid_rows.transaction_hash
+                            AND omissions.railgun_transaction_index = indexed_public_txid_rows.railgun_transaction_index
+                    )
             )
             SELECT
                 txid_index,
@@ -924,6 +1028,9 @@ impl Store {
         .bind(offset)
         .bind(limit)
         .bind(max_block)
+        .bind(omission_blocks)
+        .bind(omission_hashes)
+        .bind(omission_indices)
         .fetch_all(&self.pool)
         .await?;
 

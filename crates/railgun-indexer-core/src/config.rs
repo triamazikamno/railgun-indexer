@@ -115,6 +115,16 @@ pub struct ChainIndexedChainConfig {
     pub legacy_shield_block: u64,
     #[serde(default = "default_chain_indexed_datasets")]
     pub datasets: Vec<IndexedDatasetKind>,
+    #[serde(default)]
+    pub public_txid_compatibility_omissions: Vec<PublicTxidCompatibilityOmission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicTxidCompatibilityOmission {
+    pub block_number: u64,
+    pub transaction_hash: FixedBytes<32>,
+    pub railgun_transaction_index: u64,
 }
 
 impl<'de> Deserialize<'de> for Config {
@@ -300,6 +310,23 @@ impl Config {
                     railgun_contract: chain.railgun_contract.to_string(),
                 });
             }
+            let mut seen_public_txid_omissions = HashSet::new();
+            for omission in &chain.public_txid_compatibility_omissions {
+                if !seen_public_txid_omissions.insert((
+                    omission.block_number,
+                    omission.transaction_hash,
+                    omission.railgun_transaction_index,
+                )) {
+                    return Err(
+                        ConfigValidationError::DuplicatePublicTxidCompatibilityOmission {
+                            chain_id: chain.chain_id,
+                            block_number: omission.block_number,
+                            transaction_hash: omission.transaction_hash.to_string(),
+                            railgun_transaction_index: omission.railgun_transaction_index,
+                        },
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -413,6 +440,15 @@ pub enum ConfigValidationError {
         chain_id: u64,
         railgun_contract: String,
     },
+    #[error(
+        "duplicate public_txid_compatibility_omissions entry for chain id {chain_id}: block {block_number}, transaction {transaction_hash}, railgun transaction index {railgun_transaction_index}"
+    )]
+    DuplicatePublicTxidCompatibilityOmission {
+        chain_id: u64,
+        block_number: u64,
+        transaction_hash: String,
+        railgun_transaction_index: u64,
+    },
     #[error("postgres connection failed")]
     Postgres(#[from] sqlx::Error),
 }
@@ -477,6 +513,7 @@ mod tests {
                     v2_start_block: 2,
                     legacy_shield_block: 3,
                     datasets: default_chain_indexed_datasets(),
+                    public_txid_compatibility_omissions: Vec::new(),
                 }],
                 index_interval: Duration::from_secs(1).into(),
                 tail_safety_interval: Duration::from_mins(5).into(),
@@ -637,6 +674,27 @@ mod tests {
         assert!(matches!(
             error,
             ConfigValidationError::EmptyChainIndexedRpcUrl { chain_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn duplicate_public_txid_compatibility_omissions_are_rejected() {
+        let mut config = valid_config();
+        let omission = PublicTxidCompatibilityOmission {
+            block_number: 100,
+            transaction_hash: FixedBytes::from([0xcc; 32]),
+            railgun_transaction_index: 0,
+        };
+        config.chain_indexed.chains[0].public_txid_compatibility_omissions =
+            vec![omission.clone(), omission];
+
+        let error = config
+            .validate()
+            .expect_err("duplicate public TXID compatibility omissions should fail");
+
+        assert!(matches!(
+            error,
+            ConfigValidationError::DuplicatePublicTxidCompatibilityOmission { chain_id: 1, .. }
         ));
     }
 

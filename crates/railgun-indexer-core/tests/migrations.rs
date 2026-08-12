@@ -24,6 +24,7 @@ use railgun_indexer_core::chain_logs::{
     IndexedLogSource, IndexedNullifier, IndexedPublicTransaction, IndexedShieldCommitment,
     IndexedTransactCommitment,
 };
+use railgun_indexer_core::config::PublicTxidCompatibilityOmission;
 use railgun_indexer_core::manifest::{
     ChainScope, ChainType, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
     IndexedDatasetKind as ManifestIndexedDatasetKind, PublisherIdentity, content_hash,
@@ -1528,7 +1529,11 @@ async fn indexed_log_batch_persistence_is_idempotent() -> Result<(), Box<dyn std
 
     let store = Store::new(pool.clone());
     let railgun_contract = Address::from([0xbb; 20]);
-    let batch = indexed_log_batch_at(100);
+    let mut batch = indexed_log_batch_at(100);
+    let mut second_public_transaction = batch.public_transactions[0].clone();
+    second_public_transaction.railgun_transaction_index = 1;
+    second_public_transaction.id = "0x64:1".to_string();
+    batch.public_transactions.push(second_public_transaction);
 
     let mut tx = store.begin().await?;
     Store::persist_indexed_log_batch(&mut tx, 0, 1, railgun_contract, &batch).await?;
@@ -1557,11 +1562,47 @@ async fn indexed_log_batch_persistence_is_idempotent() -> Result<(), Box<dyn std
     let public_rows = store
         .public_txid_rows(0, 1, railgun_contract, 0, 10)
         .await?;
-    assert_eq!(public_rows.len(), 1);
+    assert_eq!(public_rows.len(), 2);
     assert_eq!(public_rows[0].txid_index, 0);
     assert_eq!(public_rows[0].block_number, 100);
     assert_eq!(public_rows[0].first_log_index, 1);
     assert_eq!(public_rows[0].last_log_index, 5);
+    assert_eq!(public_rows[1].txid_index, 1);
+    assert_eq!(public_rows[1].id, "0x64:1");
+
+    let published_rows_without_omissions = store
+        .published_public_txid_rows_through_block(0, 1, railgun_contract, 0, 10, 100, &[])
+        .await?;
+    assert_eq!(published_rows_without_omissions.len(), 2);
+    assert_eq!(published_rows_without_omissions[0].txid_index, 0);
+    assert_eq!(published_rows_without_omissions[1].txid_index, 1);
+
+    let omission = PublicTxidCompatibilityOmission {
+        block_number: 100,
+        transaction_hash: FixedBytes::from([0xcc; 32]),
+        railgun_transaction_index: 0,
+    };
+    let published_rows = store
+        .published_public_txid_rows_through_block(0, 1, railgun_contract, 0, 10, 100, &[omission])
+        .await?;
+    assert_eq!(published_rows.len(), 1);
+    assert_eq!(published_rows[0].txid_index, 0);
+    assert_eq!(published_rows[0].id, "0x64:1");
+    assert_eq!(
+        store
+            .public_txid_compatibility_omission_match_count(
+                0,
+                1,
+                railgun_contract,
+                &PublicTxidCompatibilityOmission {
+                    block_number: 100,
+                    transaction_hash: FixedBytes::from([0xcc; 32]),
+                    railgun_transaction_index: 0,
+                },
+            )
+            .await?,
+        1
+    );
 
     let wallet_rows = store
         .wallet_scan_rows(0, 1, railgun_contract, 0, 200)
