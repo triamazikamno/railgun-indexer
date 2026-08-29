@@ -306,6 +306,45 @@ impl Audit {
         invalidate_pending_poi_manifest_reconciliation(tx, channel, cid, sequence).await
     }
 
+    pub async fn abandon_pending_poi_v4_manifest_reconciliation(
+        tx: &mut Transaction<'_, Postgres>,
+        cid: &Cid,
+        sequence: u64,
+        unavailable_artifact_cid: Option<&Cid>,
+    ) -> Result<(), AuditError> {
+        let cid_string = cid.to_string();
+        invalidate_pending_poi_manifest_reconciliation(tx, PoiManifestChannel::V4, cid, sequence)
+            .await?;
+        let sequence = u64_to_i64(sequence, "sequence")?;
+
+        if let Some(unavailable_artifact_cid) = unavailable_artifact_cid {
+            sqlx::query(
+                r"
+                UPDATE published_poi_v4_artifacts AS artifact
+                SET unpinned_at = now()
+                WHERE artifact.cid = $1
+                  AND artifact.unpinned_at IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM published_poi_v4_manifest_artifacts AS reference
+                      JOIN published_poi_v4_manifests AS manifest
+                        ON manifest.id = reference.manifest_id
+                      WHERE reference.artifact_cid = artifact.cid
+                        AND manifest.cid = $2
+                        AND manifest.ipns_sequence = $3
+                        AND manifest.reconciliation_invalidated_at IS NOT NULL
+                  )
+                ",
+            )
+            .bind(unavailable_artifact_cid.to_string())
+            .bind(cid_string)
+            .bind(sequence)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn pending_manifest_publication(
         pool: &PgPool,
     ) -> Result<Option<PendingManifestPublication>, AuditError> {
@@ -569,7 +608,6 @@ impl Audit {
                 FROM published_poi_v4_artifacts
                 WHERE artifact_kind = 'bridge'
                   AND cid = ANY($1::TEXT[])
-                  AND unpinned_at IS NULL
                 ",
             )
             .bind(&bridge_cids)

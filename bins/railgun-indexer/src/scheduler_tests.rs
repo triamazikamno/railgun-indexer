@@ -292,6 +292,141 @@ async fn early_rotation_bridges_prior_tail_and_reuses_exact_cids() -> Result<()>
 
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
+async fn missing_retained_bridge_is_rebuilt_for_pending_v4_republish() -> Result<()> {
+    let (_postgres, store) = postgres_store().await?;
+    let signing_key = SigningKey::from_bytes(&[52; 32]);
+    let root_server = RootServer::start(true).await?;
+    let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
+    let ipfs = Arc::new(MemoryIpfs::default());
+    let legacy = Arc::new(MockPublisher::default());
+    let v4 = Arc::new(MockPublisher::default());
+    let now = SystemTime::now();
+    let mut publisher_scheduler = scheduler(
+        &config,
+        store.clone(),
+        ipfs.clone(),
+        signing_key.clone(),
+        legacy.clone(),
+        v4.clone(),
+    );
+
+    publisher_scheduler.publish_cycle(now).await?;
+    seed_events(&store, &signing_key, 32_768, &root_server.url).await?;
+    publisher_scheduler
+        .publish_cycle(now + Duration::from_secs(1))
+        .await?;
+    let tail_graph = Audit::active_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("32,768-event POI artifact graph is active");
+    assert!(
+        tail_graph.entries[0].current_tail.is_some(),
+        "32,768-event graph establishes a current tail"
+    );
+    age_v4_rows(store.pool(), 100).await?;
+    seed_events(&store, &signing_key, 44_000, &root_server.url).await?;
+    let rotation_now = now + Duration::from_secs(2);
+    publisher_scheduler.publish_cycle(rotation_now).await?;
+
+    let prior = Audit::active_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("rotated POI artifact graph is active");
+    let bridge = prior.entries[0]
+        .retained_bridges
+        .first()
+        .cloned()
+        .expect("rotation retained the prior tail bridge");
+    assert!(
+        prior.entries[0].current_tail.is_some(),
+        "restart rotation has a current tail to promote"
+    );
+    let bridge_published_at = sqlx::query_scalar::<_, i64>(
+        "SELECT EXTRACT(EPOCH FROM published_at)::BIGINT \
+         FROM published_poi_v4_artifacts \
+         WHERE artifact_kind = 'bridge' AND cid = $1",
+    )
+    .bind(&bridge.artifact.cid)
+    .fetch_one(store.pool())
+    .await?;
+
+    install_v4_activation_failure(store.pool()).await?;
+    publisher_scheduler.manifest_needs_publish = true;
+    let _ = publisher_scheduler
+        .publish_cycle(rotation_now + Duration::from_secs(1))
+        .await
+        .expect_err("v4 activation failure must leave a pending republish");
+    let pending = Audit::pending_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("pending v4 republish");
+    assert!(pending.artifact_cids.contains(&bridge.artifact.cid));
+    let pending_manifest = Manifest::read(&ipfs.bytes(&pending.cid)?)?;
+    assert_eq!(
+        pending_manifest.entries[0].retained_bridges,
+        vec![bridge.clone()]
+    );
+
+    ipfs.remove_bytes(&bridge.artifact.cid);
+    let aged_checkpoint = sqlx::query(
+        "UPDATE published_poi_v4_artifacts \
+         SET published_at = to_timestamp($1) \
+         WHERE artifact_kind = 'checkpoint_catalog' AND cid = $2",
+    )
+    .bind(100_i64)
+    .bind(&prior.entries[0].checkpoint_catalog.artifact.cid)
+    .execute(store.pool())
+    .await?;
+    assert_eq!(aged_checkpoint.rows_affected(), 1);
+    drop_v4_activation_failure(store.pool()).await?;
+    let recovery_now = SystemTime::now();
+    let mut restarted = scheduler(
+        &config,
+        store.clone(),
+        ipfs.clone(),
+        signing_key,
+        legacy,
+        v4.clone(),
+    );
+    restarted.publish_cycle(recovery_now).await?;
+
+    let active = Audit::active_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("replacement v4 manifest is active");
+    assert_ne!(active.cid, pending.cid);
+    assert!(active.sequence > pending.sequence);
+    let restored_bridge = active.entries[0]
+        .retained_bridges
+        .iter()
+        .find(|candidate| candidate.artifact.cid == bridge.artifact.cid)
+        .expect("original retained bridge survives forced rotation");
+    assert_eq!(restored_bridge, &bridge);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXTRACT(EPOCH FROM published_at)::BIGINT \
+             FROM published_poi_v4_artifacts \
+             WHERE artifact_kind = 'bridge' AND cid = $1",
+        )
+        .bind(&restored_bridge.artifact.cid)
+        .fetch_one(store.pool())
+        .await?,
+        bridge_published_at,
+        "bridge reactivation preserves original publication time"
+    );
+    let bridge_cid = restored_bridge.artifact.cid.parse::<Cid>()?;
+    assert!(ipfs.contains(&bridge_cid).await?);
+    assert!(
+        Audit::pending_poi_artifact_manifest_publication(store.pool())
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        v4.calls().len(),
+        5,
+        "republish activates a higher-sequence graph"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
 async fn oversized_suffix_after_active_graph_without_tail_keeps_prior_graph_active() -> Result<()> {
     assert_oversized_suffix_cycle_fails_closed(false, [38; 32]).await
 }
@@ -427,6 +562,184 @@ async fn pending_v4_survives_activation_failure_retention_and_restart() -> Resul
     assert!(unpinned.contains(&old_active.cid));
     assert!(old_only.is_subset(&unpinned));
     assert!(shared.is_disjoint(&unpinned));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn missing_pending_v4_artifact_is_rebuilt_in_same_cycle() -> Result<()> {
+    missing_pending_v4_rebuild(MissingPendingV4Case::Artifact, [49; 32]).await
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn missing_pending_v4_manifest_is_rebuilt_without_abandoning_artifacts() -> Result<()> {
+    missing_pending_v4_rebuild(MissingPendingV4Case::Manifest, [50; 32]).await
+}
+
+#[derive(Clone, Copy)]
+enum MissingPendingV4Case {
+    Artifact,
+    Manifest,
+}
+
+async fn missing_pending_v4_rebuild(
+    case: MissingPendingV4Case,
+    signing_seed: [u8; 32],
+) -> Result<()> {
+    let (_postgres, store) = postgres_store().await?;
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    let root_server = RootServer::start(true).await?;
+    seed_events(&store, &signing_key, 1, &root_server.url).await?;
+    let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
+    let ipfs = Arc::new(MemoryIpfs::default());
+    let legacy = Arc::new(MockPublisher::default());
+    let v4 = Arc::new(MockPublisher::default());
+    install_v4_activation_failure(store.pool()).await?;
+    let now = SystemTime::now();
+    let mut first = scheduler(
+        &config,
+        store.clone(),
+        ipfs.clone(),
+        signing_key.clone(),
+        legacy.clone(),
+        v4.clone(),
+    );
+    let _ = first
+        .publish_cycle(now)
+        .await
+        .expect_err("activation trigger must leave a pending v4 manifest");
+    let pending = Audit::pending_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("pending v4 manifest");
+    let (unavailable, artifact_count) = match case {
+        MissingPendingV4Case::Artifact => {
+            let unavailable = pending
+                .artifact_cids
+                .first()
+                .expect("event graph has a referenced artifact")
+                .clone();
+            ipfs.remove_bytes(&unavailable);
+            (Some(unavailable), None)
+        }
+        MissingPendingV4Case::Manifest => {
+            let artifact_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM published_poi_v4_artifacts WHERE unpinned_at IS NULL",
+            )
+            .fetch_one(store.pool())
+            .await?;
+            ipfs.remove_bytes(&pending.cid);
+            (None, Some(artifact_count))
+        }
+    };
+    drop_v4_activation_failure(store.pool()).await?;
+
+    let mut restarted = scheduler(
+        &config,
+        store.clone(),
+        ipfs.clone(),
+        signing_key,
+        legacy,
+        v4.clone(),
+    );
+    restarted
+        .publish_cycle(now + Duration::from_secs(1))
+        .await?;
+
+    let active = Audit::active_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("replacement v4 manifest is active");
+    assert_ne!(active.cid, pending.cid);
+    assert!(active.sequence > pending.sequence);
+    match case {
+        MissingPendingV4Case::Artifact => {
+            let unavailable = unavailable.expect("missing artifact CID was captured");
+            let unavailable_cid = unavailable.parse::<Cid>()?;
+            assert!(ipfs.contains(&unavailable_cid).await?);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM published_poi_v4_artifacts WHERE cid = $1 AND unpinned_at IS NULL",
+                )
+                .bind(&unavailable)
+                .fetch_one(store.pool())
+                .await?,
+                1,
+                "rebuilt artifact row is live again"
+            );
+        }
+        MissingPendingV4Case::Manifest => {
+            let artifact_count = artifact_count.expect("live artifact count was captured");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM published_poi_v4_artifacts WHERE unpinned_at IS NULL",
+                )
+                .fetch_one(store.pool())
+                .await?,
+                artifact_count,
+                "missing manifest does not invalidate artifact rows"
+            );
+        }
+    }
+    assert!(
+        Audit::pending_poi_artifact_manifest_publication(store.pool())
+            .await?
+            .is_none()
+    );
+    assert_eq!(v4.calls().len(), 2, "same cycle publishes the replacement");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn pending_v4_contains_error_preserves_pending_manifest() -> Result<()> {
+    let (_postgres, store) = postgres_store().await?;
+    let signing_key = SigningKey::from_bytes(&[51; 32]);
+    let root_server = RootServer::start(true).await?;
+    seed_events(&store, &signing_key, 1, &root_server.url).await?;
+    let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
+    let ipfs = Arc::new(MemoryIpfs::default());
+    let legacy = Arc::new(MockPublisher::default());
+    let v4 = Arc::new(MockPublisher::default());
+    install_v4_activation_failure(store.pool()).await?;
+    let now = SystemTime::now();
+    let mut first = scheduler(
+        &config,
+        store.clone(),
+        ipfs.clone(),
+        signing_key.clone(),
+        legacy.clone(),
+        v4.clone(),
+    );
+    let _ = first
+        .publish_cycle(now)
+        .await
+        .expect_err("activation trigger must leave a pending v4 manifest");
+    let pending = Audit::pending_poi_artifact_manifest_publication(store.pool())
+        .await?
+        .expect("pending v4 manifest");
+    drop_v4_activation_failure(store.pool()).await?;
+    ipfs.contains_error.store(true, Ordering::SeqCst);
+
+    let mut restarted = scheduler(
+        &config,
+        store.clone(),
+        ipfs,
+        signing_key,
+        legacy,
+        v4.clone(),
+    );
+    let _ = restarted
+        .publish_cycle(now + Duration::from_secs(1))
+        .await
+        .expect_err("provider contains failure must fail closed");
+    assert_eq!(
+        Audit::pending_poi_artifact_manifest_publication(store.pool())
+            .await?
+            .expect("pending v4 manifest remains")
+            .cid,
+        pending.cid
+    );
+    assert_eq!(v4.calls().len(), 1, "provider failure prevents replacement");
     Ok(())
 }
 
@@ -1145,6 +1458,7 @@ struct MemoryIpfs {
     pin_release: Notify,
     pin_attempts: AtomicUsize,
     fail_pin_at: AtomicUsize,
+    contains_error: AtomicBool,
 }
 
 impl MemoryIpfs {
@@ -1172,6 +1486,10 @@ impl MemoryIpfs {
 
     fn clear_bytes(&self) {
         self.bytes.lock().expect("IPFS bytes lock").clear();
+    }
+
+    fn remove_bytes(&self, cid: &str) {
+        let _ = self.bytes.lock().expect("IPFS bytes lock").remove(cid);
     }
 
     fn unpinned_count(&self) -> usize {
@@ -1223,6 +1541,13 @@ impl IpfsClient for MemoryIpfs {
     }
 
     async fn contains(&self, cid: &Cid) -> std::result::Result<bool, IpfsError> {
+        if self.contains_error.load(Ordering::SeqCst) {
+            return Err(IpfsError::ContainsFailed {
+                service: "memory".to_string(),
+                cid: Box::new(*cid),
+                source: Box::new(std::io::Error::other("forced contains failure")),
+            });
+        }
         Ok(self
             .bytes
             .lock()

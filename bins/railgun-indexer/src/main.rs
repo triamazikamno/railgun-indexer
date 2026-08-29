@@ -714,6 +714,13 @@ struct PublishedPoiEntry {
     reused_cids: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPoiPublicationReconciliation {
+    None,
+    Activated,
+    Abandoned,
+}
+
 impl PublicationScheduler {
     fn new(
         config: Config,
@@ -775,13 +782,24 @@ impl PublicationScheduler {
 
     async fn publish_cycle(&mut self, now: SystemTime) -> Result<()> {
         self.ensure_publication_running()?;
-        let reconciled = self.reconcile_pending_poi_publications().await?;
-        if !self.publication_state_loaded || reconciled {
+        let reconciliation = self.reconcile_pending_poi_publications().await?;
+        if !self.publication_state_loaded
+            || !matches!(reconciliation, PendingPoiPublicationReconciliation::None)
+        {
             self.load_durable_publication_state().await?;
             self.publication_state_loaded = true;
         }
-        if reconciled {
+        if matches!(
+            reconciliation,
+            PendingPoiPublicationReconciliation::Activated
+        ) {
             return Ok(());
+        }
+        if matches!(
+            reconciliation,
+            PendingPoiPublicationReconciliation::Abandoned
+        ) {
+            self.manifest_needs_publish = true;
         }
 
         let mut published_snapshot = false;
@@ -1313,6 +1331,9 @@ impl PublicationScheduler {
         let mut checkpoint_event_count = active.map_or(event_count, |graph| {
             graph.entry.checkpoint_catalog.row_count
         });
+        let inherited_bridges = active
+            .map(|graph| graph.entry.retained_bridges.clone())
+            .unwrap_or_default();
         let mut retained_bridges = active
             .map(|graph| graph.entry.retained_bridges.clone())
             .unwrap_or_default();
@@ -1364,6 +1385,36 @@ impl PublicationScheduler {
             checkpoint_event_count = prior_event_count;
             retained_bridges = retain_recent_bridges(retained_bridges, graph, now)?;
         }
+
+        let mut materialized_bridges = Vec::with_capacity(retained_bridges.len());
+        for bridge in retained_bridges {
+            if !inherited_bridges.contains(&bridge) {
+                materialized_bridges.push(bridge);
+                continue;
+            }
+            let prepared = corpus.prepare_event_artifact(
+                EventArtifactKind::Bridge,
+                bridge.range.start_index,
+                bridge.range.end_index,
+            )?;
+            let expected = prepared.descriptor(bridge.artifact.cid.clone())?;
+            if expected != bridge {
+                return Err(eyre!(
+                    "stored POI retained bridge descriptor does not match rebuilt bytes"
+                ));
+            }
+            let (published, reused) = self
+                .publish_poi_event_artifact(PoiArtifactPublicationKind::Bridge, &prepared)
+                .await?;
+            if published != bridge {
+                return Err(eyre!(
+                    "published POI retained bridge descriptor does not match stored descriptor"
+                ));
+            }
+            reused_cids += usize::from(reused);
+            materialized_bridges.push(published);
+        }
+        retained_bridges = materialized_bridges;
 
         let prepared_chunks = corpus.prepare_checkpoint(checkpoint_event_count)?;
         let mut checkpoint_descriptors = Vec::with_capacity(prepared_chunks.len());
@@ -2068,7 +2119,9 @@ impl PublicationScheduler {
         Ok(())
     }
 
-    async fn reconcile_pending_poi_publications(&self) -> Result<bool> {
+    async fn reconcile_pending_poi_publications(
+        &self,
+    ) -> Result<PendingPoiPublicationReconciliation> {
         self.ensure_publication_running()?;
         let legacy = Audit::pending_manifest_publication(self.store.pool())
             .await
@@ -2077,8 +2130,9 @@ impl PublicationScheduler {
             .await
             .wrap_err("load pending v4 POI manifest")?;
         if legacy.is_none() && v4.is_none() {
-            return Ok(false);
+            return Ok(PendingPoiPublicationReconciliation::None);
         }
+        let legacy_pending = legacy.is_some();
 
         let legacy_reconciliation = async {
             let Some(pending) = legacy else {
@@ -2104,18 +2158,62 @@ impl PublicationScheduler {
         };
         let v4_reconciliation = async {
             let Some(pending) = v4 else {
-                return Ok::<(), eyre::Report>(());
+                return Ok::<PendingPoiPublicationReconciliation, eyre::Report>(
+                    PendingPoiPublicationReconciliation::None,
+                );
             };
-            for cid in pending
-                .artifact_cids
-                .iter()
-                .chain(std::iter::once(&pending.cid))
-            {
-                if !self.cid_is_available(cid, "pending v4 graph").await? {
-                    return Err(eyre!(
-                        "pending v4 graph CID {cid} is externally unavailable"
-                    ));
+            let unavailable_artifact_cid = {
+                let mut unavailable = None;
+                for cid in &pending.artifact_cids {
+                    if !self.cid_is_available(cid, "pending v4 graph").await? {
+                        unavailable = Some(cid);
+                        break;
+                    }
                 }
+                unavailable
+            };
+            let unavailable = if let Some(cid) = unavailable_artifact_cid {
+                Some((cid, "artifact"))
+            } else if !self
+                .cid_is_available(&pending.cid, "pending v4 manifest")
+                .await?
+            {
+                Some((&pending.cid, "manifest"))
+            } else {
+                None
+            };
+            if let Some((unavailable_cid, unavailable_kind)) = unavailable {
+                let unavailable_cid = unavailable_cid
+                    .parse::<Cid>()
+                    .wrap_err("parse unavailable pending v4 CID")?;
+                let pending_cid = pending
+                    .cid
+                    .parse::<Cid>()
+                    .wrap_err("parse pending v4 manifest CID")?;
+                warn!(
+                    pending_manifest_cid = %pending.cid,
+                    pending_sequence = pending.sequence,
+                    unavailable_cid = %unavailable_cid,
+                    unavailable_kind,
+                    "abandoning pending POI v4 manifest with unavailable CID"
+                );
+                let mut tx = self
+                    .store
+                    .begin()
+                    .await
+                    .wrap_err("begin pending v4 manifest abandonment transaction")?;
+                Audit::abandon_pending_poi_v4_manifest_reconciliation(
+                    &mut tx,
+                    &pending_cid,
+                    pending.sequence,
+                    (unavailable_kind == "artifact").then_some(&unavailable_cid),
+                )
+                .await
+                .wrap_err("abandon pending v4 manifest reconciliation")?;
+                tx.commit()
+                    .await
+                    .wrap_err("commit pending v4 manifest abandonment")?;
+                return Ok(PendingPoiPublicationReconciliation::Abandoned);
             }
             self.v4_ipns_publisher
                 .publish_manifest_cid(&pending.cid, pending.sequence)
@@ -2124,7 +2222,8 @@ impl PublicationScheduler {
             self.ensure_publication_running()?;
             self.record_v4_ipns(&pending.cid, pending.sequence)
                 .await
-                .wrap_err("activate reconciled v4 POI manifest")
+                .wrap_err("activate reconciled v4 POI manifest")?;
+            Ok(PendingPoiPublicationReconciliation::Activated)
         };
         let (legacy_result, v4_result) =
             futures_util::future::join(legacy_reconciliation, v4_reconciliation).await;
@@ -2132,11 +2231,23 @@ impl PublicationScheduler {
         if let Err(error) = legacy_result {
             failures.push(format!("legacy: {error}"));
         }
-        if let Err(error) = v4_result {
-            failures.push(format!("v4: {error}"));
-        }
+        let v4_result = match v4_result {
+            Ok(result) => Some(result),
+            Err(error) => {
+                failures.push(format!("v4: {error}"));
+                None
+            }
+        };
         if failures.is_empty() {
-            Ok(true)
+            if v4_result == Some(PendingPoiPublicationReconciliation::Abandoned) {
+                Ok(PendingPoiPublicationReconciliation::Abandoned)
+            } else if legacy_pending
+                || v4_result == Some(PendingPoiPublicationReconciliation::Activated)
+            {
+                Ok(PendingPoiPublicationReconciliation::Activated)
+            } else {
+                Ok(PendingPoiPublicationReconciliation::None)
+            }
         } else {
             Err(eyre!(
                 "pending POI publication reconciliation failed: {}",
