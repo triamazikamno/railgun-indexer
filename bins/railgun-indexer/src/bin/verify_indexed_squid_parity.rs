@@ -1758,6 +1758,7 @@ fn squid_endpoint(chain_id: u64) -> Result<&'static str> {
         56 => Ok("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql"),
         137 => Ok("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql"),
         42161 => Ok("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql"),
+        11_155_111 => Ok("https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql"),
         _ => bail!("unsupported chain id {chain_id}"),
     }
 }

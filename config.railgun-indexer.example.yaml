@@ -43,12 +43,14 @@ poi:
   list_keys:
     - "0x0000000000000000000000000000000000000000000000000000000000000000"
 
-  # Supported chain IDs: 1 (Ethereum), 56 (BNB Chain), 137 (Polygon), 42161 (Arbitrum).
+  # Supported chain IDs: 1 (Ethereum), 56 (BNB Chain), 137 (Polygon),
+  # 42161 (Arbitrum), 11155111 (Sepolia).
   chain_ids:
     - 1
     - 56
     - 137
     - 42161
+    - 11155111
 
   # Upstream POI/TXID tree convention.
   txid_version: "V2_PoseidonMerkle"
@@ -169,6 +171,20 @@ chain_indexed:
       #   - block_number: 491943298
       #     transaction_hash: "0xd555fe412c1fa826ba47d8edb7cecfcbb89cad54c7b351048cbad786dffe7689"
       #     railgun_transaction_index: 1
+      datasets:
+        - public_txid
+        - wallet_scan
+        - commitments
+        - merkle_checkpoint
+    - chain_id: 11155111
+      railgun_contract: "0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea"
+      rpc_url: "https://sepolia-rpc.example.invalid"
+      ws_url: "wss://sepolia-rpc.example.invalid"
+      archive_rpc_url: "https://sepolia-rpc.example.invalid"
+      start_block: 5784774
+      # Sepolia has no legacy event era; both boundaries are zero.
+      v2_start_block: 0
+      legacy_shield_block: 0
       datasets:
         - public_txid
         - wallet_scan

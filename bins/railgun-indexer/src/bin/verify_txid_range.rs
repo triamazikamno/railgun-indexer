@@ -762,6 +762,12 @@ fn chain_defaults(chain_id: u64) -> Result<ChainDefaults> {
             legacy_shield_block: 68_196_853,
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql",
         }),
+        11_155_111 => Ok(ChainDefaults {
+            railgun_contract: "0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea".parse()?,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            squid_endpoint: "https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql",
+        }),
         _ => bail!("unsupported chain id {chain_id}"),
     }
 }

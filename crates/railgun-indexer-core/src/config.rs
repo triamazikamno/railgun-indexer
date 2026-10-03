@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
-pub const SUPPORTED_CHAIN_IDS: &[u64] = &[1, 56, 137, 42161];
+pub const SUPPORTED_CHAIN_IDS: &[u64] = &[1, 56, 137, 42161, 11_155_111];
 
 const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -369,7 +369,7 @@ pub enum ConfigValidationError {
     EmptyChainIds,
     #[error("poi.txid_version must not be empty")]
     EmptyPoiTxidVersion,
-    #[error("unsupported chain id {0}; supported chain ids are 1, 56, 137, 42161")]
+    #[error("unsupported chain id {0}; supported chain ids are 1, 56, 137, 42161, 11155111")]
     UnknownChainId(u64),
     #[error("postgres connection attempt timed out after {0:?}")]
     PostgresConnectTimeout(Duration),

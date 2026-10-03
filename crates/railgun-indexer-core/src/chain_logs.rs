@@ -375,16 +375,14 @@ pub async fn hydrate_public_transactions<P: Provider + ?Sized>(
             .await?;
         if let Some(tx) = tx {
             let block_timestamp = block_timestamp(provider, &mut block_timestamps, summary).await?;
-            let mut rows = public_transactions_from_calldata(summary, block_timestamp, tx.input())?;
-            if rows.is_empty() {
-                rows = public_transactions_from_trace(
-                    provider,
-                    railgun_contract,
-                    summary,
-                    block_timestamp,
-                )
-                .await?;
-            }
+            let rows = public_transactions_from_calldata_or_trace(
+                provider,
+                railgun_contract,
+                summary,
+                block_timestamp,
+                tx.input(),
+            )
+            .await?;
             if rows.is_empty() {
                 return Err(ChainLogIngestionError::MissingRailgunCalldata {
                     transaction_hash,
@@ -409,17 +407,14 @@ pub async fn hydrate_public_transactions<P: Provider + ?Sized>(
                     first_log_index: summary.first_log_index,
                     last_log_index: summary.last_log_index,
                 })?;
-            let mut rows =
-                public_transactions_from_calldata(summary, block_context.timestamp, calldata)?;
-            if rows.is_empty() {
-                rows = public_transactions_from_trace(
-                    provider,
-                    railgun_contract,
-                    summary,
-                    block_context.timestamp,
-                )
-                .await?;
-            }
+            let rows = public_transactions_from_calldata_or_trace(
+                provider,
+                railgun_contract,
+                summary,
+                block_context.timestamp,
+                calldata,
+            )
+            .await?;
             if rows.is_empty() {
                 return Err(ChainLogIngestionError::MissingRailgunCalldata {
                     transaction_hash,
@@ -913,6 +908,23 @@ fn public_transactions_from_calldata(
     public_transactions_from_decoded(summary, block_timestamp, &transactions)
 }
 
+async fn public_transactions_from_calldata_or_trace<P: Provider + ?Sized>(
+    provider: &P,
+    railgun_contract: Address,
+    summary: &TransactOutputSummary,
+    block_timestamp: u64,
+    calldata: &[u8],
+) -> Result<Vec<IndexedPublicTransaction>, ChainLogIngestionError> {
+    match public_transactions_from_calldata(summary, block_timestamp, calldata) {
+        Ok(rows) if !rows.is_empty() => Ok(rows),
+        Ok(_) | Err(ChainLogIngestionError::UnmatchedEmittedOutputCommitments { .. }) => {
+            public_transactions_from_trace(provider, railgun_contract, summary, block_timestamp)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn public_transactions_from_trace<P: Provider + ?Sized>(
     provider: &P,
     railgun_contract: Address,
@@ -965,6 +977,9 @@ fn collect_debug_trace_railgun_transactions(
     railgun_contract: Address,
     decoded: &mut Vec<DecodedRailgunTransaction>,
 ) -> Result<(), ChainLogIngestionError> {
+    if frame.get("error").is_some_and(|error| !error.is_null()) {
+        return Ok(());
+    }
     if trace_frame_targets_contract(frame, railgun_contract)
         && let Some(input) = trace_input(frame)
         && let Some(mut transactions) = decode_railgun_transactions(&input)?
@@ -987,7 +1002,25 @@ fn collect_trace_transaction_railgun_transactions(
     let Some(frames) = trace.as_array() else {
         return Ok(());
     };
+    // Reverted ancestors may appear after their children in a flat trace.
+    let failed_paths = frames
+        .iter()
+        .filter(|frame| frame.get("error").is_some_and(|error| !error.is_null()))
+        .filter_map(|frame| frame.get("traceAddress").and_then(Value::as_array))
+        .collect::<Vec<_>>();
     for frame in frames {
+        if frame.get("error").is_some_and(|error| !error.is_null())
+            || frame
+                .get("traceAddress")
+                .and_then(Value::as_array)
+                .is_some_and(|path| {
+                    failed_paths
+                        .iter()
+                        .any(|failed_path| path.starts_with(failed_path))
+                })
+        {
+            continue;
+        }
         let action = frame.get("action").unwrap_or(frame);
         if trace_frame_targets_contract(action, railgun_contract)
             && let Some(input) = trace_input(action)
@@ -1921,7 +1954,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::transports::mock::Asserter;
     use alloy::uint;
-    use broadcaster_core::contracts::railgun::{BoundParams, SnarkProof};
+    use broadcaster_core::contracts::railgun::{ActionData, BoundParams, Call, SnarkProof};
     use serde_json::{Value, json};
 
     #[test]
@@ -2813,45 +2846,226 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_uses_debug_trace_for_wrapped_railgun_call() {
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        let transaction_hash = fixed_bytes(LEGACY_TRANSACTION_HASH);
-        let block_hash = fixed_bytes(LEGACY_BLOCK_HASH);
-        let mut batch = transact_batch(transaction_hash, block_hash, LEGACY_BLOCK_NUMBER);
+    async fn hydrate_uses_traces_for_committed_wrapped_railgun_calls() {
         let railgun_calldata = transactCall {
             _transactions: vec![railgun_transaction(0x11)],
         }
         .abi_encode();
-
-        asserter.push_success(&transaction_json_with_input(vec![0xde, 0xad, 0xbe, 0xef]));
-        asserter.push_success(&block_json(
-            LEGACY_BLOCK_HASH,
-            LEGACY_BLOCK_NUMBER,
-            1_714_356_419,
-            vec![],
-        ));
-        asserter.push_success(&json!({
+        let reverted_calldata = transactCall {
+            _transactions: vec![railgun_transaction(0x22)],
+        }
+        .abi_encode();
+        let successful_call = json!({
+            "type": "CALL",
+            "to": railgun_contract().to_string(),
+            "input": hex::encode_prefixed(&railgun_calldata),
+            "error": null,
+        });
+        let reverted_call = json!({
+            "type": "CALL",
+            "to": railgun_contract().to_string(),
+            "input": hex::encode_prefixed(&reverted_calldata),
+            "error": "execution reverted",
+        });
+        let debug_trace = json!({
             "type": "CALL",
             "to": "0x1111111111111111111111111111111111111111",
             "input": "0xdeadbeef",
+            "calls": [successful_call, reverted_call, {
+                "type": "CALL",
+                "to": "0x1111111111111111111111111111111111111111",
+                "input": "0xdeadbeef",
+                "error": "execution reverted",
+                "calls": [successful_call],
+            }],
+        });
+        let flat_trace = json!([
+            {
+                "type": "call",
+                "action": successful_call,
+                "traceAddress": [0],
+                "error": null,
+            },
+            {
+                "type": "call",
+                "action": reverted_call,
+                "traceAddress": [1],
+                "error": "Reverted",
+            },
+            {
+                "type": "call",
+                "action": successful_call,
+                "traceAddress": [2, 0],
+            },
+            {
+                "type": "call",
+                "action": {
+                    "to": "0x1111111111111111111111111111111111111111",
+                    "input": "0xdeadbeef",
+                },
+                "traceAddress": [2],
+                "error": "Reverted",
+            },
+        ]);
+
+        for use_flat_trace in [false, true] {
+            let asserter = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+            let transaction_hash = fixed_bytes(LEGACY_TRANSACTION_HASH);
+            let block_hash = fixed_bytes(LEGACY_BLOCK_HASH);
+            let mut batch = transact_batch(transaction_hash, block_hash, LEGACY_BLOCK_NUMBER);
+
+            asserter.push_success(&transaction_json_with_input(vec![0xde, 0xad, 0xbe, 0xef]));
+            asserter.push_success(&block_json(
+                LEGACY_BLOCK_HASH,
+                LEGACY_BLOCK_NUMBER,
+                1_714_356_419,
+                vec![],
+            ));
+            if use_flat_trace {
+                asserter.push_success(&Value::Null);
+                asserter.push_success(&flat_trace);
+            } else {
+                asserter.push_success(&debug_trace);
+            }
+
+            hydrate_public_transactions(&provider, railgun_contract(), &mut batch)
+                .await
+                .expect("hydrate only committed public transactions");
+
+            assert_eq!(batch.public_transactions.len(), 1);
+            assert_eq!(
+                batch.public_transactions[0].merkle_root,
+                fixed_bytes_32(0x11)
+            );
+            assert_eq!(batch.public_transactions[0].railgun_transaction_index, 0);
+            assert!(asserter.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_traces_relay_actions_with_additional_public_transactions() {
+        let initial_transaction = railgun_transaction(0x11);
+        let additional_transaction =
+            railgun_transaction_with_commitments(0x22, vec![fixed_bytes_32(0x24)], false);
+        let initial_calldata = transactCall {
+            _transactions: vec![initial_transaction.clone()],
+        }
+        .abi_encode();
+        let additional_calldata = transactCall {
+            _transactions: vec![additional_transaction.clone()],
+        }
+        .abi_encode();
+        let action_contract = Address::from([0x11; 20]);
+        let relay_calldata = relayCall {
+            _transactions: vec![initial_transaction.clone()],
+            _actionData: ActionData {
+                random: FixedBytes::ZERO,
+                requireSuccess: true,
+                minGasLimit: U256::ZERO,
+                calls: vec![Call {
+                    to: action_contract,
+                    data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                    value: U256::ZERO,
+                }],
+            },
+        }
+        .abi_encode();
+        let transaction = transaction_json_with_input(relay_calldata.clone());
+        let trace = json!({
+            "type": "CALL",
+            "to": "0x2222222222222222222222222222222222222222",
+            "input": hex::encode_prefixed(&relay_calldata),
             "calls": [{
                 "type": "CALL",
                 "to": railgun_contract().to_string(),
-                "input": hex::encode_prefixed(railgun_calldata),
+                "input": hex::encode_prefixed(initial_calldata),
+            }, {
+                "type": "CALL",
+                "to": action_contract.to_string(),
+                "input": "0xdeadbeef",
+                "calls": [{
+                    "type": "CALL",
+                    "to": railgun_contract().to_string(),
+                    "input": hex::encode_prefixed(additional_calldata),
+                }],
             }],
-        }));
+        });
+        let mut logs = vec![
+            log_for(Nullified {
+                treeNumber: 0,
+                nullifier: initial_transaction.nullifiers,
+            }),
+            log_for(Transact {
+                treeNumber: U256::ONE,
+                startPosition: U256::ZERO,
+                hash: initial_transaction.commitments,
+                ciphertext: vec![commitment_ciphertext(); 2],
+            }),
+            log_for(Nullified {
+                treeNumber: 0,
+                nullifier: additional_transaction.nullifiers,
+            }),
+            log_for(Transact {
+                treeNumber: U256::ONE,
+                startPosition: U256::from(2),
+                hash: additional_transaction.commitments,
+                ciphertext: vec![commitment_ciphertext()],
+            }),
+        ];
+        for (index, log) in logs.iter_mut().enumerate() {
+            log.block_hash = Some(fixed_bytes(LEGACY_BLOCK_HASH));
+            log.block_number = Some(LEGACY_BLOCK_NUMBER);
+            log.transaction_hash = Some(fixed_bytes(LEGACY_TRANSACTION_HASH));
+            log.log_index = Some(u64::try_from(index).expect("log index") + 7);
+        }
 
-        hydrate_public_transactions(&provider, railgun_contract(), &mut batch)
-            .await
-            .expect("hydrate public transactions");
+        for use_full_block in [false, true] {
+            let asserter = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+            let mut batch = ingest_chain_logs(&logs).expect("ingest relay and action logs");
+            if use_full_block {
+                asserter.push_success(&Value::Null);
+            } else {
+                asserter.push_success(&transaction);
+            }
+            asserter.push_success(&block_json(
+                LEGACY_BLOCK_HASH,
+                LEGACY_BLOCK_NUMBER,
+                1_714_356_419,
+                if use_full_block {
+                    vec![transaction.clone()]
+                } else {
+                    vec![]
+                },
+            ));
+            asserter.push_success(&trace);
 
-        assert_eq!(batch.public_transactions.len(), 1);
-        assert_eq!(
-            batch.public_transactions[0].merkle_root,
-            fixed_bytes_32(0x11)
-        );
-        assert!(asserter.read_q().is_empty());
+            hydrate_public_transactions(&provider, railgun_contract(), &mut batch)
+                .await
+                .expect("hydrate relay and action public transactions");
+
+            assert_eq!(batch.public_transactions.len(), 2);
+            assert_eq!(
+                batch.public_transactions[0].merkle_root,
+                fixed_bytes_32(0x11)
+            );
+            assert_eq!(
+                batch.public_transactions[1].merkle_root,
+                fixed_bytes_32(0x22)
+            );
+            assert_eq!(batch.public_transactions[0].railgun_transaction_index, 0);
+            assert_eq!(batch.public_transactions[1].railgun_transaction_index, 1);
+            assert_eq!(
+                batch.public_transactions[0].utxo_batch_start_position_out,
+                0
+            );
+            assert_eq!(
+                batch.public_transactions[1].utxo_batch_start_position_out,
+                2
+            );
+            assert!(asserter.read_q().is_empty());
+        }
     }
 
     #[tokio::test]

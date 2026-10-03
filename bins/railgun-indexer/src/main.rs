@@ -3202,6 +3202,7 @@ mod tests {
         let config: Config =
             serde_yaml::from_str(include_str!("../../../config.railgun-indexer.example.yaml"))
                 .wrap_err("parse example config")?;
+        config.validate().wrap_err("validate example config")?;
         let chains = config
             .chain_indexed
             .chains
@@ -3209,7 +3210,7 @@ mod tests {
             .map(|chain| (chain.chain_id, chain))
             .collect::<BTreeMap<_, _>>();
 
-        assert_eq!(chains.len(), 4);
+        assert_eq!(chains.len(), 5);
         for expected in CANONICAL_CHAIN_INDEXED_DEFAULTS {
             let chain = chains.get(&expected.chain_id).unwrap_or_else(|| {
                 panic!(
@@ -3241,7 +3242,7 @@ mod tests {
                 })
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(scopes.len(), 4);
+        assert_eq!(scopes.len(), 5);
         assert!(
             scopes
                 .iter()
@@ -3251,7 +3252,8 @@ mod tests {
         Ok(())
     }
 
-    // Mirrors sync_service::ChainConfigDefaults::for_chain for deployment fields.
+    // Mainnet deployment fields mirror sync_service::ChainConfigDefaults::for_chain.
+    // Sepolia uses its verified contract deployment and has no legacy event era.
     const CANONICAL_CHAIN_INDEXED_DEFAULTS: &[ExpectedChainIndexedDefault] = &[
         ExpectedChainIndexedDefault {
             chain_id: 1,
@@ -3280,6 +3282,13 @@ mod tests {
             start_block: 56_109_834,
             v2_start_block: 0,
             legacy_shield_block: 68_196_853,
+        },
+        ExpectedChainIndexedDefault {
+            chain_id: 11_155_111,
+            railgun_contract: "0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea",
+            start_block: 5_784_774,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
         },
     ];
 

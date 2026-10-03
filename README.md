@@ -44,7 +44,7 @@ Important fields:
 - `railgun_indexer.retention_interval`: artifact and manifest cleanup cadence.
 - `poi.upstream_url`: POI JSON-RPC endpoint to mirror, for example `https://ppoi.fdi.network`.
 - `poi.list_keys`: upstream list operator public keys to mirror.
-- `poi.chain_ids`: supported chain IDs: `1`, `56`, `137`, `42161`.
+- `poi.chain_ids`: supported chain IDs: `1`, `56`, `137`, `42161`, `11155111` (Sepolia).
 - `poi.delta_publish_interval`, `poi.base_rebuild_interval`: POI publication cadences.
 - `poi.per_pair_concurrency_limit`: maximum concurrent `(list_key, chain_id)` sync workers.
 
