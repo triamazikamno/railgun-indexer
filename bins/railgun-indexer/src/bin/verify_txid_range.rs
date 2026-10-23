@@ -54,6 +54,11 @@ struct Args {
     #[arg(long)]
     legacy_shield_block: Option<u64>,
 
+    /// Override the `Action` event start block. Blocks from it are also rebuilt through the
+    /// calldata path and both results are compared.
+    #[arg(long)]
+    action_start_block: Option<u64>,
+
     /// Squid GraphQL page size.
     #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
     page_size: u64,
@@ -70,7 +75,6 @@ struct TxidRow {
     block_number: u64,
     block_timestamp: u64,
     transaction_hash: [u8; 32],
-    merkle_root: [u8; 32],
     nullifiers: Vec<[u8; 32]>,
     commitments: Vec<[u8; 32]>,
     bound_params_hash: [u8; 32],
@@ -160,6 +164,7 @@ async fn main() -> Result<()> {
     let legacy_shield_block = args
         .legacy_shield_block
         .unwrap_or(defaults.legacy_shield_block);
+    let action_start_block = args.action_start_block.or(defaults.action_start_block);
     let rpc_url = args
         .rpc_url
         .as_deref()
@@ -181,6 +186,7 @@ async fn main() -> Result<()> {
         args.to_block,
         v2_start_block,
         legacy_shield_block,
+        action_start_block,
         args.rpc_block_chunk_size,
     )
     .await?;
@@ -194,12 +200,46 @@ async fn main() -> Result<()> {
         batch.legacy_generated_commitments.len(),
         batch.nullifiers.len(),
     );
-    hydrate_public_transactions(&provider, railgun_contract, &mut batch).await?;
+    let calldata_batch = action_start_block
+        .is_some_and(|start| args.to_block >= start)
+        .then(|| batch.clone());
+    hydrate_public_transactions(&provider, railgun_contract, action_start_block, &mut batch)
+        .await?;
     let rpc_rows = rpc_rows_from_batch(&batch.public_transactions)?;
     eprintln!(
-        "[txid-range] hydrated RPC public_txid rows={}",
-        rpc_rows.len()
+        "[txid-range] hydrated RPC public_txid rows={} action_start_block={action_start_block:?} unshield_log_derivations={} unshield_log_divergences={}",
+        rpc_rows.len(),
+        batch.unshield_log_derivations,
+        batch.unshield_log_divergences,
     );
+    let mut failures = 0;
+    if let Some(mut calldata_batch) = calldata_batch {
+        // The calldata path needs trace RPC for wrapped calls; still compare the log path with
+        // Squid when it cannot run.
+        if let Err(error) =
+            hydrate_public_transactions(&provider, railgun_contract, None, &mut calldata_batch)
+                .await
+        {
+            println!(
+                "chain {} block_range={}..{} calldata path failed: {error}",
+                args.chain_id, args.from_block, args.to_block
+            );
+            failures += 1;
+        } else {
+            let calldata_rows = rpc_rows_from_batch(&calldata_batch.public_transactions)?;
+            let calldata_failures = compare_rows(("logs", &rpc_rows), ("calldata", &calldata_rows));
+            println!(
+                "chain {} block_range={}..{} log_rows={} calldata_rows={} failures={}",
+                args.chain_id,
+                args.from_block,
+                args.to_block,
+                rpc_rows.len(),
+                calldata_rows.len(),
+                calldata_failures
+            );
+            failures += calldata_failures;
+        }
+    }
 
     let squid_rows = squid_public_txid_rows(
         &client,
@@ -215,7 +255,7 @@ async fn main() -> Result<()> {
         squid_rows.len()
     );
 
-    let failures = compare_rows(&rpc_rows, &squid_rows);
+    let squid_failures = compare_rows(("rpc", &rpc_rows), ("squid", &squid_rows));
     println!(
         "chain {} block_range={}..{} rpc_rows={} squid_rows={} failures={}",
         args.chain_id,
@@ -223,8 +263,9 @@ async fn main() -> Result<()> {
         args.to_block,
         rpc_rows.len(),
         squid_rows.len(),
-        failures
+        squid_failures
     );
+    failures += squid_failures;
     if failures > 0 {
         bail!("TXID range parity failed with {failures} mismatch(es)");
     }
@@ -238,6 +279,7 @@ async fn fetch_chain_index_logs_chunked<P: Provider + ?Sized>(
     to_block: u64,
     v2_start_block: u64,
     legacy_shield_block: u64,
+    action_start_block: Option<u64>,
     block_chunk_size: u64,
 ) -> Result<Vec<Log>> {
     let mut logs = Vec::new();
@@ -268,6 +310,7 @@ async fn fetch_chain_index_logs_chunked<P: Provider + ?Sized>(
             chunk_end,
             v2_start_block,
             legacy_shield_block,
+            action_start_block,
         )
         .await?;
         eprintln!(
@@ -305,7 +348,6 @@ fn rpc_rows_from_batch(rows: &[IndexedPublicTransaction]) -> Result<Vec<TxidRow>
                 block_number: row.source.block_number,
                 block_timestamp: row.block_timestamp,
                 transaction_hash: fixed_bytes(row.source.transaction_hash),
-                merkle_root: fixed_bytes(row.merkle_root),
                 nullifiers: row.nullifiers.iter().copied().map(fixed_bytes).collect(),
                 commitments: row.commitments.iter().copied().map(fixed_bytes).collect(),
                 bound_params_hash: fixed_bytes(row.bound_params_hash),
@@ -407,7 +449,6 @@ query PublicTxidRange($offset: Int!, $limit: Int!, $fromBlock: BigInt!, $toBlock
     blockNumber
     blockTimestamp
     transactionHash
-    merkleRoot
     nullifiers
     commitments
     boundParamsHash
@@ -447,40 +488,43 @@ query PublicTxidRange($offset: Int!, $limit: Int!, $fromBlock: BigInt!, $toBlock
         .transactions)
 }
 
-fn compare_rows(rpc_rows: &[TxidRow], squid_rows: &[TxidRow]) -> usize {
-    let mut failures = usize::from(rpc_rows.len() != squid_rows.len());
-    if rpc_rows.len() != squid_rows.len() {
+fn compare_rows(
+    (left_name, left_rows): (&str, &[TxidRow]),
+    (right_name, right_rows): (&str, &[TxidRow]),
+) -> usize {
+    let mut failures = usize::from(left_rows.len() != right_rows.len());
+    if left_rows.len() != right_rows.len() {
         println!(
-            "row count mismatch rpc_rows={} squid_rows={}",
-            rpc_rows.len(),
-            squid_rows.len()
+            "row count mismatch {left_name}_rows={} {right_name}_rows={}",
+            left_rows.len(),
+            right_rows.len()
         );
     }
-    let max = rpc_rows.len().max(squid_rows.len());
+    let max = left_rows.len().max(right_rows.len());
     for index in 0..max {
-        match (rpc_rows.get(index), squid_rows.get(index)) {
-            (Some(rpc), Some(squid)) => {
-                let rpc_leaf = rpc.leaf_hash().to_be_bytes::<32>();
-                let squid_leaf = squid.leaf_hash().to_be_bytes::<32>();
-                if !rows_match(rpc, squid) || rpc_leaf != squid_leaf {
+        match (left_rows.get(index), right_rows.get(index)) {
+            (Some(left), Some(right)) => {
+                let left_leaf = left.leaf_hash().to_be_bytes::<32>();
+                let right_leaf = right.leaf_hash().to_be_bytes::<32>();
+                if !rows_match(left, right) || left_leaf != right_leaf {
                     failures = failures.saturating_add(1);
                     println!("mismatch range_index={index}");
-                    println!("  rpc:   {}", rpc.short());
-                    println!("  squid: {}", squid.short());
-                    println!("  rpc_leaf={}", hex::encode_prefixed(rpc_leaf));
-                    println!("  squid_leaf={}", hex::encode_prefixed(squid_leaf));
-                    print_row_diffs(rpc, squid);
+                    println!("  {left_name}: {}", left.short());
+                    println!("  {right_name}: {}", right.short());
+                    println!("  {left_name}_leaf={}", hex::encode_prefixed(left_leaf));
+                    println!("  {right_name}_leaf={}", hex::encode_prefixed(right_leaf));
+                    print_row_diffs((left_name, left), (right_name, right));
                     break;
                 }
             }
-            (Some(rpc), None) => {
+            (Some(left), None) => {
                 failures = failures.saturating_add(1);
-                println!("extra RPC row: {}", rpc.short());
+                println!("extra {left_name} row: {}", left.short());
                 break;
             }
-            (None, Some(squid)) => {
+            (None, Some(right)) => {
                 failures = failures.saturating_add(1);
-                println!("missing RPC row: {}", squid.short());
+                println!("missing {left_name} row: {}", right.short());
                 break;
             }
             (None, None) => break,
@@ -520,7 +564,6 @@ fn rows_match(left: &TxidRow, right: &TxidRow) -> bool {
     left.block_number == right.block_number
         && left.block_timestamp == right.block_timestamp
         && left.transaction_hash == right.transaction_hash
-        && left.merkle_root == right.merkle_root
         && left.nullifiers == right.nullifiers
         && left.commitments == right.commitments
         && left.bound_params_hash == right.bound_params_hash
@@ -529,13 +572,16 @@ fn rows_match(left: &TxidRow, right: &TxidRow) -> bool {
         && left.output_start_global() == right.output_start_global()
 }
 
-fn print_row_diffs(rpc: &TxidRow, squid: &TxidRow) {
+fn print_row_diffs((rpc_name, rpc): (&str, &TxidRow), (squid_name, squid): (&str, &TxidRow)) {
     let mut printed = false;
     macro_rules! diff_value {
         ($field:literal, $left:expr, $right:expr) => {
             if $left != $right {
                 printed = true;
-                println!("  field_diff {} rpc={} squid={}", $field, $left, $right);
+                println!(
+                    "  field_diff {} {rpc_name}={} {squid_name}={}",
+                    $field, $left, $right
+                );
             }
         };
     }
@@ -544,7 +590,7 @@ fn print_row_diffs(rpc: &TxidRow, squid: &TxidRow) {
             if $left != $right {
                 printed = true;
                 println!(
-                    "  field_diff {} rpc=0x{} squid=0x{}",
+                    "  field_diff {} {rpc_name}=0x{} {squid_name}=0x{}",
                     $field,
                     hex::encode($left),
                     hex::encode($right)
@@ -557,7 +603,7 @@ fn print_row_diffs(rpc: &TxidRow, squid: &TxidRow) {
             if $left != $right {
                 printed = true;
                 println!(
-                    "  field_diff {} rpc=[{}] squid=[{}]",
+                    "  field_diff {} {rpc_name}=[{}] {squid_name}=[{}]",
                     $field,
                     hex_vec($left),
                     hex_vec($right)
@@ -577,7 +623,6 @@ fn print_row_diffs(rpc: &TxidRow, squid: &TxidRow) {
         rpc.transaction_hash,
         squid.transaction_hash
     );
-    diff_hex!("merkle_root", rpc.merkle_root, squid.merkle_root);
     diff_hex_vec!("nullifiers", &rpc.nullifiers, &squid.nullifiers);
     diff_hex_vec!("commitments", &rpc.commitments, &squid.commitments);
     diff_hex!(
@@ -619,7 +664,6 @@ fn parse_squid_transaction(range_index: usize, value: &Value) -> Result<TxidRow>
         block_number: u64_field(value, "blockNumber")?,
         block_timestamp: u64_field(value, "blockTimestamp")?,
         transaction_hash: fixed_hex_field(value, "transactionHash")?,
-        merkle_root: fixed_hex_field(value, "merkleRoot")?,
         nullifiers: fixed_u256_array_field(value, "nullifiers")?,
         commitments: fixed_u256_array_field(value, "commitments")?,
         bound_params_hash: fixed_u256_field(value, "boundParamsHash")?,
@@ -733,6 +777,7 @@ struct ChainDefaults {
     railgun_contract: Address,
     v2_start_block: u64,
     legacy_shield_block: u64,
+    action_start_block: Option<u64>,
     squid_endpoint: &'static str,
 }
 
@@ -742,30 +787,35 @@ fn chain_defaults(chain_id: u64) -> Result<ChainDefaults> {
             railgun_contract: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9".parse()?,
             v2_start_block: 16_076_750,
             legacy_shield_block: 16_790_263,
+            action_start_block: Some(25_753_685),
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql",
         }),
         56 => Ok(ChainDefaults {
             railgun_contract: "0x590162bf4b50f6576a459b75309ee21d92178a10".parse()?,
             v2_start_block: 23_478_204,
             legacy_shield_block: 26_313_947,
+            action_start_block: Some(115_899_634),
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql",
         }),
         137 => Ok(ChainDefaults {
             railgun_contract: "0x19b620929f97b7b990801496c3b361ca5def8c71".parse()?,
             v2_start_block: 36_219_104,
             legacy_shield_block: 40_143_539,
+            action_start_block: Some(92_007_080),
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql",
         }),
         42161 => Ok(ChainDefaults {
             railgun_contract: "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9".parse()?,
             v2_start_block: 0,
             legacy_shield_block: 68_196_853,
+            action_start_block: Some(494_497_454),
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql",
         }),
         11_155_111 => Ok(ChainDefaults {
             railgun_contract: "0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea".parse()?,
             v2_start_block: 0,
             legacy_shield_block: 0,
+            action_start_block: None,
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql",
         }),
         _ => bail!("unsupported chain id {chain_id}"),

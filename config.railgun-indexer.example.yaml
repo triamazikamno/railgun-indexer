@@ -44,11 +44,12 @@ poi:
     - "0x0000000000000000000000000000000000000000000000000000000000000000"
 
   # Supported chain IDs: 1 (Ethereum), 56 (BNB Chain), 137 (Polygon),
-  # 42161 (Arbitrum), 11155111 (Sepolia).
+  # 8453 (Base), 42161 (Arbitrum), 11155111 (Sepolia).
   chain_ids:
     - 1
     - 56
     - 137
+    - 8453
     - 42161
     - 11155111
 
@@ -116,6 +117,9 @@ chain_indexed:
       start_block: 14737691
       v2_start_block: 16076750
       legacy_shield_block: 16790263
+      # First block whose public TXID rows come from Action logs. Leave unset to
+      # keep calldata and trace sources for every block, as Sepolia does.
+      action_start_block: 25753685
       datasets:
         - public_txid
         - wallet_scan
@@ -129,6 +133,7 @@ chain_indexed:
       start_block: 17633701
       v2_start_block: 23478204
       legacy_shield_block: 26313947
+      action_start_block: 115899634
       datasets:
         - public_txid
         - wallet_scan
@@ -142,6 +147,7 @@ chain_indexed:
       start_block: 28083766
       v2_start_block: 36219104
       legacy_shield_block: 40143539
+      action_start_block: 92007080
       datasets:
         - public_txid
         - wallet_scan
@@ -155,6 +161,7 @@ chain_indexed:
       start_block: 56109834
       v2_start_block: 0
       legacy_shield_block: 68196853
+      action_start_block: 494497454
       # Temporary Squid/PPOI compatibility for the published public-TXID feed.
       # Remove this omission after the upstream sequence is corrected.
       # See https://github.com/Railgun-Community/engine/issues/143 for more details.
@@ -171,6 +178,22 @@ chain_indexed:
       #   - block_number: 491943298
       #     transaction_hash: "0xd555fe412c1fa826ba47d8edb7cecfcbb89cad54c7b351048cbad786dffe7689"
       #     railgun_transaction_index: 1
+      datasets:
+        - public_txid
+        - wallet_scan
+        - commitments
+        - merkle_checkpoint
+    - chain_id: 8453
+      railgun_contract: "0x0047d1f97674614189e80566575fb615788acf25"
+      rpc_url: "https://base-rpc.example.invalid"
+      ws_url: "wss://base-rpc.example.invalid"
+      archive_rpc_url: "https://base-archive-rpc.example.invalid"
+      start_block: 50224711
+      # Base has no legacy event era and emits Action logs from its deployment,
+      # so standard JSON-RPC without trace methods is enough.
+      v2_start_block: 0
+      legacy_shield_block: 0
+      action_start_block: 50224711
       datasets:
         - public_txid
         - wallet_scan

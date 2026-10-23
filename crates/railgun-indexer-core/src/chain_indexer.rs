@@ -18,6 +18,7 @@ pub struct ChainLogIndexingRange {
     pub indexed_block_headers: Vec<ChainIndexedBlockHeader>,
     pub v2_start_block: u64,
     pub legacy_shield_block: u64,
+    pub action_start_block: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,8 @@ pub struct ChainLogIndexingOutcome {
     pub to_block: u64,
     pub fetched_log_count: usize,
     pub persisted_row_count: usize,
+    pub unshield_log_derivations: usize,
+    pub unshield_log_divergences: usize,
 }
 
 pub async fn index_chain_log_range<P: Provider + ?Sized>(
@@ -47,12 +50,19 @@ pub async fn index_chain_log_range<P: Provider + ?Sized>(
         range.to_block,
         range.v2_start_block,
         range.legacy_shield_block,
+        range.action_start_block,
     )
     .await?;
     let fetched_log_count = logs.len();
     let mut batch = ingest_chain_logs(&logs)?;
     hydrate_indexed_log_source_timestamps(provider, &mut batch).await?;
-    hydrate_public_transactions(provider, range.railgun_contract, &mut batch).await?;
+    hydrate_public_transactions(
+        provider,
+        range.railgun_contract,
+        range.action_start_block,
+        &mut batch,
+    )
+    .await?;
     let persisted_row_count = batch.transact_commitments.len()
         + batch.shield_commitments.len()
         + batch.nullifiers.len()
@@ -99,6 +109,8 @@ pub async fn index_chain_log_range<P: Provider + ?Sized>(
         to_block: range.to_block,
         fetched_log_count,
         persisted_row_count,
+        unshield_log_derivations: batch.unshield_log_derivations,
+        unshield_log_divergences: batch.unshield_log_divergences,
     })
 }
 

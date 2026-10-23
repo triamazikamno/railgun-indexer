@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
-pub const SUPPORTED_CHAIN_IDS: &[u64] = &[1, 56, 137, 42161, 11_155_111];
+pub const SUPPORTED_CHAIN_IDS: &[u64] = &[1, 56, 137, 8453, 42161, 11_155_111];
 
 const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,6 +113,11 @@ pub struct ChainIndexedChainConfig {
     pub start_block: u64,
     pub v2_start_block: u64,
     pub legacy_shield_block: u64,
+    /// First block whose public TXID rows are built from `Action` logs.
+    ///
+    /// Unset keeps calldata and trace sources for every block.
+    #[serde(default)]
+    pub action_start_block: Option<u64>,
     #[serde(default = "default_chain_indexed_datasets")]
     pub datasets: Vec<IndexedDatasetKind>,
     #[serde(default)]
@@ -299,6 +304,17 @@ impl Config {
                     chain_id: chain.chain_id,
                 });
             }
+            if let Some(action_start_block) = chain.action_start_block
+                && action_start_block < chain.start_block
+            {
+                return Err(
+                    ConfigValidationError::ChainIndexedActionStartBeforeStartBlock {
+                        chain_id: chain.chain_id,
+                        action_start_block,
+                        start_block: chain.start_block,
+                    },
+                );
+            }
             if chain.datasets.is_empty() {
                 return Err(ConfigValidationError::EmptyChainIndexedDatasets {
                     chain_id: chain.chain_id,
@@ -369,7 +385,7 @@ pub enum ConfigValidationError {
     EmptyChainIds,
     #[error("poi.txid_version must not be empty")]
     EmptyPoiTxidVersion,
-    #[error("unsupported chain id {0}; supported chain ids are 1, 56, 137, 42161, 11155111")]
+    #[error("unsupported chain id {0}; supported chain ids are 1, 56, 137, 8453, 42161, 11155111")]
     UnknownChainId(u64),
     #[error("postgres connection attempt timed out after {0:?}")]
     PostgresConnectTimeout(Duration),
@@ -433,6 +449,14 @@ pub enum ConfigValidationError {
     ZeroChainIndexedRailgunContract { chain_id: u64 },
     #[error("chain_indexed datasets must not be empty for chain id {chain_id}")]
     EmptyChainIndexedDatasets { chain_id: u64 },
+    #[error(
+        "chain_indexed action_start_block {action_start_block} is below start_block {start_block} for chain id {chain_id}"
+    )]
+    ChainIndexedActionStartBeforeStartBlock {
+        chain_id: u64,
+        action_start_block: u64,
+        start_block: u64,
+    },
     #[error(
         "duplicate chain_indexed entry for chain id {chain_id} and railgun contract {railgun_contract}"
     )]
@@ -512,6 +536,7 @@ mod tests {
                     start_block: 1,
                     v2_start_block: 2,
                     legacy_shield_block: 3,
+                    action_start_block: None,
                     datasets: default_chain_indexed_datasets(),
                     public_txid_compatibility_omissions: Vec::new(),
                 }],

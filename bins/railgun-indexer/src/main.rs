@@ -3210,7 +3210,7 @@ mod tests {
             .map(|chain| (chain.chain_id, chain))
             .collect::<BTreeMap<_, _>>();
 
-        assert_eq!(chains.len(), 5);
+        assert_eq!(chains.len(), 6);
         for expected in CANONICAL_CHAIN_INDEXED_DEFAULTS {
             let chain = chains.get(&expected.chain_id).unwrap_or_else(|| {
                 panic!(
@@ -3226,6 +3226,7 @@ mod tests {
             assert_eq!(chain.start_block, expected.start_block);
             assert_eq!(chain.v2_start_block, expected.v2_start_block);
             assert_eq!(chain.legacy_shield_block, expected.legacy_shield_block);
+            assert_eq!(chain.action_start_block, expected.action_start_block);
         }
 
         let scopes = config
@@ -3242,7 +3243,7 @@ mod tests {
                 })
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(scopes.len(), 5);
+        assert_eq!(scopes.len(), 6);
         assert!(
             scopes
                 .iter()
@@ -3253,7 +3254,7 @@ mod tests {
     }
 
     // Mainnet deployment fields mirror sync_service::ChainConfigDefaults::for_chain.
-    // Sepolia uses its verified contract deployment and has no legacy event era.
+    // Sepolia and Base use their verified contract deployments and have no legacy event era.
     const CANONICAL_CHAIN_INDEXED_DEFAULTS: &[ExpectedChainIndexedDefault] = &[
         ExpectedChainIndexedDefault {
             chain_id: 1,
@@ -3261,6 +3262,7 @@ mod tests {
             start_block: 14_737_691,
             v2_start_block: 16_076_750,
             legacy_shield_block: 16_790_263,
+            action_start_block: Some(25_753_685),
         },
         ExpectedChainIndexedDefault {
             chain_id: 56,
@@ -3268,6 +3270,7 @@ mod tests {
             start_block: 17_633_701,
             v2_start_block: 23_478_204,
             legacy_shield_block: 26_313_947,
+            action_start_block: Some(115_899_634),
         },
         ExpectedChainIndexedDefault {
             chain_id: 137,
@@ -3275,6 +3278,15 @@ mod tests {
             start_block: 28_083_766,
             v2_start_block: 36_219_104,
             legacy_shield_block: 40_143_539,
+            action_start_block: Some(92_007_080),
+        },
+        ExpectedChainIndexedDefault {
+            chain_id: 8453,
+            railgun_contract: "0x0047d1f97674614189e80566575fb615788acf25",
+            start_block: 50_224_711,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            action_start_block: Some(50_224_711),
         },
         ExpectedChainIndexedDefault {
             chain_id: 42161,
@@ -3282,6 +3294,7 @@ mod tests {
             start_block: 56_109_834,
             v2_start_block: 0,
             legacy_shield_block: 68_196_853,
+            action_start_block: Some(494_497_454),
         },
         ExpectedChainIndexedDefault {
             chain_id: 11_155_111,
@@ -3289,6 +3302,7 @@ mod tests {
             start_block: 5_784_774,
             v2_start_block: 0,
             legacy_shield_block: 0,
+            action_start_block: None,
         },
     ];
 
@@ -3298,6 +3312,7 @@ mod tests {
         start_block: u64,
         v2_start_block: u64,
         legacy_shield_block: u64,
+        action_start_block: Option<u64>,
     }
 
     fn v4_test_entry() -> PoiArtifactManifestEntry {

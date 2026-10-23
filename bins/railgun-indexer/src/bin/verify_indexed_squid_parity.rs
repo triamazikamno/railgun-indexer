@@ -1624,7 +1624,7 @@ fn merkle_root(leaves: &[[u8; 32]]) -> Result<[u8; 32]> {
     }
     for _ in 0..TREE_DEPTH {
         let mut parents = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks_exact(2) {
+        for pair in layer.as_chunks::<2>().0 {
             parents.push(poseidon(vec![pair[0], pair[1]]));
         }
         layer = parents;

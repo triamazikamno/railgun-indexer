@@ -175,7 +175,7 @@ fn checkpoint_root(checkpoint: &MerkleCheckpointArtifact) -> [u8; 32] {
             layer.push(empty_subtree_root);
         }
         let mut parents = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks_exact(2) {
+        for pair in layer.as_chunks::<2>().0 {
             parents.push(poseidon(vec![pair[0], pair[1]]));
         }
         layer = parents;

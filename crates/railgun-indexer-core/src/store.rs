@@ -14,7 +14,7 @@ use tracing::info;
 
 pub(crate) const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
 const CHAIN_INDEXED_IPNS_SEQUENCE_STATE_KEY: &str = "chain_indexed_ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 20;
+const CURRENT_SCHEMA_VERSION: i32 = 21;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -956,7 +956,6 @@ impl Store {
                 Vec<u8>,
                 Vec<u8>,
                 Vec<u8>,
-                Vec<u8>,
                 Option<Vec<u8>>,
                 i64,
                 i64,
@@ -974,7 +973,6 @@ impl Store {
                     transaction_hash,
                     first_log_index,
                     last_log_index,
-                    merkle_root,
                     nullifiers,
                     commitments,
                     bound_params_hash,
@@ -1008,7 +1006,6 @@ impl Store {
                 transaction_hash,
                 first_log_index,
                 last_log_index,
-                merkle_root,
                 nullifiers,
                 commitments,
                 bound_params_hash,
@@ -1045,7 +1042,6 @@ impl Store {
                     transaction_hash,
                     first_log_index,
                     last_log_index,
-                    merkle_root,
                     nullifiers,
                     commitments,
                     bound_params_hash,
@@ -1068,7 +1064,6 @@ impl Store {
                         transaction_hash: exact_array("transaction_hash", &transaction_hash)?,
                         first_log_index: i64_to_u64(first_log_index, "first_log_index")?,
                         last_log_index: i64_to_u64(last_log_index, "last_log_index")?,
-                        merkle_root: exact_array("merkle_root", &merkle_root)?,
                         nullifiers: fixed_bytes_vec("nullifiers", &nullifiers)?,
                         commitments: fixed_bytes_vec("commitments", &commitments)?,
                         bound_params_hash: exact_array("bound_params_hash", &bound_params_hash)?,
@@ -1104,7 +1099,6 @@ impl Store {
                 Vec<u8>,
                 Vec<u8>,
                 Vec<u8>,
-                Vec<u8>,
                 i64,
                 i64,
                 i64,
@@ -1116,7 +1110,6 @@ impl Store {
                 block_number,
                 railgun_transaction_index,
                 transaction_hash,
-                merkle_root,
                 nullifiers,
                 commitments,
                 bound_params_hash,
@@ -1148,7 +1141,6 @@ impl Store {
                     block_number,
                     railgun_transaction_index,
                     transaction_hash,
-                    merkle_root,
                     nullifiers,
                     commitments,
                     bound_params_hash,
@@ -1164,7 +1156,6 @@ impl Store {
                             "railgun_transaction_index",
                         )?,
                         transaction_hash: exact_array("transaction_hash", &transaction_hash)?,
-                        merkle_root: exact_array("merkle_root", &merkle_root)?,
                         nullifiers: fixed_bytes_vec("nullifiers", &nullifiers)?,
                         commitments: fixed_bytes_vec("commitments", &commitments)?,
                         bound_params_hash: exact_array("bound_params_hash", &bound_params_hash)?,
@@ -2762,11 +2753,11 @@ impl Store {
                 INSERT INTO indexed_public_txid_rows (
                     chain_type, chain_id, railgun_contract, block_number, block_timestamp,
                     block_hash, transaction_hash, first_log_index, last_log_index,
-                    railgun_transaction_index, row_id, merkle_root, nullifiers,
+                    railgun_transaction_index, row_id, nullifiers,
                     commitments, bound_params_hash, has_unshield, unshield_preimage, utxo_tree_in,
                     utxo_tree_out, utxo_batch_start_position_out
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                 ON CONFLICT (chain_type, chain_id, railgun_contract, transaction_hash, railgun_transaction_index)
                 DO UPDATE SET
                     block_number = EXCLUDED.block_number,
@@ -2775,7 +2766,6 @@ impl Store {
                     first_log_index = EXCLUDED.first_log_index,
                     last_log_index = EXCLUDED.last_log_index,
                     row_id = EXCLUDED.row_id,
-                    merkle_root = EXCLUDED.merkle_root,
                     nullifiers = EXCLUDED.nullifiers,
                     commitments = EXCLUDED.commitments,
                     bound_params_hash = EXCLUDED.bound_params_hash,
@@ -2800,7 +2790,6 @@ impl Store {
                 "railgun_transaction_index",
             )?)
             .bind(&item.id)
-            .bind(item.merkle_root.as_slice())
             .bind(nullifiers)
             .bind(commitments)
             .bind(item.bound_params_hash.as_slice())
@@ -2922,7 +2911,6 @@ pub struct StoredPublicTxidRow {
     pub transaction_hash: [u8; 32],
     pub first_log_index: u64,
     pub last_log_index: u64,
-    pub merkle_root: [u8; 32],
     pub nullifiers: Vec<[u8; 32]>,
     pub commitments: Vec<[u8; 32]>,
     pub bound_params_hash: [u8; 32],
@@ -2939,7 +2927,6 @@ pub struct StoredMissingPublicTxidUnshieldPreimage {
     pub block_number: u64,
     pub railgun_transaction_index: u64,
     pub transaction_hash: [u8; 32],
-    pub merkle_root: [u8; 32],
     pub nullifiers: Vec<[u8; 32]>,
     pub commitments: Vec<[u8; 32]>,
     pub bound_params_hash: [u8; 32],
@@ -3311,6 +3298,7 @@ const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[
     (18, V18_MIGRATIONS),
     (19, V19_MIGRATIONS),
     (20, V20_MIGRATIONS),
+    (21, V21_MIGRATIONS),
 ];
 
 const V4_MIGRATIONS: &[&str] = &[
@@ -4266,6 +4254,10 @@ const V20_MIGRATIONS: &[&str] = &[
     ",
 ];
 
+// Dropping the column also drops its `idx_public_txid_rows_merkle_root_len` check.
+const V21_MIGRATIONS: &[&str] =
+    &["ALTER TABLE indexed_public_txid_rows DROP COLUMN IF EXISTS merkle_root"];
+
 fn decode_fixed_hex<const N: usize>(
     field: &'static str,
     value: &str,
@@ -4292,7 +4284,9 @@ fn fixed_bytes_vec(field: &'static str, bytes: &[u8]) -> Result<Vec<[u8; 32]>, S
         });
     }
     bytes
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .map(|chunk| exact_array(field, chunk))
         .collect()
 }

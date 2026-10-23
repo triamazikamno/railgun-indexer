@@ -402,7 +402,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     .execute(&pool)
     .await?;
     sqlx::query(
-        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 20, now())",
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 21, now())",
     )
     .execute(&pool)
     .await?;
@@ -410,7 +410,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     run_migrations(&pool).await?;
 
     assert!(!table_exists(&pool, "poi_events").await?);
-    assert_eq!(schema_version(&pool).await?, 20);
+    assert_eq!(schema_version(&pool).await?, 21);
 
     Ok(())
 }
@@ -635,7 +635,7 @@ async fn v15_invalidates_preexisting_pending_reconciliation_until_newer_channel_
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 20);
+    assert_eq!(schema_version(&pool).await?, 21);
     let legacy_invalidated: Option<i64> = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM reconciliation_invalidated_at)::BIGINT \
          FROM published_manifests WHERE cid = $1",
@@ -1073,7 +1073,7 @@ async fn v11_conservatively_backfills_active_manifest_artifact_references()
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 20);
+    assert_eq!(schema_version(&pool).await?, 21);
     let references: Vec<(String, String)> = sqlx::query_as(
         r"
         SELECT manifest.cid, reference.artifact_cid
@@ -1187,7 +1187,7 @@ async fn v15_to_v17_invalidates_bodyless_indexed_pending_and_replaces_at_higher_
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 20);
+    assert_eq!(schema_version(&pool).await?, 21);
     assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(17));
     assert!(
         Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
@@ -1359,7 +1359,7 @@ async fn v16_to_v17_invalidates_bodyless_indexed_pending_without_lowering_sequen
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 20);
+    assert_eq!(schema_version(&pool).await?, 21);
     assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(30));
     let state: (bool, bool, bool) = sqlx::query_as(
         "SELECT reconciliation_invalidated_at IS NOT NULL, \
@@ -1742,7 +1742,8 @@ async fn unshield_preimage_migration_backfill_and_new_ingest_roundtrip()
     sqlx::query(
         "ALTER TABLE indexed_public_txid_rows \
          DROP CONSTRAINT IF EXISTS idx_public_txid_rows_unshield_preimage_check, \
-         DROP COLUMN IF EXISTS unshield_preimage",
+         DROP COLUMN IF EXISTS unshield_preimage, \
+         ADD COLUMN merkle_root BYTEA NOT NULL",
     )
     .execute(&pool)
     .await?;
@@ -1780,7 +1781,15 @@ async fn unshield_preimage_migration_backfill_and_new_ingest_roundtrip()
     .await?;
 
     run_migrations(&pool).await?;
-    assert_eq!(schema_version(&pool).await?, 20);
+    assert_eq!(schema_version(&pool).await?, 21);
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'indexed_public_txid_rows' AND column_name = 'merkle_root')",
+        )
+        .fetch_one(&pool)
+        .await?
+    );
     let store = Store::new(pool);
 
     let missing = store
@@ -3835,7 +3844,6 @@ fn indexed_log_batch_at(block_number: u64) -> IndexedLogBatch {
             railgun_transaction_index: 0,
             id: format!("0x{block_number:x}:0"),
             block_timestamp: 1_700_000_000 + block_number,
-            merkle_root: AlloyFixedBytes::from([0x20; 32]),
             nullifiers: vec![AlloyFixedBytes::from([0x21; 32])],
             commitments: vec![AlloyFixedBytes::from([0x22; 32])],
             bound_params_hash: AlloyFixedBytes::from([0x23; 32]),
@@ -3846,6 +3854,7 @@ fn indexed_log_batch_at(block_number: u64) -> IndexedLogBatch {
             utxo_batch_start_position_out: 10,
             railgun_txid: U256::from(0x24_u64),
         }],
+        ..Default::default()
     }
 }
 
@@ -3874,7 +3883,6 @@ fn sparse_commitment_batch() -> IndexedLogBatch {
             railgun_transaction_index: 0,
             id: "0xcontiguous:0".to_string(),
             block_timestamp: 1_700_000_102,
-            merkle_root: AlloyFixedBytes::from([0x36; 32]),
             nullifiers: Vec::new(),
             commitments: vec![
                 AlloyFixedBytes::from([0x40; 32]),

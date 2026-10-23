@@ -19,7 +19,9 @@ use merkletree::tree::DenseMerkleTree;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const PUBLIC_TXID_RECORD_SECTION_ID: u16 = 1;
+// Section 1 held the earlier record layout with a spent-input Merkle root. Released wallets that
+// only read section 1 reject these chunks and fall back to Squid.
+const PUBLIC_TXID_RECORD_SECTION_ID: u16 = 3;
 const PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID: u16 = 2;
 
 pub fn public_txid_chunk_plan_item(
@@ -241,7 +243,6 @@ fn encode_public_txid_records(records: &[StoredPublicTxidRow]) -> Result<Vec<u8>
         bytes.extend_from_slice(&record.transaction_hash);
         write_u64(&mut bytes, record.first_log_index);
         write_u64(&mut bytes, record.last_log_index);
-        bytes.extend_from_slice(&record.merkle_root);
         write_fixed_bytes_vec(&mut bytes, &record.nullifiers)?;
         write_fixed_bytes_vec(&mut bytes, &record.commitments)?;
         bytes.extend_from_slice(&record.bound_params_hash);
@@ -506,11 +507,18 @@ mod tests {
         let envelope = decode_chunk_bytes(&published.descriptor, &published.compressed_bytes)
             .expect("decode chunk");
 
+        // Released wallets read chunk format 2, so the other datasets stay readable to them.
+        assert_eq!(published.descriptor.encoding_version, 2);
+        assert_eq!(envelope.header.format_version, 2);
+        assert!(envelope.section_payload(1).is_err());
         assert_eq!(
             envelope
                 .section_payload(PUBLIC_TXID_RECORD_SECTION_ID)
                 .expect("record section"),
-            encode_public_txid_records(&records).expect("legacy record encoding")
+            records
+                .iter()
+                .flat_map(expected_record_layout)
+                .collect::<Vec<_>>()
         );
         let sidecar = envelope
             .section_payload(PUBLIC_TXID_UNSHIELD_PREIMAGE_SECTION_ID)
@@ -574,7 +582,6 @@ mod tests {
             transaction_hash: [txid_index as u8; 32],
             first_log_index: 1,
             last_log_index: 2,
-            merkle_root: [0xbb; 32],
             nullifiers: vec![[0x11; 32]],
             commitments: vec![[0x22; 32]],
             bound_params_hash: [0x33; 32],
@@ -584,6 +591,34 @@ mod tests {
             utxo_tree_out: 4,
             utxo_batch_start_position_out: txid_index,
         }
+    }
+
+    /// The record layout the wallet's public TXID decoder reads; it carries no Merkle root.
+    fn expected_record_layout(record: &StoredPublicTxidRow) -> Vec<u8> {
+        let id_len = u16::try_from(record.id.len()).expect("id length");
+        let nullifier_count = u32::try_from(record.nullifiers.len()).expect("nullifier count");
+        let commitment_count = u32::try_from(record.commitments.len()).expect("commitment count");
+        let fields: [&[u8]; 18] = [
+            &record.txid_index.to_le_bytes(),
+            &id_len.to_le_bytes(),
+            record.id.as_bytes(),
+            &record.block_number.to_le_bytes(),
+            &record.block_timestamp.to_le_bytes(),
+            &record.block_hash,
+            &record.transaction_hash,
+            &record.first_log_index.to_le_bytes(),
+            &record.last_log_index.to_le_bytes(),
+            &nullifier_count.to_le_bytes(),
+            &record.nullifiers.concat(),
+            &commitment_count.to_le_bytes(),
+            &record.commitments.concat(),
+            &record.bound_params_hash,
+            &[u8::from(record.has_unshield)],
+            &record.utxo_tree_in.to_le_bytes(),
+            &record.utxo_tree_out.to_le_bytes(),
+            &record.utxo_batch_start_position_out.to_le_bytes(),
+        ];
+        fields.concat()
     }
 
     fn scope() -> ChainScope {

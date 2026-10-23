@@ -567,6 +567,7 @@ async fn index_chain_range_with_provider(
             indexed_block_headers: vec![indexed_through_header],
             v2_start_block: runtime.chain.v2_start_block,
             legacy_shield_block: runtime.chain.legacy_shield_block,
+            action_start_block: runtime.chain.action_start_block,
         },
     )
     .await
@@ -634,6 +635,8 @@ fn log_indexed_range(
         to_block = outcome.to_block,
         fetched_log_count = outcome.fetched_log_count,
         persisted_row_count = outcome.persisted_row_count,
+        unshield_log_derivations = outcome.unshield_log_derivations,
+        unshield_log_divergences = outcome.unshield_log_divergences,
         "indexed chain log range"
     );
 }

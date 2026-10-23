@@ -76,7 +76,6 @@ struct TxidRow {
     block_number: u64,
     block_timestamp: u64,
     transaction_hash: [u8; 32],
-    merkle_root: [u8; 32],
     nullifiers: Vec<[u8; 32]>,
     commitments: Vec<[u8; 32]>,
     bound_params_hash: [u8; 32],
@@ -877,7 +876,6 @@ fn rows_match(left: &TxidRow, right: &TxidRow) -> bool {
         && left.block_number == right.block_number
         && left.block_timestamp == right.block_timestamp
         && left.transaction_hash == right.transaction_hash
-        && left.merkle_root == right.merkle_root
         && left.nullifiers == right.nullifiers
         && left.commitments == right.commitments
         && left.bound_params_hash == right.bound_params_hash
@@ -1001,12 +999,11 @@ fn parse_public_txid_payload(
             // Log indexes are part of artifact provenance, but Squid's public
             // transaction query does not expose them. Consume them here and
             // compare the fields both sources can provide.
-            merkle_root: {
+            nullifiers: {
                 let _first_log_index = cursor.read_u64()?;
                 let _last_log_index = cursor.read_u64()?;
-                cursor.read_fixed_32()?
+                cursor.read_fixed_vec()?
             },
-            nullifiers: cursor.read_fixed_vec()?,
             commitments: cursor.read_fixed_vec()?,
             bound_params_hash: cursor.read_fixed_32()?,
             has_unshield: cursor.read_u8()? != 0,
@@ -1039,7 +1036,6 @@ query PublicTxidPage($offset: Int!, $limit: Int!, $maxBlock: BigInt!) {
     blockNumber
     blockTimestamp
     transactionHash
-    merkleRoot
     nullifiers
     commitments
     boundParamsHash
@@ -1057,7 +1053,6 @@ query PublicTxidPage($offset: Int!, $limit: Int!, $minBlock: BigInt!, $maxBlock:
     blockNumber
     blockTimestamp
     transactionHash
-    merkleRoot
     nullifiers
     commitments
     boundParamsHash
@@ -1113,7 +1108,6 @@ fn parse_squid_transaction(txid_index: u64, value: &Value) -> Result<TxidRow> {
         block_number: u64_field(value, "blockNumber")?,
         block_timestamp: u64_field(value, "blockTimestamp")?,
         transaction_hash: fixed_hex_field(value, "transactionHash")?,
-        merkle_root: fixed_hex_field(value, "merkleRoot")?,
         nullifiers: fixed_u256_array_field(value, "nullifiers")?,
         commitments: fixed_u256_array_field(value, "commitments")?,
         bound_params_hash: fixed_u256_field(value, "boundParamsHash")?,
@@ -1321,7 +1315,6 @@ fn print_row_diffs(artifact: &TxidRow, squid: &TxidRow) {
         artifact.transaction_hash,
         squid.transaction_hash
     );
-    diff_hex!("merkle_root", artifact.merkle_root, squid.merkle_root);
     diff_hex_vec!("nullifiers", &artifact.nullifiers, &squid.nullifiers);
     diff_hex_vec!("commitments", &artifact.commitments, &squid.commitments);
     diff_hex!(
