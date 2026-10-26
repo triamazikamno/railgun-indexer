@@ -4,9 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::post};
 use ed25519_dalek::{Signer, SigningKey};
 use poi::poi::{PoiEventType, PoiSyncedListEvent, SignedBlockedShield, SignedPoiEvent};
-use railgun_indexer_core::blocked::BlockedShieldsArtifact;
 use railgun_indexer_core::scrape::{PageSizeAdapter, RetryPolicy, ScrapeError, ScrapeWorker};
-use railgun_indexer_core::snapshot::{Lifecycle, SnapshotReader};
 use railgun_indexer_core::store::{Store, run_migrations};
 use railgun_indexer_core::verify::verify_blocked_shield;
 use reqwest::Url;
@@ -83,65 +81,6 @@ async fn mock_upstream_serves_node_status_leaves_and_blocked_shields()
     assert!(state.method_seen("ppoi_poi_merkletree_leaves"));
     assert!(state.method_seen("ppoi_validate_poi_merkleroots"));
     assert!(state.method_seen("ppoi_blocked_shields"));
-
-    server.abort();
-    Ok(())
-}
-
-#[tokio::test]
-async fn indexer_mock_upstream_produces_decodable_leaf_snapshot()
--> Result<(), Box<dyn std::error::Error>> {
-    let node = match Postgres::default().start().await {
-        Ok(node) => node,
-        Err(err) if is_docker_unavailable(&err) => {
-            eprintln!("skipping mock upstream snapshot test: Docker is unavailable");
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
-    let connection_string = format!(
-        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
-        node.get_host_port_ipv4(5432).await?
-    );
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&connection_string)
-        .await?;
-    run_migrations(&pool).await?;
-
-    let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
-    let state = MockState::fixture(&signing_key, 4, 2);
-    let (upstream_url, server) = spawn_mock_upstream(state.clone()).await?;
-    let store = Store::new(pool);
-
-    let mut worker = worker(&upstream_url, state.list_key, store.clone(), 2, 1, 1);
-    worker.run_until_caught_up().await?;
-    worker.sync_blocked_shields_until_caught_up().await?;
-
-    let lifecycle = Lifecycle::new(store, upstream_url, 0, [7; 32]);
-    let snapshot = SnapshotReader::read(&lifecycle.build_base(&state.list_key, 1, 3).await?)?;
-    let blocked_artifact = lifecycle
-        .build_blocked_shields_artifact(&state.list_key, 1)
-        .await?;
-    let blocked_artifact = BlockedShieldsArtifact::read(&blocked_artifact.bytes)?;
-
-    assert_eq!(snapshot.events.len(), 4);
-    assert_eq!(snapshot.blocked_shields.len(), 0);
-    assert_eq!(blocked_artifact.blocked_shields.len(), 2);
-    for (index, event) in snapshot.events.iter().enumerate() {
-        assert_eq!(event.event_index, u64::try_from(index)?);
-        assert_eq!(event.blinded_commitment, [index as u8 + 1; 32]);
-    }
-    let list_key = list_key_bytes(&state.list_key);
-    for record in &blocked_artifact.blocked_shields {
-        let signed_record = SignedBlockedShield {
-            commitment_hash: record.commitment_hash.clone(),
-            blinded_commitment: record.blinded_commitment.clone(),
-            block_reason: record.block_reason.clone(),
-            signature: record.signature.clone(),
-        };
-        verify_blocked_shield(&signed_record, &list_key)?;
-    }
 
     server.abort();
     Ok(())

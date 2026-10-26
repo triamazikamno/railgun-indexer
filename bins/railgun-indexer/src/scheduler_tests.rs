@@ -38,14 +38,7 @@ async fn scheduler_revalidates_unchanged_tip_and_rejects_before_v4_pins() -> Res
     config.upstream_url.clone_from(&root_server.url);
     let ipfs = Arc::new(MemoryIpfs::default());
     let publisher = Arc::new(MockPublisher::default());
-    let scheduler = scheduler(
-        &config,
-        store,
-        ipfs.clone(),
-        signing_key,
-        publisher.clone(),
-        publisher,
-    );
+    let scheduler = scheduler(&config, store, ipfs.clone(), signing_key, publisher);
 
     let first = scheduler
         .publish_poi_artifact_graph(SystemTime::now())
@@ -86,7 +79,6 @@ async fn scheduler_publishes_four_empty_scopes_and_reuses_graph_after_restart() 
         vec![1, 56, 137, 42161],
     );
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     let now = SystemTime::now();
     let mut first = scheduler(
@@ -94,12 +86,10 @@ async fn scheduler_publishes_four_empty_scopes_and_reuses_graph_after_restart() 
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy.clone(),
         v4.clone(),
     );
     first.publish_cycle(now).await?;
 
-    assert!(legacy.calls().is_empty());
     let poi_artifact_calls = v4.calls();
     assert_eq!(poi_artifact_calls.len(), 1);
     let manifest = Manifest::read(&ipfs.bytes(&poi_artifact_calls[0].0)?)?;
@@ -112,14 +102,7 @@ async fn scheduler_publishes_four_empty_scopes_and_reuses_graph_after_restart() 
     }));
     let pins = ipfs.pin_count();
 
-    let mut restarted = scheduler(
-        &config,
-        store,
-        ipfs.clone(),
-        signing_key,
-        legacy,
-        v4.clone(),
-    );
+    let mut restarted = scheduler(&config, store, ipfs.clone(), signing_key, v4.clone());
     restarted
         .publish_cycle(now + Duration::from_secs(1))
         .await?;
@@ -142,72 +125,37 @@ async fn scheduler_publishes_four_empty_scopes_and_reuses_graph_after_restart() 
 
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
-async fn scheduler_processes_v4_when_legacy_activation_fails_and_reconciles_restart() -> Result<()>
-{
+async fn scheduler_activates_v4_with_only_v4_pins() -> Result<()> {
     let (_postgres, store) = postgres_store().await?;
     let signing_key = SigningKey::from_bytes(&[33; 32]);
     let root_server = RootServer::start(true).await?;
     seed_events(&store, &signing_key, 1, &root_server.url).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
-    install_legacy_activation_failure(store.pool()).await?;
-    let now = SystemTime::now();
-    let mut first = scheduler(
+    let mut scheduler = scheduler(
         &config,
         store.clone(),
         ipfs.clone(),
-        signing_key.clone(),
-        legacy.clone(),
+        signing_key,
         v4.clone(),
     );
-    let _error = first
-        .publish_cycle(now)
-        .await
-        .expect_err("legacy activation failure must fail the combined cycle");
 
-    assert_eq!(legacy.calls().len(), 1);
-    assert_eq!(v4.calls().len(), 1);
-    let pending = Audit::pending_manifest_publication(store.pool())
+    scheduler.publish_cycle(SystemTime::now()).await?;
+
+    let active = Audit::active_poi_artifact_manifest_publication(store.pool())
         .await?
-        .expect("legacy manifest remains pending");
+        .expect("v4 manifest is active");
+    assert_eq!(v4.calls(), vec![(active.cid.clone(), active.sequence)]);
     assert!(
         Audit::pending_poi_artifact_manifest_publication(store.pool())
             .await?
             .is_none()
     );
-    assert!(
-        Audit::active_poi_artifact_manifest_publication(store.pool())
-            .await?
-            .is_some()
-    );
-
-    drop_legacy_activation_failure(store.pool()).await?;
-    let mut restarted = scheduler(
-        &config,
-        store.clone(),
-        ipfs,
-        signing_key,
-        legacy.clone(),
-        v4.clone(),
-    );
-    restarted
-        .publish_cycle(now + Duration::from_secs(1))
-        .await?;
     assert_eq!(
-        legacy.calls().last(),
-        Some(&(pending.cid, pending.sequence))
-    );
-    assert_eq!(
-        v4.calls().len(),
-        1,
-        "active v4 channel must not be replayed"
-    );
-    assert!(
-        Audit::pending_manifest_publication(store.pool())
-            .await?
-            .is_none()
+        ipfs.pin_count(),
+        active_v4_cids(store.pool(), &active.cid).await?.len(),
+        "every pin belongs to the active v4 graph"
     );
     Ok(())
 }
@@ -221,14 +169,7 @@ async fn early_rotation_bridges_prior_tail_and_reuses_exact_cids() -> Result<()>
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
     let publisher = Arc::new(MockPublisher::default());
-    let scheduler = scheduler(
-        &config,
-        store,
-        ipfs.clone(),
-        signing_key.clone(),
-        publisher.clone(),
-        publisher,
-    );
+    let scheduler = scheduler(&config, store, ipfs.clone(), signing_key.clone(), publisher);
     let empty = corpus(&signing_key, 0)?;
     let now = SystemTime::now();
     let empty_entry = scheduler
@@ -298,7 +239,6 @@ async fn missing_retained_bridge_is_rebuilt_for_pending_v4_republish() -> Result
     let root_server = RootServer::start(true).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     let now = SystemTime::now();
     let mut publisher_scheduler = scheduler(
@@ -306,7 +246,6 @@ async fn missing_retained_bridge_is_rebuilt_for_pending_v4_republish() -> Result
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy.clone(),
         v4.clone(),
     );
 
@@ -382,7 +321,6 @@ async fn missing_retained_bridge_is_rebuilt_for_pending_v4_republish() -> Result
         store.clone(),
         ipfs.clone(),
         signing_key,
-        legacy,
         v4.clone(),
     );
     restarted.publish_cycle(recovery_now).await?;
@@ -446,7 +384,6 @@ async fn pending_v4_survives_activation_failure_retention_and_restart() -> Resul
     let root_server = RootServer::start(true).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     install_v4_activation_failure(store.pool()).await?;
     let now = SystemTime::now();
@@ -455,7 +392,6 @@ async fn pending_v4_survives_activation_failure_retention_and_restart() -> Resul
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy.clone(),
         v4.clone(),
     );
     let _error = first
@@ -484,7 +420,6 @@ async fn pending_v4_survives_activation_failure_retention_and_restart() -> Resul
         store.clone(),
         ipfs.clone(),
         signing_key,
-        legacy,
         v4.clone(),
     );
     restarted
@@ -593,7 +528,6 @@ async fn missing_pending_v4_rebuild(
     seed_events(&store, &signing_key, 1, &root_server.url).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     install_v4_activation_failure(store.pool()).await?;
     let now = SystemTime::now();
@@ -602,7 +536,6 @@ async fn missing_pending_v4_rebuild(
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy.clone(),
         v4.clone(),
     );
     let _ = first
@@ -639,7 +572,6 @@ async fn missing_pending_v4_rebuild(
         store.clone(),
         ipfs.clone(),
         signing_key,
-        legacy,
         v4.clone(),
     );
     restarted
@@ -698,7 +630,6 @@ async fn pending_v4_contains_error_preserves_pending_manifest() -> Result<()> {
     seed_events(&store, &signing_key, 1, &root_server.url).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     install_v4_activation_failure(store.pool()).await?;
     let now = SystemTime::now();
@@ -707,7 +638,6 @@ async fn pending_v4_contains_error_preserves_pending_manifest() -> Result<()> {
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy.clone(),
         v4.clone(),
     );
     let _ = first
@@ -720,14 +650,7 @@ async fn pending_v4_contains_error_preserves_pending_manifest() -> Result<()> {
     drop_v4_activation_failure(store.pool()).await?;
     ipfs.contains_error.store(true, Ordering::SeqCst);
 
-    let mut restarted = scheduler(
-        &config,
-        store.clone(),
-        ipfs,
-        signing_key,
-        legacy,
-        v4.clone(),
-    );
+    let mut restarted = scheduler(&config, store.clone(), ipfs, signing_key, v4.clone());
     let _ = restarted
         .publish_cycle(now + Duration::from_secs(1))
         .await
@@ -751,7 +674,6 @@ async fn pending_graph_is_retention_protected_while_ipns_is_blocked() -> Result<
     let root_server = RootServer::start(true).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     v4.blocking.store(true, Ordering::SeqCst);
     let now = SystemTime::now();
@@ -760,7 +682,6 @@ async fn pending_graph_is_retention_protected_while_ipns_is_blocked() -> Result<
         store.clone(),
         ipfs.clone(),
         signing_key,
-        legacy,
         v4.clone(),
     );
     let publication = tokio::spawn(async move { publisher_scheduler.publish_cycle(now).await });
@@ -793,7 +714,6 @@ async fn shutdown_during_ipns_preserves_pending_graph_for_restart_reconciliation
     let root_server = RootServer::start(true).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     v4.blocking.store(true, Ordering::SeqCst);
     let publication_scheduler = scheduler(
@@ -801,7 +721,6 @@ async fn shutdown_during_ipns_preserves_pending_graph_for_restart_reconciliation
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy.clone(),
         v4.clone(),
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -832,14 +751,7 @@ async fn shutdown_during_ipns_preserves_pending_graph_for_restart_reconciliation
     );
 
     v4.blocking.store(false, Ordering::SeqCst);
-    let mut restarted = scheduler(
-        &config,
-        store.clone(),
-        ipfs,
-        signing_key,
-        legacy,
-        v4.clone(),
-    );
+    let mut restarted = scheduler(&config, store.clone(), ipfs, signing_key, v4.clone());
     restarted.publish_cycle(SystemTime::now()).await?;
     assert_eq!(
         v4.calls().last(),
@@ -921,7 +833,6 @@ async fn scheduler_pin_and_audit_exclude_concurrent_retention_recheck() -> Resul
         ipfs.clone(),
         signing_key,
         Arc::new(MockPublisher::default()),
-        Arc::new(MockPublisher::default()),
         coordinator.clone(),
     );
     let now = SystemTime::now();
@@ -956,50 +867,51 @@ async fn scheduler_pin_and_audit_exclude_concurrent_retention_recheck() -> Resul
 
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
-async fn snapshot_audit_failure_cleans_fresh_pin_after_reference_recheck() -> Result<()> {
+async fn v4_artifact_audit_failure_cleans_fresh_pin_after_reference_recheck() -> Result<()> {
     let (_postgres, store) = postgres_store().await?;
     let signing_key = SigningKey::from_bytes(&[47; 32]);
     let root_server = RootServer::start(true).await?;
-    let root = seed_events(&store, &signing_key, 1, &root_server.url).await?;
+    seed_events(&store, &signing_key, 1, &root_server.url).await?;
     sqlx::query(
-        "CREATE FUNCTION reject_snapshot_audit() RETURNS trigger AS $$ \
-         BEGIN RAISE EXCEPTION 'forced snapshot audit failure'; END; \
+        "CREATE FUNCTION reject_v4_artifact_audit() RETURNS trigger AS $$ \
+         BEGIN RAISE EXCEPTION 'forced v4 artifact audit failure'; END; \
          $$ LANGUAGE plpgsql",
     )
     .execute(store.pool())
     .await?;
     sqlx::query(
-        "CREATE TRIGGER reject_snapshot_audit BEFORE INSERT ON published_snapshots \
-         FOR EACH ROW EXECUTE FUNCTION reject_snapshot_audit()",
+        "CREATE TRIGGER reject_v4_artifact_audit BEFORE INSERT ON published_poi_v4_artifacts \
+         FOR EACH ROW EXECUTE FUNCTION reject_v4_artifact_audit()",
     )
     .execute(store.pool())
     .await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let publisher = Arc::new(MockPublisher::default());
     let scheduler = scheduler(
         &config,
         store.clone(),
         ipfs.clone(),
         signing_key,
-        publisher.clone(),
-        publisher,
+        Arc::new(MockPublisher::default()),
     );
 
     let _error = scheduler
-        .publish_snapshot(&config.list_keys[0], 1, SnapshotKind::Base, 0, 0, &root.0)
+        .publish_poi_artifact_graph(SystemTime::now())
         .await
-        .expect_err("forced snapshot audit failure must fail publication");
+        .expect_err("forced v4 artifact audit failure must fail publication");
 
     assert_eq!(ipfs.pin_count(), 1);
     assert_eq!(ipfs.unpinned_count(), 1);
-    assert_eq!(row_count(store.pool(), "published_snapshots").await?, 0);
+    assert_eq!(
+        row_count(store.pool(), "published_poi_v4_artifacts").await?,
+        0
+    );
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
-async fn shutdown_after_snapshot_pin_finishes_audit_then_stops_before_new_work() -> Result<()> {
+async fn shutdown_after_v4_artifact_pin_finishes_audit_then_stops_before_new_work() -> Result<()> {
     let (_postgres, store) = postgres_store().await?;
     let signing_key = SigningKey::from_bytes(&[48; 32]);
     let root_server = RootServer::start(true).await?;
@@ -1007,21 +919,18 @@ async fn shutdown_after_snapshot_pin_finishes_audit_then_stops_before_new_work()
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
     ipfs.block_pin.store(true, Ordering::SeqCst);
-    let publisher = Arc::new(MockPublisher::default());
     let mut scheduler = scheduler(
         &config,
         store.clone(),
         ipfs.clone(),
         signing_key,
-        publisher.clone(),
-        publisher,
+        Arc::new(MockPublisher::default()),
     );
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     scheduler.shutdown = Some(shutdown);
-    let list_key = config.list_keys[0];
     let publication = tokio::spawn(async move {
         scheduler
-            .publish_pair(&list_key, 1, SystemTime::now())
+            .publish_poi_artifact_graph(SystemTime::now())
             .await
     });
     ipfs.pin_entered.notified().await;
@@ -1030,13 +939,12 @@ async fn shutdown_after_snapshot_pin_finishes_audit_then_stops_before_new_work()
 
     let error = publication
         .await
-        .expect("join cooperative snapshot publication")
+        .expect("join cooperative v4 artifact publication")
         .expect_err("shutdown boundary must stop after durable audit");
     assert!(error.to_string().contains("cooperative shutdown boundary"));
-    assert_eq!(row_count(store.pool(), "published_snapshots").await?, 1);
     assert_eq!(
-        row_count(store.pool(), "published_blocked_shields").await?,
-        0
+        row_count(store.pool(), "published_poi_v4_artifacts").await?,
+        1
     );
     assert_eq!(ipfs.pin_count(), 1);
     assert_eq!(ipfs.unpinned_count(), 0);
@@ -1045,43 +953,50 @@ async fn shutdown_after_snapshot_pin_finishes_audit_then_stops_before_new_work()
 
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
-async fn second_dual_manifest_pin_failure_cleans_first_uncommitted_manifest_pin() -> Result<()> {
+async fn v4_manifest_audit_failure_cleans_uncommitted_manifest_pin() -> Result<()> {
     let (_postgres, store) = postgres_store().await?;
     let signing_key = SigningKey::from_bytes(&[49; 32]);
     let root_server = RootServer::start(true).await?;
     seed_events(&store, &signing_key, 1, &root_server.url).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let publisher = Arc::new(MockPublisher::default());
     let scheduler = scheduler(
         &config,
         store.clone(),
         ipfs.clone(),
         signing_key,
-        publisher.clone(),
-        publisher,
+        Arc::new(MockPublisher::default()),
     );
     let now = SystemTime::now();
-    scheduler.publish_pair(&config.list_keys[0], 1, now).await?;
     let poi_graph = scheduler.publish_poi_artifact_graph(now).await?;
-    let legacy_entries = scheduler.manifest_entries().await?;
-    assert!(!legacy_entries.is_empty());
     let lease = scheduler
         .sequence_allocator
         .reserve_cycle(unix_millis(now)?)
         .await?;
-    ipfs.fail_pin_at
-        .store(ipfs.pin_attempts() + 2, Ordering::SeqCst);
+    sqlx::query(
+        "CREATE FUNCTION reject_v4_manifest_audit() RETURNS trigger AS $$ \
+         BEGIN RAISE EXCEPTION 'forced v4 manifest audit failure'; END; \
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_v4_manifest_audit BEFORE INSERT ON published_poi_v4_manifests \
+         FOR EACH ROW EXECUTE FUNCTION reject_v4_manifest_audit()",
+    )
+    .execute(store.pool())
+    .await?;
+    let pins_before = ipfs.pin_count();
     let unpinned_before = ipfs.unpinned_count();
 
     let _error = scheduler
-        .publish_poi_manifests(now, lease, legacy_entries, &poi_graph)
+        .publish_poi_manifests(now, lease, &poi_graph)
         .await
         .err()
-        .expect("second manifest pin must fail");
+        .expect("v4 manifest audit must fail");
 
+    assert_eq!(ipfs.pin_count(), pins_before + 1);
     assert_eq!(ipfs.unpinned_count(), unpinned_before + 1);
-    assert_eq!(row_count(store.pool(), "published_manifests").await?, 0);
     assert_eq!(
         row_count(store.pool(), "published_poi_v4_manifests").await?,
         0
@@ -1094,16 +1009,14 @@ fn scheduler(
     store: Store,
     ipfs: Arc<MemoryIpfs>,
     signing_key: SigningKey,
-    legacy: Arc<MockPublisher>,
-    v4: Arc<MockPublisher>,
+    publisher: Arc<MockPublisher>,
 ) -> PublicationScheduler {
     scheduler_with_coordinator(
         config,
         store,
         ipfs,
         signing_key,
-        legacy,
-        v4,
+        publisher,
         PinLifecycleCoordinator::default(),
     )
 }
@@ -1118,7 +1031,6 @@ async fn assert_oversized_suffix_cycle_fails_closed(
     seed_events(&store, &signing_key, 1, &root_server.url).await?;
     let config = test_config(root_server.url.clone(), &signing_key, vec![1]);
     let ipfs = Arc::new(MemoryIpfs::default());
-    let legacy = Arc::new(MockPublisher::default());
     let v4 = Arc::new(MockPublisher::default());
     let now = SystemTime::now();
     let mut scheduler = scheduler(
@@ -1126,7 +1038,6 @@ async fn assert_oversized_suffix_cycle_fails_closed(
         store.clone(),
         ipfs.clone(),
         signing_key.clone(),
-        legacy,
         v4.clone(),
     );
     scheduler.publish_cycle(now).await?;
@@ -1224,8 +1135,7 @@ fn scheduler_with_coordinator(
     store: Store,
     ipfs: Arc<MemoryIpfs>,
     signing_key: SigningKey,
-    legacy: Arc<MockPublisher>,
-    v4: Arc<MockPublisher>,
+    publisher: Arc<MockPublisher>,
     pin_lifecycle: PinLifecycleCoordinator,
 ) -> PublicationScheduler {
     PublicationScheduler::new(
@@ -1234,8 +1144,7 @@ fn scheduler_with_coordinator(
         ipfs,
         signing_key,
         PoiRpcClient::new(url::Url::parse(&config.upstream_url).expect("test upstream URL")),
-        legacy,
-        v4,
+        publisher,
         Status::for_pairs(&config.list_keys, &config.chain_ids, config.page_size_max).shared(),
         pin_lifecycle,
     )
@@ -1456,8 +1365,6 @@ struct MemoryIpfs {
     block_pin: AtomicBool,
     pin_entered: Notify,
     pin_release: Notify,
-    pin_attempts: AtomicUsize,
-    fail_pin_at: AtomicUsize,
     contains_error: AtomicBool,
 }
 
@@ -1495,10 +1402,6 @@ impl MemoryIpfs {
     fn unpinned_count(&self) -> usize {
         self.unpinned.lock().expect("IPFS unpinned lock").len()
     }
-
-    fn pin_attempts(&self) -> usize {
-        self.pin_attempts.load(Ordering::SeqCst)
-    }
 }
 
 #[async_trait]
@@ -1508,16 +1411,9 @@ impl IpfsClient for MemoryIpfs {
     }
 
     async fn pin_bytes(&self, bytes: &[u8]) -> std::result::Result<Cid, IpfsError> {
-        let attempt = self.pin_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         self.pin_entered.notify_one();
         if self.block_pin.load(Ordering::SeqCst) {
             self.pin_release.notified().await;
-        }
-        if self.fail_pin_at.load(Ordering::SeqCst) == attempt {
-            return Err(IpfsError::PinFailed {
-                service: "memory".to_string(),
-                source: Box::new(std::io::Error::other("forced pin failure")),
-            });
         }
         let cid = raw_block_cid(bytes)?;
         self.bytes
@@ -1673,48 +1569,11 @@ async fn install_v4_activation_failure(pool: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn install_legacy_activation_failure(pool: &sqlx::PgPool) -> Result<()> {
-    sqlx::query(
-        r"
-        CREATE OR REPLACE FUNCTION fail_test_legacy_activation() RETURNS trigger AS $$
-        BEGIN
-            IF OLD.ipns_published_at IS NULL AND NEW.ipns_published_at IS NOT NULL THEN
-                RAISE EXCEPTION 'test legacy activation failure';
-            END IF;
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql
-        ",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        r"
-        CREATE TRIGGER fail_test_legacy_activation
-        BEFORE UPDATE ON published_manifests
-        FOR EACH ROW EXECUTE FUNCTION fail_test_legacy_activation()
-        ",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 async fn drop_v4_activation_failure(pool: &sqlx::PgPool) -> Result<()> {
     sqlx::query("DROP TRIGGER IF EXISTS fail_test_v4_activation ON published_poi_v4_manifests")
         .execute(pool)
         .await?;
     sqlx::query("DROP FUNCTION IF EXISTS fail_test_v4_activation()")
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-async fn drop_legacy_activation_failure(pool: &sqlx::PgPool) -> Result<()> {
-    sqlx::query("DROP TRIGGER IF EXISTS fail_test_legacy_activation ON published_manifests")
-        .execute(pool)
-        .await?;
-    sqlx::query("DROP FUNCTION IF EXISTS fail_test_legacy_activation()")
         .execute(pool)
         .await?;
     Ok(())

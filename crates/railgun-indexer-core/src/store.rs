@@ -1,6 +1,5 @@
 use crate::chain_logs::{IndexedLogBatch, IndexedLogSource};
 use crate::config::PublicTxidCompatibilityOmission;
-use crate::snapshot::SnapshotKind;
 use alloy::primitives::Address;
 use alloy::sol_types::SolValue;
 use alloy_primitives::{FixedBytes, U256, hex};
@@ -8,13 +7,12 @@ use broadcaster_core::transact::MERKLE_ZERO_VALUE;
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 use sqlx::{PgPool, Postgres, Transaction};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 
 pub(crate) const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
 const CHAIN_INDEXED_IPNS_SEQUENCE_STATE_KEY: &str = "chain_indexed_ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 21;
+const CURRENT_SCHEMA_VERSION: i32 = 23;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -158,112 +156,6 @@ impl Store {
                 last_tip_merkleroot: last_tip_merkleroot
                     .map(|bytes| exact_array("last_tip_merkleroot", &bytes))
                     .transpose()?,
-            })
-        })
-        .transpose()
-    }
-
-    pub async fn active_publications(
-        &self,
-        list_key: &FixedBytes<32>,
-        chain_id: u64,
-        upstream_url: &str,
-    ) -> Result<Vec<StoredPublication>, StoreError> {
-        let chain_id = u64_to_i64(chain_id, "chain_id")?;
-        let rows =
-            sqlx::query_as::<_, (String, i64, i64, String, i64, Vec<u8>, Option<Vec<u8>>, i64)>(
-                r"
-            SELECT
-                kind,
-                start_index,
-                end_index,
-                cid,
-                byte_size,
-                content_hash,
-                tip_merkleroot,
-                EXTRACT(EPOCH FROM published_at)::BIGINT AS published_at_unix_seconds
-            FROM published_snapshots
-            WHERE list_key = $1
-                AND chain_id = $2
-                AND upstream_url = $3
-                AND superseded_at IS NULL
-                AND content_hash IS NOT NULL
-            ORDER BY
-                CASE kind WHEN 'base' THEN 0 ELSE 1 END,
-                start_index ASC,
-                id ASC
-            ",
-            )
-            .bind(list_key.as_slice())
-            .bind(chain_id)
-            .bind(upstream_url)
-            .fetch_all(&self.pool)
-            .await?;
-
-        rows.into_iter()
-            .map(
-                |(
-                    kind,
-                    start_index,
-                    end_index,
-                    cid,
-                    byte_size,
-                    content_hash,
-                    tip_merkleroot,
-                    published_at,
-                )| {
-                    Ok(StoredPublication {
-                        kind: parse_snapshot_kind(&kind)?,
-                        start_index: i64_to_u64(start_index, "start_index")?,
-                        end_index: i64_to_u64(end_index, "end_index")?,
-                        cid,
-                        byte_size: i64_to_u64(byte_size, "byte_size")?,
-                        content_hash: exact_array("snapshot_content_hash", &content_hash)?,
-                        tip_merkleroot: tip_merkleroot
-                            .map(|bytes| exact_array("tip_merkleroot", &bytes))
-                            .transpose()?,
-                        published_at: i64_to_system_time(published_at, "published_at")?,
-                    })
-                },
-            )
-            .collect()
-    }
-
-    pub async fn active_blocked_shields_publication(
-        &self,
-        list_key: &FixedBytes<32>,
-        chain_id: u64,
-        upstream_url: &str,
-    ) -> Result<Option<StoredBlockedShieldsPublication>, StoreError> {
-        let chain_id = u64_to_i64(chain_id, "chain_id")?;
-        let row = sqlx::query_as::<_, (String, i64, Vec<u8>, i64)>(
-            r"
-            SELECT
-                cid,
-                byte_size,
-                content_hash,
-                EXTRACT(EPOCH FROM published_at)::BIGINT AS published_at_unix_seconds
-            FROM published_blocked_shields
-            WHERE list_key = $1
-                AND chain_id = $2
-                AND upstream_url = $3
-                AND superseded_at IS NULL
-            ORDER BY id DESC
-            LIMIT 1
-            ",
-        )
-        .bind(list_key.as_slice())
-        .bind(chain_id)
-        .bind(upstream_url)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|(cid, byte_size, content_hash, published_at)| {
-            Ok(StoredBlockedShieldsPublication {
-                cid,
-                byte_size: i64_to_u64(byte_size, "byte_size")?,
-                content_hash: exact_array("blocked_shields_content_hash", &content_hash)?,
-                published_at: i64_to_system_time(published_at, "published_at")?,
             })
         })
         .transpose()
@@ -3097,26 +2989,6 @@ impl IndexedDatasetKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredPublication {
-    pub kind: SnapshotKind,
-    pub start_index: u64,
-    pub end_index: u64,
-    pub cid: String,
-    pub byte_size: u64,
-    pub content_hash: [u8; 32],
-    pub tip_merkleroot: Option<[u8; 32]>,
-    pub published_at: SystemTime,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredBlockedShieldsPublication {
-    pub cid: String,
-    pub byte_size: u64,
-    pub content_hash: [u8; 32],
-    pub published_at: SystemTime,
-}
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database operation failed")]
@@ -3152,8 +3024,6 @@ pub enum StoreError {
     PoiEventConflict { chain_id: u64, event_index: u64 },
     #[error("stored POI event data is incomplete at chain {chain_id} index {event_index}")]
     IncompletePoiEvent { chain_id: u64, event_index: u64 },
-    #[error("invalid stored snapshot kind {0}")]
-    InvalidSnapshotKind(String),
     #[error("invalid stored commitment family {0}")]
     InvalidCommitmentFamily(String),
     #[error("commitment tree {tree_number} position {position} is duplicated")]
@@ -3188,9 +3058,6 @@ async fn poi_dataset_has_state(tx: &mut Transaction<'_, Postgres>) -> Result<boo
         SELECT EXISTS(SELECT 1 FROM poi_events)
             OR EXISTS(SELECT 1 FROM blocked_shields)
             OR EXISTS(SELECT 1 FROM chain_tips)
-            OR EXISTS(SELECT 1 FROM published_snapshots)
-            OR EXISTS(SELECT 1 FROM published_blocked_shields)
-            OR EXISTS(SELECT 1 FROM published_manifests)
             OR EXISTS(SELECT 1 FROM published_poi_v4_artifacts)
             OR EXISTS(SELECT 1 FROM published_poi_v4_manifests)
             OR EXISTS(SELECT 1 FROM published_poi_v4_manifest_entries)
@@ -3299,6 +3166,8 @@ const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[
     (19, V19_MIGRATIONS),
     (20, V20_MIGRATIONS),
     (21, V21_MIGRATIONS),
+    (22, V22_MIGRATIONS),
+    (23, V23_MIGRATIONS),
 ];
 
 const V4_MIGRATIONS: &[&str] = &[
@@ -4258,6 +4127,48 @@ const V20_MIGRATIONS: &[&str] = &[
 const V21_MIGRATIONS: &[&str] =
     &["ALTER TABLE indexed_public_txid_rows DROP COLUMN IF EXISTS merkle_root"];
 
+// The legacy POI channel is retired: supersede its live rows so retention unpins them after
+// `retention_interval`; V23 drops the tables.
+const V22_MIGRATIONS: &[&str] = &[
+    r"
+    UPDATE published_manifests
+    SET superseded_at = now()
+    WHERE superseded_at IS NULL AND unpinned_at IS NULL
+    ",
+    r"
+    UPDATE published_snapshots
+    SET superseded_at = now()
+    WHERE superseded_at IS NULL AND unpinned_at IS NULL
+    ",
+    r"
+    UPDATE published_blocked_shields
+    SET superseded_at = now()
+    WHERE superseded_at IS NULL AND unpinned_at IS NULL
+    ",
+];
+
+// Dropping a legacy row while its CID is still pinned would leak that pin forever, so refuse
+// until V22 retention has unpinned every legacy row.
+const V23_MIGRATIONS: &[&str] = &[
+    r"
+    DO $$
+    DECLARE
+        pinned_manifests BIGINT;
+        pinned_snapshots BIGINT;
+        pinned_blocked_shields BIGINT;
+    BEGIN
+        SELECT count(*) INTO pinned_manifests FROM published_manifests WHERE unpinned_at IS NULL;
+        SELECT count(*) INTO pinned_snapshots FROM published_snapshots WHERE unpinned_at IS NULL;
+        SELECT count(*) INTO pinned_blocked_shields FROM published_blocked_shields WHERE unpinned_at IS NULL;
+        IF pinned_manifests + pinned_snapshots + pinned_blocked_shields > 0 THEN
+            RAISE EXCEPTION 'refusing to drop legacy POI publication tables while rows are still pinned (unpinned_at IS NULL): published_manifests=%, published_snapshots=%, published_blocked_shields=%; run the V22 build until retention unpins them, then deploy again',
+                pinned_manifests, pinned_snapshots, pinned_blocked_shields;
+        END IF;
+    END $$
+    ",
+    "DROP TABLE published_manifests, published_snapshots, published_blocked_shields",
+];
+
 fn decode_fixed_hex<const N: usize>(
     field: &'static str,
     value: &str,
@@ -4346,19 +4257,6 @@ fn global_tree_position(tree_number: u32, tree_position: u64) -> Result<u64, Sto
             field: "global_tree_position",
             value: format!("tree={tree_number} position={tree_position}"),
         })
-}
-
-fn i64_to_system_time(value: i64, field: &'static str) -> Result<SystemTime, StoreError> {
-    let seconds = i64_to_u64(value, field)?;
-    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
-}
-
-fn parse_snapshot_kind(value: &str) -> Result<SnapshotKind, StoreError> {
-    match value {
-        "base" => Ok(SnapshotKind::Base),
-        "delta" => Ok(SnapshotKind::Delta),
-        _ => Err(StoreError::InvalidSnapshotKind(value.to_string())),
-    }
 }
 
 fn parse_commitment_family(value: &str) -> Result<StoredCommitmentFamily, StoreError> {

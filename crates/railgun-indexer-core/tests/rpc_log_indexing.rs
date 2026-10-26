@@ -66,7 +66,6 @@ async fn rpc_log_fixture_persists_indexed_rows_without_squid_upstream()
     assert_eq!(row_count(&pool, "indexed_nullifiers").await?, 1);
     assert_eq!(row_count(&pool, "indexed_public_transactions").await?, 1);
     assert_eq!(row_count(&pool, "chain_tips").await?, 0);
-    assert_eq!(row_count(&pool, "published_snapshots").await?, 0);
 
     Ok(())
 }

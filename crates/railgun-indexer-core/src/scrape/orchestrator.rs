@@ -176,18 +176,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    pub async fn record_manifest_publication(
-        &self,
-        manifest_cid: impl Into<String>,
-        ipfs_reachable: bool,
-    ) {
-        if let Some(status) = &self.status {
-            let mut status = status.write().await;
-            status.record_manifest_publication(manifest_cid);
-            status.set_ipfs_reachable(ipfs_reachable);
-        }
-    }
-
     fn worker_for_pair(&self, list_key: FixedBytes<32>, chain_id: u64) -> ScrapeWorker {
         let worker = ScrapeWorker::new(
             list_key,

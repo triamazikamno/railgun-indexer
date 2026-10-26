@@ -1,11 +1,11 @@
 # railgun-indexer
 
 `railgun-indexer` publishes Railgun artifacts. The current implementation consists of 2 parts:
-1. mirrors a POI JSON-RPC node into Postgres, builds binary POI snapshots plus current
-blocked-shields artifacts
+1. mirrors a POI JSON-RPC node into Postgres, builds POI checkpoint, tail and bridge
+artifacts plus current blocked-shields artifacts
 2. scans chain RPC(good archive nodes required) for railgun-related events into Postgres, builds binary snapshots  
 
-It pins all artifacts and manifests to IPFS, and updates IPNS under the publisher key.
+It pins all artifacts and manifests to IPFS, and updates the POI and chain-indexed IPNS names.
 
 ## Prerequisites
 
@@ -25,8 +25,8 @@ openssl rand -hex 32 > secrets/railgun-indexer-publisher.key
 chmod 600 secrets/railgun-indexer-publisher.key
 ```
 
-The same key signs the manifest and publishes the IPNS record, so wallets need
-only one publisher trust anchor.
+The same key signs the POI manifest and seeds the POI IPNS identity, which
+is derived from it with HKDF, so wallets need only one publisher trust anchor.
 
 ## Configuration
 
@@ -45,7 +45,8 @@ Important fields:
 - `poi.upstream_url`: POI JSON-RPC endpoint to mirror, for example `https://ppoi.fdi.network`.
 - `poi.list_keys`: upstream list operator public keys to mirror.
 - `poi.chain_ids`: supported chain IDs: `1`, `56`, `137`, `8453` (Base), `42161`, `11155111` (Sepolia).
-- `poi.delta_publish_interval`, `poi.base_rebuild_interval`: POI publication cadences.
+- `poi.delta_publish_interval`: the POI publication tick.
+- `poi.base_rebuild_interval`: age at which the POI checkpoint rotates.
 - `poi.per_pair_concurrency_limit`: maximum concurrent `(list_key, chain_id)` sync workers.
 
 See `docs/railgun-indexer-production-validation.md` for the manual production
@@ -59,8 +60,9 @@ The Filebase publisher uses normal S3 `PutObject` uploads. Filebase returns
 the IPFS CID in object metadata, and the indexer copies each object to a stable
 CID-based key so later retention sweeps can delete it by CID.
 
-Manifest entries publish signed artifact descriptors for every base snapshot,
-delta snapshot, and blocked-shields artifact. Each descriptor contains the IPFS
+The POI manifest publishes signed artifact descriptors for each scope's
+checkpoint catalog, current tail, retained bridges, and blocked-shields
+artifact. Each descriptor contains the IPFS
 `cid`, SHA-256 as `sha256`, and `byte_size`; wallets must verify those bytes
 before parsing artifacts. IPFS/Filebase/gateways are transport only, while the
 publisher signature and upstream list-key signatures are the trust boundaries.
@@ -100,14 +102,14 @@ persists `chain_tips`, so a restart continues from the last committed cursor.
 During bootstrap, expect:
 
 - Adaptive page sizes to shrink during slow upstream ranges and grow again after successes.
-- Base snapshots and blocked-shields artifacts to be published once a chain/list has a persisted tip.
-- Deltas to be published on later `delta_publish_interval` ticks.
+- A POI manifest on the first publication tick, including empty scopes.
+- A new POI manifest on later `delta_publish_interval` ticks when events or blocked shields change.
 
 ## Common Failures
 
 - Upstream unreachable: page failures and retry/backoff state appear in `/status`; the scraper retries bounded failures and shrinks page size before surfacing a hard error.
 - Postgres connection lost: scrape, publication, and retention cycles log failures and retry; restore Postgres and the next cycle resumes from durable state.
 - IPFS pinning quota exceeded: publication cycles log the pinning error and retry on the next publication tick; existing published artifacts remain in Postgres for audit.
-- Provider data loss or cleared bucket: publication cycles verify active snapshot and blocked-shields CIDs before publishing a descriptor manifest. If an active snapshot CID is missing, the indexer rebuilds a fresh base snapshot for that `(list_key, chain_id)` and supersedes the old active base/deltas. If an active blocked-shields CID is missing, the indexer repins the current blocked-shields artifact. Superseded CIDs remain in the audit tables and are cleaned up by retention later.
+- Provider data loss or cleared bucket: before reusing a POI artifact CID, the publisher checks that the provider still holds it and repins the bytes if not. A missing active manifest CID triggers a new manifest, and a pending manifest with a missing CID is abandoned and rebuilt at a higher sequence. Superseded CIDs remain in the audit tables and are cleaned up by retention later.
 - IPNS DHT publish timeout: manifest pinning may succeed while IPNS update fails; the scheduler retries on the next publication or republish tick.
-- Retention sweep behavior: superseded artifact and manifest CIDs older than `retention_interval` are unpinned, but `published_snapshots`, `published_blocked_shields`, and `published_manifests` rows are retained permanently for audit.
+- Retention sweep behavior: superseded artifact and manifest CIDs older than `retention_interval` are unpinned, but their publication rows are retained for audit.

@@ -19,30 +19,25 @@ use railgun_indexer_core::audit::{
 };
 use railgun_indexer_core::blocked::content_hash;
 use railgun_indexer_core::config::Config;
-use railgun_indexer_core::manifest::{
-    ArtifactDescriptor, Manifest, ManifestEntry, RetainedDeltaDescriptor,
-    load_publisher_signing_key,
-};
+use railgun_indexer_core::manifest::load_publisher_signing_key;
 use railgun_indexer_core::poi_v4::{
     PreparedEventArtifact, PublicationError, ValidatedCorpus,
     artifact_descriptor as poi_artifact_descriptor, checkpoint_catalog,
 };
 use railgun_indexer_core::publication_sequence::{
-    PoiPublicationSequenceAllocator, PoiPublicationSequenceLease, run_dual_poi_publication_cycle,
+    PoiPublicationSequenceAllocator, PoiPublicationSequenceLease,
 };
 use railgun_indexer_core::publish::ipfs::{
-    FilebaseIpfsClient, IpfsClient, MultiPinner, pin_blocked_shields, pin_manifest,
-    pin_snapshot_file,
+    FilebaseIpfsClient, IpfsClient, MultiPinner, pin_manifest,
 };
 use railgun_indexer_core::publish::ipns::{
     IpnsPublisher, IpnsPublisherConfig, IpnsPublisherTask, ManifestIpnsPublisher,
     v4_poi_public_identity, validate_publisher_identities,
 };
 use railgun_indexer_core::scrape::Orchestrator;
-use railgun_indexer_core::snapshot::format::FORMAT_VERSION as SNAPSHOT_FORMAT_VERSION;
-use railgun_indexer_core::snapshot::{Lifecycle, SnapshotKind};
+use railgun_indexer_core::snapshot::Lifecycle;
 use railgun_indexer_core::status::{SharedStatus, Status};
-use railgun_indexer_core::store::{Store, StoredPublication, run_migrations};
+use railgun_indexer_core::store::{Store, run_migrations};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
@@ -122,14 +117,12 @@ struct Options {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RecoveryChannel {
-    Legacy,
     V4,
 }
 
 impl From<RecoveryChannel> for PoiManifestChannel {
     fn from(value: RecoveryChannel) -> Self {
         match value {
-            RecoveryChannel::Legacy => Self::Legacy,
             RecoveryChannel::V4 => Self::V4,
         }
     }
@@ -235,37 +228,25 @@ async fn main() -> Result<()> {
     let ipfs_pinner = init_ipfs_pinner(&config).wrap_err("initialize IPFS pinner")?;
     let ipns_config =
         IpnsPublisherConfig::from_indexer_config(&config).wrap_err("initialize IPNS config")?;
-    let (ipns_publisher, ipns_task) = IpnsPublisher::new(&publisher_key, ipns_config.clone())
-        .wrap_err("initialize legacy POI IPNS publisher")?;
     let (v4_poi_ipns_publisher, v4_poi_ipns_task) =
         IpnsPublisher::new_v4_poi(&publisher_key, ipns_config.clone())
             .wrap_err("initialize v4 POI IPNS publisher")?;
     let (chain_indexed_ipns_publisher, chain_indexed_ipns_task) =
         IpnsPublisher::new(&chain_indexed_publisher_key, ipns_config)
             .wrap_err("initialize chain-indexed IPNS publisher")?;
-    validate_publisher_identities(
-        &ipns_publisher,
-        &v4_poi_ipns_publisher,
-        &chain_indexed_ipns_publisher,
-    )
-    .wrap_err("validate publisher identities")?;
-    let poi_ipns_name = ipns_publisher
-        .ipns_name()
-        .wrap_err("derive legacy POI IPNS name")?;
+    validate_publisher_identities(&v4_poi_ipns_publisher, &chain_indexed_ipns_publisher)
+        .wrap_err("validate publisher identities")?;
     let poi_v4_ipns_name = v4_poi_ipns_publisher
         .ipns_name()
         .wrap_err("derive v4 POI IPNS name")?;
     let chain_indexed_ipns_name = chain_indexed_ipns_publisher
         .ipns_name()
         .wrap_err("derive chain-indexed IPNS name")?;
-    let poi_peer_id = ipns_publisher.peer_id().to_string();
     let poi_v4_peer_id = v4_poi_ipns_publisher.peer_id().to_string();
     let chain_indexed_peer_id = chain_indexed_ipns_publisher.peer_id().to_string();
     status.write().await.set_ipns_identities(
-        poi_ipns_name.clone(),
         poi_v4_ipns_name.clone(),
         chain_indexed_ipns_name.clone(),
-        poi_peer_id.clone(),
         poi_v4_peer_id.clone(),
         chain_indexed_peer_id.clone(),
     );
@@ -276,10 +257,8 @@ async fn main() -> Result<()> {
         upstream_endpoint_hash = %hex::encode_prefixed(upstream_endpoint_hash(&config.upstream_url)),
         chain_count = config.chain_ids.len(),
         list_count = config.list_keys.len(),
-        poi_ipns_name,
         poi_v4_ipns_name,
         chain_indexed_ipns_name,
-        poi_peer_id,
         poi_v4_peer_id,
         chain_indexed_peer_id,
         "loaded railgun indexer config"
@@ -292,8 +271,6 @@ async fn main() -> Result<()> {
         publisher_key,
         chain_indexed_publisher_key,
         ipfs_pinner,
-        ipns_publisher,
-        ipns_task,
         v4_poi_ipns_publisher,
         v4_poi_ipns_task,
         chain_indexed_ipns_publisher,
@@ -398,8 +375,6 @@ async fn run_background_tasks(
     publisher_key: SigningKey,
     chain_indexed_publisher_key: SigningKey,
     ipfs_pinner: Arc<dyn IpfsClient>,
-    ipns_publisher: IpnsPublisher,
-    ipns_task: IpnsPublisherTask,
     v4_poi_ipns_publisher: IpnsPublisher,
     v4_poi_ipns_task: IpnsPublisherTask,
     chain_indexed_ipns_publisher: IpnsPublisher,
@@ -412,15 +387,6 @@ async fn run_background_tasks(
     let pin_lifecycle = PinLifecycleCoordinator::default();
     let chain_canonicality = ChainCanonicalityCoordinator::default();
 
-    tasks.spawn({
-        let shutdown = shutdown_rx.clone();
-        async move {
-            ipns_task
-                .run(shutdown)
-                .await
-                .wrap_err("POI IPNS publisher task")
-        }
-    });
     tasks.spawn({
         let shutdown = shutdown_rx.clone();
         async move {
@@ -470,7 +436,6 @@ async fn run_background_tasks(
             ipfs_pinner.clone(),
             publisher_key,
             poi_rpc_client,
-            Arc::new(ipns_publisher),
             Arc::new(v4_poi_ipns_publisher),
             status.clone(),
             pin_lifecycle.clone(),
@@ -668,12 +633,10 @@ struct PublicationScheduler {
     ipfs_client: Arc<dyn IpfsClient>,
     signing_key: SigningKey,
     poi_rpc_client: PoiRpcClient,
-    ipns_publisher: Arc<dyn ManifestIpnsPublisher>,
     v4_ipns_publisher: Arc<dyn ManifestIpnsPublisher>,
     status: SharedStatus,
     pin_lifecycle: PinLifecycleCoordinator,
     sequence_allocator: PoiPublicationSequenceAllocator,
-    last_manifest_cid: Option<String>,
     last_poi_artifact_manifest_cid: Option<String>,
     last_poi_artifact_graph_hash: Option<[u8; 32]>,
     manifest_needs_publish: bool,
@@ -688,7 +651,6 @@ struct PublishedManifest {
 }
 
 struct PublishedPoiManifests {
-    legacy: Option<PublishedManifest>,
     v4: PublishedManifest,
     poi_artifact_graph_cids: Vec<String>,
 }
@@ -728,17 +690,11 @@ impl PublicationScheduler {
         ipfs_client: Arc<dyn IpfsClient>,
         signing_key: SigningKey,
         poi_rpc_client: PoiRpcClient,
-        ipns_publisher: Arc<dyn ManifestIpnsPublisher>,
         v4_ipns_publisher: Arc<dyn ManifestIpnsPublisher>,
         status: SharedStatus,
         pin_lifecycle: PinLifecycleCoordinator,
     ) -> Self {
-        let lifecycle = Lifecycle::new(
-            store.clone(),
-            config.upstream_url.clone(),
-            EVM_CHAIN_TYPE,
-            upstream_endpoint_hash(&config.upstream_url),
-        );
+        let lifecycle = Lifecycle::new(store.clone());
         let sequence_allocator = PoiPublicationSequenceAllocator::new(store.clone());
 
         Self {
@@ -748,12 +704,10 @@ impl PublicationScheduler {
             ipfs_client,
             signing_key,
             poi_rpc_client,
-            ipns_publisher,
             v4_ipns_publisher,
             status,
             pin_lifecycle,
             sequence_allocator,
-            last_manifest_cid: None,
             last_poi_artifact_manifest_cid: None,
             last_poi_artifact_graph_hash: None,
             manifest_needs_publish: true,
@@ -802,61 +756,23 @@ impl PublicationScheduler {
             self.manifest_needs_publish = true;
         }
 
-        let mut published_snapshot = false;
-        for list_key in &self.config.list_keys {
-            for chain_id in &self.config.chain_ids {
-                self.ensure_publication_running()?;
-                match self.publish_pair(list_key, *chain_id, now).await {
-                    Ok(pair_published) => {
-                        if pair_published {
-                            published_snapshot = true;
-                            self.manifest_needs_publish = true;
-                        }
-                    }
-                    Err(error) => {
-                        self.set_ipfs_reachable(false).await;
-                        warn!(
-                            list_key = %list_key_hex(list_key),
-                            chain_id,
-                            error = %error,
-                            "POI snapshot publication failed for pair; continuing cycle"
-                        );
-                    }
-                }
-            }
-        }
-
         self.ensure_publication_running()?;
         let poi_artifact_started = std::time::Instant::now();
         let poi_graph = self.publish_poi_artifact_graph(now).await?;
         self.ensure_publication_running()?;
-        let legacy_entries = self.manifest_entries().await?;
         let graph_changed = self
             .last_poi_artifact_graph_hash
             .is_none_or(|hash| hash != poi_graph.graph_hash);
-        let legacy_missing = !legacy_entries.is_empty() && self.last_manifest_cid.is_none();
-        let mut needs_publication = published_snapshot
-            || self.manifest_needs_publish
-            || legacy_missing
+        let mut needs_publication = self.manifest_needs_publish
             || self.last_poi_artifact_manifest_cid.is_none()
             || graph_changed
             || self.should_republish_ipns(now);
         if !needs_publication {
-            let mut current_manifests = vec![
-                self.last_poi_artifact_manifest_cid
-                    .as_ref()
-                    .expect("POI artifact manifest CID checked above")
-                    .as_str(),
-            ];
-            if let Some(legacy) = self.last_manifest_cid.as_deref() {
-                current_manifests.push(legacy);
-            }
-            for cid in current_manifests {
-                if !self.cid_is_available(cid, "manifest").await? {
-                    needs_publication = true;
-                    break;
-                }
-            }
+            let current_manifest = self
+                .last_poi_artifact_manifest_cid
+                .as_ref()
+                .expect("POI artifact manifest CID checked above");
+            needs_publication = !self.cid_is_available(current_manifest, "manifest").await?;
         }
         if !needs_publication {
             return Ok(());
@@ -866,16 +782,10 @@ impl PublicationScheduler {
             .sequence_allocator
             .reserve_cycle(unix_millis(now)?)
             .await
-            .wrap_err("reserve dual POI publication sequence")?;
-        let manifests = self
-            .publish_poi_manifests(now, lease, legacy_entries, &poi_graph)
-            .await?;
+            .wrap_err("reserve POI publication sequence")?;
+        let manifests = self.publish_poi_manifests(now, lease, &poi_graph).await?;
         self.ensure_publication_running()?;
         self.publish_poi_ipns(lease, &manifests).await?;
-        self.last_manifest_cid = manifests
-            .legacy
-            .as_ref()
-            .map(|manifest| manifest.cid.clone());
         self.last_poi_artifact_manifest_cid = Some(manifests.v4.cid.clone());
         self.last_poi_artifact_graph_hash = Some(poi_graph.graph_hash);
         self.manifest_needs_publish = false;
@@ -899,297 +809,9 @@ impl PublicationScheduler {
             bridges = poi_graph.bridge_count,
             reused_cids = poi_graph.reused_cids,
             elapsed_ms = poi_artifact_started.elapsed().as_millis(),
-            "published dual POI cycle"
+            "published POI v4 cycle"
         );
         Ok(())
-    }
-
-    async fn publish_pair(
-        &self,
-        list_key: &alloy_primitives::FixedBytes<32>,
-        chain_id: u64,
-        now: SystemTime,
-    ) -> Result<bool> {
-        let Some(tip) = self
-            .store
-            .chain_tip(list_key, chain_id, &self.config.upstream_url)
-            .await
-            .wrap_err("read chain tip for publication")?
-        else {
-            return Ok(false);
-        };
-        let Some(tip_merkleroot) = tip.last_tip_merkleroot else {
-            return Ok(false);
-        };
-        let publications = self
-            .store
-            .active_publications(list_key, chain_id, &self.config.upstream_url)
-            .await
-            .wrap_err("read active snapshot publications")?;
-        let active_base = active_base(&publications);
-        let current_publications = current_manifest_publications(&publications);
-        let last_published_tip = published_tip(&current_publications);
-
-        if last_published_tip.is_some_and(|published_tip| tip.last_event_index < published_tip) {
-            info!(
-                list_key = %list_key_hex(list_key),
-                chain_id,
-                chain_tip = tip.last_event_index,
-                published_tip = last_published_tip,
-                "skipping publication because active snapshots are ahead of chain tip"
-            );
-            return Ok(false);
-        }
-
-        let published_snapshot = if let Some(missing_cid) = first_missing_publication_cid(
-            self.ipfs_client.as_ref(),
-            &publications,
-            list_key,
-            chain_id,
-        )
-        .await?
-        {
-            warn!(
-                list_key = %list_key_hex(list_key),
-                chain_id,
-                missing_cid,
-                "active POI snapshot CID is missing from IPFS service; rebuilding base snapshot"
-            );
-            self.publish_snapshot(
-                list_key,
-                chain_id,
-                SnapshotKind::Base,
-                0,
-                tip.last_event_index,
-                &tip_merkleroot,
-            )
-            .await?;
-            true
-        } else {
-            let should_rebuild_base = active_base.is_none_or(|base| {
-                Lifecycle::should_rebuild_base(
-                    Some(base.published_at),
-                    now,
-                    *self.config.base_rebuild_interval,
-                )
-            });
-            if should_rebuild_base {
-                self.publish_snapshot(
-                    list_key,
-                    chain_id,
-                    SnapshotKind::Base,
-                    0,
-                    tip.last_event_index,
-                    &tip_merkleroot,
-                )
-                .await?;
-                true
-            } else if let Some(published_tip) = last_published_tip
-                && tip.last_event_index > published_tip
-            {
-                self.publish_snapshot(
-                    list_key,
-                    chain_id,
-                    SnapshotKind::Delta,
-                    published_tip + 1,
-                    tip.last_event_index,
-                    &tip_merkleroot,
-                )
-                .await?;
-                true
-            } else {
-                false
-            }
-        };
-
-        let published_blocked_shields = self
-            .publish_blocked_shields_artifact(list_key, chain_id)
-            .await?;
-
-        Ok(published_snapshot || published_blocked_shields)
-    }
-
-    async fn publish_snapshot(
-        &self,
-        list_key: &alloy_primitives::FixedBytes<32>,
-        chain_id: u64,
-        kind: SnapshotKind,
-        start_index: u64,
-        end_index: u64,
-        tip_merkleroot: &[u8; 32],
-    ) -> Result<()> {
-        self.ensure_publication_running()?;
-        let bytes = match kind {
-            SnapshotKind::Base => self
-                .lifecycle
-                .build_base(list_key, chain_id, end_index)
-                .await
-                .wrap_err("build base snapshot")?,
-            SnapshotKind::Delta => self
-                .lifecycle
-                .build_delta(list_key, chain_id, start_index, end_index)
-                .await
-                .wrap_err("build delta snapshot")?,
-        };
-        self.ensure_publication_running()?;
-        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
-        let ownership = self.acquire_pin_ownership()?;
-        let cid = match pin_snapshot_file(self.ipfs_client.as_ref(), &bytes).await {
-            Ok(cid) => cid,
-            Err(error) => {
-                ownership.settle();
-                return Err(error).wrap_err("pin snapshot to IPFS");
-            }
-        };
-        let audit_result = async {
-            let byte_size = u64::try_from(bytes.len()).wrap_err("snapshot byte size overflow")?;
-            let artifact_hash = content_hash(&bytes);
-            let mut tx = self
-                .store
-                .begin()
-                .await
-                .wrap_err("begin audit transaction")?;
-            Audit::record_publication(
-                &mut tx,
-                list_key,
-                chain_id,
-                &self.config.upstream_url,
-                kind,
-                start_index,
-                end_index,
-                &cid,
-                byte_size,
-                &artifact_hash,
-                SNAPSHOT_FORMAT_VERSION,
-                tip_merkleroot,
-            )
-            .await
-            .wrap_err("record snapshot publication")?;
-            tx.commit()
-                .await
-                .wrap_err("commit snapshot publication audit")?;
-            Ok::<_, eyre::Report>((byte_size, artifact_hash))
-        }
-        .await;
-        let (byte_size, artifact_hash) = match audit_result {
-            Ok(result) => result,
-            Err(error) => {
-                self.cleanup_uncommitted_pin_while_locked(&cid, "snapshot", ownership)
-                    .await;
-                return Err(error);
-            }
-        };
-        ownership.settle();
-        drop(pin_lifecycle_guard);
-        self.ensure_publication_running()?;
-
-        info!(
-            list_key = %list_key_hex(list_key),
-            chain_id,
-            kind = snapshot_kind_label(kind),
-            start_index,
-            end_index,
-            byte_size,
-            sha256 = %hex::encode_prefixed(artifact_hash),
-            cid = %cid,
-            "published POI snapshot"
-        );
-        Ok(())
-    }
-
-    async fn publish_blocked_shields_artifact(
-        &self,
-        list_key: &alloy_primitives::FixedBytes<32>,
-        chain_id: u64,
-    ) -> Result<bool> {
-        self.ensure_publication_running()?;
-        let artifact = self
-            .lifecycle
-            .build_blocked_shields_artifact(list_key, chain_id)
-            .await
-            .wrap_err("build blocked-shields artifact")?;
-        let bytes = artifact.bytes;
-        let artifact_hash = content_hash(&bytes);
-        let active = self
-            .store
-            .active_blocked_shields_publication(list_key, chain_id, &self.config.upstream_url)
-            .await
-            .wrap_err("read active blocked-shields publication")?;
-
-        if let Some(active) = &active
-            && active.content_hash == artifact_hash
-        {
-            if self
-                .cid_is_available(&active.cid, "blocked-shields")
-                .await?
-            {
-                return Ok(false);
-            }
-            warn!(
-                list_key = %list_key_hex(list_key),
-                chain_id,
-                cid = %active.cid,
-                "active blocked-shields artifact CID is missing from IPFS service; repinning"
-            );
-        }
-
-        self.ensure_publication_running()?;
-        let pin_lifecycle_guard = self.pin_lifecycle.lock().await;
-        let ownership = self.acquire_pin_ownership()?;
-        let cid = match pin_blocked_shields(self.ipfs_client.as_ref(), &bytes).await {
-            Ok(cid) => cid,
-            Err(error) => {
-                ownership.settle();
-                return Err(error).wrap_err("pin blocked-shields artifact to IPFS");
-            }
-        };
-        let audit_result = async {
-            let byte_size = u64::try_from(bytes.len())
-                .wrap_err("blocked-shields artifact byte size overflow")?;
-            let mut tx = self
-                .store
-                .begin()
-                .await
-                .wrap_err("begin blocked-shields audit transaction")?;
-            Audit::record_blocked_shields_publication(
-                &mut tx,
-                list_key,
-                chain_id,
-                &self.config.upstream_url,
-                &cid,
-                byte_size,
-                SNAPSHOT_FORMAT_VERSION,
-                &artifact_hash,
-            )
-            .await
-            .wrap_err("record blocked-shields publication")?;
-            tx.commit()
-                .await
-                .wrap_err("commit blocked-shields publication audit")?;
-            Ok::<_, eyre::Report>(byte_size)
-        }
-        .await;
-        let byte_size = match audit_result {
-            Ok(byte_size) => byte_size,
-            Err(error) => {
-                self.cleanup_uncommitted_pin_while_locked(&cid, "blocked-shields", ownership)
-                    .await;
-                return Err(error);
-            }
-        };
-        ownership.settle();
-        drop(pin_lifecycle_guard);
-        self.ensure_publication_running()?;
-
-        info!(
-            list_key = %list_key_hex(list_key),
-            chain_id,
-            byte_size,
-            blocked_shield_count = artifact.row_count,
-            cid = %cid,
-            "published blocked-shields artifact"
-        );
-        Ok(true)
     }
 
     async fn publish_poi_artifact_graph(&self, now: SystemTime) -> Result<PublishedPoiGraph> {
@@ -1764,26 +1386,10 @@ impl PublicationScheduler {
         &self,
         now: SystemTime,
         lease: PoiPublicationSequenceLease,
-        legacy_entries: Vec<ManifestEntry>,
         poi_graph: &PublishedPoiGraph,
     ) -> Result<PublishedPoiManifests> {
         self.ensure_publication_running()?;
         let issued_at_ms = unix_millis(now)?;
-        let legacy = if legacy_entries.is_empty() {
-            None
-        } else {
-            let mut manifest = Manifest::new(
-                SNAPSHOT_FORMAT_VERSION,
-                issued_at_ms,
-                lease.legacy_manifest_sequence(),
-                FixedBytes::ZERO,
-                legacy_entries,
-            );
-            manifest
-                .sign_manifest(&self.signing_key)
-                .wrap_err("sign unchanged legacy POI manifest")?;
-            Some(serde_json::to_vec(&manifest).wrap_err("serialize legacy POI manifest")?)
-        };
         let mut poi_manifest = PoiArtifactManifest::new(
             issued_at_ms,
             lease.v4_manifest_sequence(),
@@ -1798,60 +1404,16 @@ impl PublicationScheduler {
             .wrap_err("serialize POI v4 manifest")?;
 
         let _pin_lifecycle = self.pin_lifecycle.lock().await;
-        let (legacy_pin, mut legacy_ownership) = if let Some(bytes) = legacy.as_deref() {
-            let ownership = self.acquire_pin_ownership()?;
-            match pin_manifest(self.ipfs_client.as_ref(), bytes).await {
-                Ok(cid) => (Some(cid), Some(ownership)),
-                Err(error) => {
-                    ownership.settle();
-                    return Err(error).wrap_err("pin legacy POI manifest");
-                }
-            }
-        } else {
-            (None, None)
-        };
-        if let Err(error) = self.ensure_publication_running() {
-            if let (Some(cid), Some(ownership)) = (&legacy_pin, legacy_ownership.take()) {
-                self.cleanup_uncommitted_pin_while_locked(cid, "legacy POI manifest", ownership)
-                    .await;
-            }
-            return Err(error);
-        }
-        let poi_artifact_ownership = match self.acquire_pin_ownership() {
-            Ok(ownership) => ownership,
-            Err(error) => {
-                if let (Some(cid), Some(ownership)) = (&legacy_pin, legacy_ownership.take()) {
-                    self.cleanup_uncommitted_pin_while_locked(
-                        cid,
-                        "legacy POI manifest",
-                        ownership,
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
-        };
+        let poi_artifact_ownership = self.acquire_pin_ownership()?;
         let poi_artifact_pin =
             match pin_manifest(self.ipfs_client.as_ref(), &poi_manifest_bytes).await {
                 Ok(cid) => cid,
                 Err(error) => {
                     poi_artifact_ownership.settle();
-                    if let (Some(cid), Some(ownership)) = (&legacy_pin, legacy_ownership.take()) {
-                        self.cleanup_uncommitted_pin_while_locked(
-                            cid,
-                            "legacy POI manifest",
-                            ownership,
-                        )
-                        .await;
-                    }
                     return Err(error).wrap_err("pin POI v4 manifest");
                 }
             };
         if let Err(error) = self.ensure_publication_running() {
-            if let (Some(cid), Some(ownership)) = (&legacy_pin, legacy_ownership.take()) {
-                self.cleanup_uncommitted_pin_while_locked(cid, "legacy POI manifest", ownership)
-                    .await;
-            }
             self.cleanup_uncommitted_pin_while_locked(
                 &poi_artifact_pin,
                 "POI artifact manifest",
@@ -1865,19 +1427,7 @@ impl PublicationScheduler {
                 .store
                 .begin()
                 .await
-                .wrap_err("begin dual POI manifest audit transaction")?;
-            if let (Some(cid), Some(bytes)) = (legacy_pin.as_ref(), legacy.as_deref()) {
-                Audit::record_manifest_pin(
-                    &mut tx,
-                    cid,
-                    lease.legacy_manifest_sequence(),
-                    u64::try_from(bytes.len()).wrap_err("legacy manifest byte size overflow")?,
-                    &content_hash(bytes),
-                    SNAPSHOT_FORMAT_VERSION,
-                )
-                .await
-                .wrap_err("record legacy manifest pin")?;
-            }
+                .wrap_err("begin POI v4 manifest audit transaction")?;
             Audit::record_poi_artifact_manifest_pin(
                 &mut tx,
                 &poi_artifact_pin,
@@ -1890,14 +1440,10 @@ impl PublicationScheduler {
             )
             .await
             .wrap_err("record POI v4 manifest graph")?;
-            tx.commit().await.wrap_err("commit dual POI manifest audit")
+            tx.commit().await.wrap_err("commit POI v4 manifest audit")
         }
         .await;
         if let Err(error) = audit_result {
-            if let (Some(cid), Some(ownership)) = (&legacy_pin, legacy_ownership.take()) {
-                self.cleanup_uncommitted_pin_while_locked(cid, "legacy POI manifest", ownership)
-                    .await;
-            }
             self.cleanup_uncommitted_pin_while_locked(
                 &poi_artifact_pin,
                 "POI artifact manifest",
@@ -1906,89 +1452,17 @@ impl PublicationScheduler {
             .await;
             return Err(error);
         }
-        if let Some(ownership) = legacy_ownership.take() {
-            ownership.settle();
-        }
         poi_artifact_ownership.settle();
 
-        let legacy = legacy_pin.map(|cid| PublishedManifest {
-            cid: cid.to_string(),
-            sequence: lease.legacy_manifest_sequence(),
-        });
         let v4 = PublishedManifest {
             cid: poi_artifact_pin.to_string(),
             sequence: lease.v4_manifest_sequence(),
         };
-        if let Some(legacy) = &legacy {
-            self.status
-                .write()
-                .await
-                .record_manifest_publication(legacy.cid.clone());
-        }
         self.ensure_publication_running()?;
         Ok(PublishedPoiManifests {
-            legacy,
             v4,
             poi_artifact_graph_cids: poi_graph.artifact_cids.clone(),
         })
-    }
-
-    async fn manifest_entries(&self) -> Result<Vec<ManifestEntry>> {
-        let mut entries = Vec::new();
-        for list_key in &self.config.list_keys {
-            for chain_id in &self.config.chain_ids {
-                let publications = self
-                    .store
-                    .active_publications(list_key, *chain_id, &self.config.upstream_url)
-                    .await
-                    .wrap_err("read active publications for manifest")?;
-                let Some(base) = active_base(&publications) else {
-                    continue;
-                };
-                let Some(blocked_shields) = self
-                    .store
-                    .active_blocked_shields_publication(
-                        list_key,
-                        *chain_id,
-                        &self.config.upstream_url,
-                    )
-                    .await
-                    .wrap_err("read active blocked-shields publication for manifest")?
-                else {
-                    continue;
-                };
-                let deltas = manifest_deltas(&publications, base);
-                let retained_deltas = active_deltas(&publications)
-                    .into_iter()
-                    .map(retained_delta_descriptor)
-                    .collect::<Result<Vec<_>>>()?;
-                let current = deltas.last().copied().unwrap_or(base);
-                let tip_merkleroot = current
-                    .tip_merkleroot
-                    .ok_or_else(|| eyre!("published snapshot is missing tip merkleroot"))?;
-
-                entries.push(ManifestEntry {
-                    list_key: *list_key,
-                    chain_id: *chain_id,
-                    base: artifact_descriptor(base),
-                    deltas: deltas
-                        .iter()
-                        .map(|publication| artifact_descriptor(publication))
-                        .collect(),
-                    retained_deltas,
-                    blocked_shields: blocked_shields_descriptor(&blocked_shields),
-                    current_tip_index: current.end_index,
-                    current_tip_merkleroot: FixedBytes::from(tip_merkleroot),
-                });
-            }
-        }
-
-        entries.sort_by(|left, right| {
-            left.list_key
-                .cmp(&right.list_key)
-                .then_with(|| left.chain_id.cmp(&right.chain_id))
-        });
-        Ok(entries)
     }
 
     async fn publish_poi_ipns(
@@ -2000,89 +1474,32 @@ impl PublicationScheduler {
         let mut required_poi_artifacts = manifests.poi_artifact_graph_cids.clone();
         required_poi_artifacts.push(manifests.v4.cid.clone());
         let mut failures = Vec::new();
-        if let Some(legacy) = &manifests.legacy {
-            let outcome = run_dual_poi_publication_cycle(
-                lease,
-                |sequence| async move {
-                    if !self
-                        .cid_is_available(&legacy.cid, "legacy manifest")
-                        .await?
-                    {
-                        return Err(eyre!("legacy manifest CID is externally unavailable"));
-                    }
-                    self.ipns_publisher
-                        .publish_manifest_cid(&legacy.cid, sequence)
-                        .await
-                        .map_err(eyre::Report::new)
-                },
-                |sequence| async move {
-                    for cid in &required_poi_artifacts {
-                        if !self.cid_is_available(cid, "POI v4 graph").await? {
-                            return Err(eyre!(
-                                "required POI v4 graph CID {cid} is externally unavailable"
-                            ));
-                        }
-                    }
-                    self.v4_ipns_publisher
-                        .publish_manifest_cid(&manifests.v4.cid, sequence)
-                        .await
-                        .map_err(eyre::Report::new)
-                },
-            )
-            .await;
-            match outcome.legacy {
-                Ok(_) => {
-                    if let Err(error) = self.ensure_publication_running() {
-                        failures.push(format!("legacy activation: {error}"));
-                    } else if let Err(error) =
-                        self.record_legacy_ipns(&legacy.cid, legacy.sequence).await
-                    {
-                        failures.push(format!("legacy audit: {error}"));
-                    }
+        let publication = async {
+            for cid in &required_poi_artifacts {
+                if !self.cid_is_available(cid, "POI v4 graph").await? {
+                    return Err(eyre!(
+                        "required POI v4 graph CID {cid} is externally unavailable"
+                    ));
                 }
-                Err(error) => failures.push(format!("legacy: {error}")),
             }
-            match outcome.v4 {
-                Ok(_) => {
-                    if let Err(error) = self.ensure_publication_running() {
-                        failures.push(format!("v4 activation: {error}"));
-                    } else if let Err(error) = self
-                        .record_v4_ipns(&manifests.v4.cid, manifests.v4.sequence)
-                        .await
-                    {
-                        failures.push(format!("POI artifact audit: {error}"));
-                    }
-                }
-                Err(error) => failures.push(format!("v4: {error}")),
-            }
-        } else {
-            let publication = async {
-                for cid in &required_poi_artifacts {
-                    if !self.cid_is_available(cid, "POI v4 graph").await? {
-                        return Err(eyre!(
-                            "required POI v4 graph CID {cid} is externally unavailable"
-                        ));
-                    }
-                }
-                self.v4_ipns_publisher
-                    .publish_manifest_cid(&manifests.v4.cid, lease.v4_manifest_sequence())
+            self.v4_ipns_publisher
+                .publish_manifest_cid(&manifests.v4.cid, lease.v4_manifest_sequence())
+                .await
+                .map_err(eyre::Report::new)
+        }
+        .await;
+        match publication {
+            Ok(_) => {
+                if let Err(error) = self.ensure_publication_running() {
+                    failures.push(format!("v4 activation: {error}"));
+                } else if let Err(error) = self
+                    .record_v4_ipns(&manifests.v4.cid, manifests.v4.sequence)
                     .await
-                    .map_err(eyre::Report::new)
-            }
-            .await;
-            match publication {
-                Ok(_) => {
-                    if let Err(error) = self.ensure_publication_running() {
-                        failures.push(format!("v4 activation: {error}"));
-                    } else if let Err(error) = self
-                        .record_v4_ipns(&manifests.v4.cid, manifests.v4.sequence)
-                        .await
-                    {
-                        failures.push(format!("POI artifact audit: {error}"));
-                    }
+                {
+                    failures.push(format!("POI artifact audit: {error}"));
                 }
-                Err(error) => failures.push(format!("v4: {error}")),
             }
+            Err(error) => failures.push(format!("v4: {error}")),
         }
         if failures.is_empty() {
             Ok(())
@@ -2092,22 +1509,6 @@ impl PublicationScheduler {
                 failures.join(", ")
             ))
         }
-    }
-
-    async fn record_legacy_ipns(&self, manifest_cid: &str, sequence: u64) -> Result<()> {
-        let parsed_cid = manifest_cid.parse().wrap_err("parse legacy manifest CID")?;
-        let mut tx = self
-            .store
-            .begin()
-            .await
-            .wrap_err("begin legacy manifest IPNS audit transaction")?;
-        Audit::record_manifest_ipns_publication(&mut tx, &parsed_cid, sequence)
-            .await
-            .wrap_err("record legacy manifest IPNS publication")?;
-        tx.commit()
-            .await
-            .wrap_err("commit legacy manifest IPNS audit")?;
-        Ok(())
     }
 
     async fn record_v4_ipns(&self, manifest_cid: &str, sequence: u64) -> Result<()> {
@@ -2123,147 +1524,81 @@ impl PublicationScheduler {
         &self,
     ) -> Result<PendingPoiPublicationReconciliation> {
         self.ensure_publication_running()?;
-        let legacy = Audit::pending_manifest_publication(self.store.pool())
+        let Some(pending) = Audit::pending_poi_artifact_manifest_publication(self.store.pool())
             .await
-            .wrap_err("load pending legacy POI manifest")?;
-        let v4 = Audit::pending_poi_artifact_manifest_publication(self.store.pool())
-            .await
-            .wrap_err("load pending v4 POI manifest")?;
-        if legacy.is_none() && v4.is_none() {
+            .wrap_err("load pending v4 POI manifest")?
+        else {
             return Ok(PendingPoiPublicationReconciliation::None);
-        }
-        let legacy_pending = legacy.is_some();
+        };
 
-        let legacy_reconciliation = async {
-            let Some(pending) = legacy else {
-                return Ok::<(), eyre::Report>(());
-            };
-            if !self
-                .cid_is_available(&pending.cid, "pending legacy manifest")
-                .await?
-            {
-                return Err(eyre!(
-                    "pending legacy manifest CID {} is externally unavailable",
-                    pending.cid
-                ));
-            }
-            self.ipns_publisher
-                .publish_manifest_cid(&pending.cid, pending.sequence)
-                .await
-                .map_err(eyre::Report::new)?;
-            self.ensure_publication_running()?;
-            self.record_legacy_ipns(&pending.cid, pending.sequence)
-                .await
-                .wrap_err("activate reconciled legacy POI manifest")
-        };
-        let v4_reconciliation = async {
-            let Some(pending) = v4 else {
-                return Ok::<PendingPoiPublicationReconciliation, eyre::Report>(
-                    PendingPoiPublicationReconciliation::None,
-                );
-            };
-            let unavailable_artifact_cid = {
-                let mut unavailable = None;
-                for cid in &pending.artifact_cids {
-                    if !self.cid_is_available(cid, "pending v4 graph").await? {
-                        unavailable = Some(cid);
-                        break;
-                    }
+        let unavailable_artifact_cid = {
+            let mut unavailable = None;
+            for cid in &pending.artifact_cids {
+                if !self.cid_is_available(cid, "pending v4 graph").await? {
+                    unavailable = Some(cid);
+                    break;
                 }
-                unavailable
-            };
-            let unavailable = if let Some(cid) = unavailable_artifact_cid {
-                Some((cid, "artifact"))
-            } else if !self
-                .cid_is_available(&pending.cid, "pending v4 manifest")
-                .await?
-            {
-                Some((&pending.cid, "manifest"))
-            } else {
-                None
-            };
-            if let Some((unavailable_cid, unavailable_kind)) = unavailable {
-                let unavailable_cid = unavailable_cid
-                    .parse::<Cid>()
-                    .wrap_err("parse unavailable pending v4 CID")?;
-                let pending_cid = pending
-                    .cid
-                    .parse::<Cid>()
-                    .wrap_err("parse pending v4 manifest CID")?;
-                warn!(
-                    pending_manifest_cid = %pending.cid,
-                    pending_sequence = pending.sequence,
-                    unavailable_cid = %unavailable_cid,
-                    unavailable_kind,
-                    "abandoning pending POI v4 manifest with unavailable CID"
-                );
-                let mut tx = self
-                    .store
-                    .begin()
-                    .await
-                    .wrap_err("begin pending v4 manifest abandonment transaction")?;
-                Audit::abandon_pending_poi_v4_manifest_reconciliation(
-                    &mut tx,
-                    &pending_cid,
-                    pending.sequence,
-                    (unavailable_kind == "artifact").then_some(&unavailable_cid),
-                )
-                .await
-                .wrap_err("abandon pending v4 manifest reconciliation")?;
-                tx.commit()
-                    .await
-                    .wrap_err("commit pending v4 manifest abandonment")?;
-                return Ok(PendingPoiPublicationReconciliation::Abandoned);
             }
-            self.v4_ipns_publisher
-                .publish_manifest_cid(&pending.cid, pending.sequence)
-                .await
-                .map_err(eyre::Report::new)?;
-            self.ensure_publication_running()?;
-            self.record_v4_ipns(&pending.cid, pending.sequence)
-                .await
-                .wrap_err("activate reconciled v4 POI manifest")?;
-            Ok(PendingPoiPublicationReconciliation::Activated)
+            unavailable
         };
-        let (legacy_result, v4_result) =
-            futures_util::future::join(legacy_reconciliation, v4_reconciliation).await;
-        let mut failures = Vec::new();
-        if let Err(error) = legacy_result {
-            failures.push(format!("legacy: {error}"));
-        }
-        let v4_result = match v4_result {
-            Ok(result) => Some(result),
-            Err(error) => {
-                failures.push(format!("v4: {error}"));
-                None
-            }
-        };
-        if failures.is_empty() {
-            if v4_result == Some(PendingPoiPublicationReconciliation::Abandoned) {
-                Ok(PendingPoiPublicationReconciliation::Abandoned)
-            } else if legacy_pending
-                || v4_result == Some(PendingPoiPublicationReconciliation::Activated)
-            {
-                Ok(PendingPoiPublicationReconciliation::Activated)
-            } else {
-                Ok(PendingPoiPublicationReconciliation::None)
-            }
+        let unavailable = if let Some(cid) = unavailable_artifact_cid {
+            Some((cid, "artifact"))
+        } else if !self
+            .cid_is_available(&pending.cid, "pending v4 manifest")
+            .await?
+        {
+            Some((&pending.cid, "manifest"))
         } else {
-            Err(eyre!(
-                "pending POI publication reconciliation failed: {}",
-                failures.join(", ")
-            ))
+            None
+        };
+        if let Some((unavailable_cid, unavailable_kind)) = unavailable {
+            let unavailable_cid = unavailable_cid
+                .parse::<Cid>()
+                .wrap_err("parse unavailable pending v4 CID")?;
+            let pending_cid = pending
+                .cid
+                .parse::<Cid>()
+                .wrap_err("parse pending v4 manifest CID")?;
+            warn!(
+                pending_manifest_cid = %pending.cid,
+                pending_sequence = pending.sequence,
+                unavailable_cid = %unavailable_cid,
+                unavailable_kind,
+                "abandoning pending POI v4 manifest with unavailable CID"
+            );
+            let mut tx = self
+                .store
+                .begin()
+                .await
+                .wrap_err("begin pending v4 manifest abandonment transaction")?;
+            Audit::abandon_pending_poi_v4_manifest_reconciliation(
+                &mut tx,
+                &pending_cid,
+                pending.sequence,
+                (unavailable_kind == "artifact").then_some(&unavailable_cid),
+            )
+            .await
+            .wrap_err("abandon pending v4 manifest reconciliation")?;
+            tx.commit()
+                .await
+                .wrap_err("commit pending v4 manifest abandonment")?;
+            return Ok(PendingPoiPublicationReconciliation::Abandoned);
         }
+        self.v4_ipns_publisher
+            .publish_manifest_cid(&pending.cid, pending.sequence)
+            .await
+            .map_err(eyre::Report::new)?;
+        self.ensure_publication_running()?;
+        self.record_v4_ipns(&pending.cid, pending.sequence)
+            .await
+            .wrap_err("activate reconciled v4 POI manifest")?;
+        Ok(PendingPoiPublicationReconciliation::Activated)
     }
 
     async fn load_durable_publication_state(&mut self) -> Result<()> {
-        let legacy = Audit::active_manifest_publication(self.store.pool())
-            .await
-            .wrap_err("load active legacy POI manifest state")?;
         let v4 = Audit::active_poi_artifact_manifest_publication(self.store.pool())
             .await
             .wrap_err("load active v4 POI manifest state")?;
-        self.last_manifest_cid = legacy.as_ref().map(|manifest| manifest.cid.clone());
         self.last_poi_artifact_manifest_cid = v4.as_ref().map(|manifest| manifest.cid.clone());
         self.last_poi_artifact_graph_hash = v4
             .as_ref()
@@ -2271,12 +1606,7 @@ impl PublicationScheduler {
             .transpose()
             .wrap_err("serialize active POI artifact graph identity")?
             .map(|bytes| content_hash(&bytes));
-        self.last_ipns_publish_at = legacy
-            .as_ref()
-            .map(|manifest| manifest.ipns_published_at)
-            .into_iter()
-            .chain(v4.as_ref().map(|manifest| manifest.ipns_published_at))
-            .max();
+        self.last_ipns_publish_at = v4.as_ref().map(|manifest| manifest.ipns_published_at);
         self.manifest_needs_publish = v4.is_none();
         let mut status = self.status.write().await;
         if let Some(v4) = v4 {
@@ -2394,72 +1724,6 @@ fn poi_artifact_rotation_required(
         || !current_tail_fits
 }
 
-fn active_base(publications: &[StoredPublication]) -> Option<&StoredPublication> {
-    publications
-        .iter()
-        .rfind(|publication| matches!(publication.kind, SnapshotKind::Base))
-}
-
-fn active_deltas(publications: &[StoredPublication]) -> Vec<&StoredPublication> {
-    let mut deltas = publications
-        .iter()
-        .filter(|publication| matches!(publication.kind, SnapshotKind::Delta))
-        .collect::<Vec<_>>();
-    deltas.sort_by_key(|publication| publication.start_index);
-    deltas
-}
-
-fn manifest_deltas<'a>(
-    publications: &'a [StoredPublication],
-    base: &StoredPublication,
-) -> Vec<&'a StoredPublication> {
-    active_deltas(publications)
-        .into_iter()
-        .filter(|publication| publication.start_index > base.end_index)
-        .collect()
-}
-
-fn current_manifest_publications(publications: &[StoredPublication]) -> Vec<&StoredPublication> {
-    let Some(base) = active_base(publications) else {
-        return Vec::new();
-    };
-    let mut current = Vec::with_capacity(publications.len());
-    current.push(base);
-    current.extend(manifest_deltas(publications, base));
-    current
-}
-
-fn published_tip(publications: &[&StoredPublication]) -> Option<u64> {
-    publications
-        .iter()
-        .map(|publication| publication.end_index)
-        .max()
-}
-
-async fn first_missing_publication_cid(
-    ipfs_client: &dyn IpfsClient,
-    publications: &[StoredPublication],
-    list_key: &alloy_primitives::FixedBytes<32>,
-    chain_id: u64,
-) -> Result<Option<String>> {
-    for publication in current_manifest_publications(publications) {
-        if !cid_is_available(ipfs_client, &publication.cid, "snapshot")
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "check published snapshot availability for list_key={} chain_id={chain_id} cid={}",
-                    list_key_hex(list_key),
-                    publication.cid
-                )
-            })?
-        {
-            return Ok(Some(publication.cid.clone()));
-        }
-    }
-
-    Ok(None)
-}
-
 async fn cid_is_available(
     ipfs_client: &dyn IpfsClient,
     cid: &str,
@@ -2478,45 +1742,8 @@ fn upstream_endpoint_hash(upstream_url: &str) -> [u8; 32] {
     Sha256::digest(upstream_url.as_bytes()).into()
 }
 
-fn artifact_descriptor(publication: &StoredPublication) -> ArtifactDescriptor {
-    ArtifactDescriptor {
-        cid: publication.cid.clone(),
-        sha256: FixedBytes::from(publication.content_hash),
-        byte_size: publication.byte_size,
-    }
-}
-
-fn retained_delta_descriptor(publication: &StoredPublication) -> Result<RetainedDeltaDescriptor> {
-    let tip_merkleroot = publication
-        .tip_merkleroot
-        .ok_or_else(|| eyre!("published delta snapshot is missing tip merkleroot"))?;
-    Ok(RetainedDeltaDescriptor::new(
-        artifact_descriptor(publication),
-        publication.start_index,
-        publication.end_index,
-        FixedBytes::from(tip_merkleroot),
-    ))
-}
-
-fn blocked_shields_descriptor(
-    publication: &railgun_indexer_core::store::StoredBlockedShieldsPublication,
-) -> ArtifactDescriptor {
-    ArtifactDescriptor {
-        cid: publication.cid.clone(),
-        sha256: FixedBytes::from(publication.content_hash),
-        byte_size: publication.byte_size,
-    }
-}
-
 fn list_key_hex(list_key: &FixedBytes<32>) -> String {
     hex::encode_prefixed(list_key.as_slice())
-}
-
-const fn snapshot_kind_label(kind: SnapshotKind) -> &'static str {
-    match kind {
-        SnapshotKind::Base => "base",
-        SnapshotKind::Delta => "delta",
-    }
 }
 
 fn unix_millis(now: SystemTime) -> Result<u64> {
@@ -2707,12 +1934,10 @@ async fn wait_for_shutdown() -> Result<()> {
 mod tests {
     use super::*;
     use alloy_primitives::FixedBytes;
-    use async_trait::async_trait;
-    use cid::Cid;
     use clap::error::ErrorKind;
-    use railgun_indexer_core::publish::ipfs::{IpfsError, raw_block_cid};
-    use std::collections::{BTreeMap, HashSet};
-    use std::sync::Mutex;
+    use railgun_indexer_core::manifest::ArtifactDescriptor;
+    use railgun_indexer_core::publish::ipfs::raw_block_cid;
+    use std::collections::BTreeMap;
 
     #[test]
     fn offline_identity_mode_does_not_require_config() {
@@ -2787,11 +2012,33 @@ mod tests {
             "config.yaml",
             "--invalidate-pending-poi-manifest",
             "--channel",
-            "legacy",
+            "v4",
         ])
         .expect_err("CID and sequence are mandatory");
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn pending_manifest_recovery_rejects_retired_legacy_channel() {
+        let cid_text = raw_block_cid(b"pending recovery CLI")
+            .expect("test CID")
+            .to_string();
+        let error = Options::try_parse_from([
+            "railgun-indexer",
+            "--config",
+            "config.yaml",
+            "--invalidate-pending-poi-manifest",
+            "--channel",
+            "legacy",
+            "--manifest-cid",
+            &cid_text,
+            "--manifest-sequence",
+            "42",
+        ])
+        .expect_err("legacy recovery channel is retired");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]
@@ -2921,10 +2168,8 @@ mod tests {
         {
             let mut status = status.write().await;
             status.set_ipns_identities(
-                "k51qzi5uqu5dlpoi",
                 "k51qzi5uqu5dlv4poi",
                 "k51qzi5uqu5dlindexed",
-                "12D3KooWLegacy",
                 "12D3KooWV4Poi",
                 "12D3KooWIndexed",
             );
@@ -2964,7 +2209,6 @@ mod tests {
         assert_eq!(status.pairs.len(), 1);
         assert_eq!(status.pairs[0].chain_id, 1);
         assert_eq!(status.pairs[0].current_page_size, 100);
-        assert_eq!(status.poi_ipns_name.as_deref(), Some("k51qzi5uqu5dlpoi"));
         assert_eq!(
             status.poi_v4_ipns_name.as_deref(),
             Some("k51qzi5uqu5dlv4poi")
@@ -2973,7 +2217,6 @@ mod tests {
             status.chain_indexed_ipns_name.as_deref(),
             Some("k51qzi5uqu5dlindexed")
         );
-        assert_eq!(status.poi_peer_id.as_deref(), Some("12D3KooWLegacy"));
         assert_eq!(status.poi_v4_peer_id.as_deref(), Some("12D3KooWV4Poi"));
         assert_eq!(
             status.chain_indexed_peer_id.as_deref(),
@@ -3016,117 +2259,6 @@ mod tests {
 
         status.clear_poi_artifact_publication();
         assert!(status.poi_artifact_publication.is_none());
-    }
-
-    #[tokio::test]
-    async fn missing_publication_cid_detects_deleted_delta() -> Result<()> {
-        let list_key = FixedBytes::from([2_u8; 32]);
-        let base_cid = raw_block_cid(b"base")?;
-        let delta_cid = raw_block_cid(b"delta")?;
-        let client = AvailabilityClient::new([base_cid]);
-        let publications = vec![
-            stored_publication(SnapshotKind::Base, 0, 3, base_cid),
-            stored_publication(SnapshotKind::Delta, 4, 4, delta_cid),
-        ];
-
-        let missing = first_missing_publication_cid(&client, &publications, &list_key, 1).await?;
-
-        assert_eq!(missing, Some(delta_cid.to_string()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn missing_publication_cid_accepts_all_present() -> Result<()> {
-        let list_key = FixedBytes::from([3_u8; 32]);
-        let base_cid = raw_block_cid(b"base")?;
-        let delta_cid = raw_block_cid(b"delta")?;
-        let client = AvailabilityClient::new([base_cid, delta_cid]);
-        let publications = vec![
-            stored_publication(SnapshotKind::Base, 0, 3, base_cid),
-            stored_publication(SnapshotKind::Delta, 4, 4, delta_cid),
-        ];
-
-        let missing = first_missing_publication_cid(&client, &publications, &list_key, 1).await?;
-
-        assert_eq!(missing, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn missing_publication_cid_ignores_delta_covered_by_base() -> Result<()> {
-        let list_key = FixedBytes::from([4_u8; 32]);
-        let base_cid = raw_block_cid(b"base")?;
-        let retained_delta_cid = raw_block_cid(b"retained delta")?;
-        let current_delta_cid = raw_block_cid(b"current delta")?;
-        let client = AvailabilityClient::new([base_cid, current_delta_cid]);
-        let publications = vec![
-            stored_publication(SnapshotKind::Base, 0, 10, base_cid),
-            stored_publication(SnapshotKind::Delta, 8, 10, retained_delta_cid),
-            stored_publication(SnapshotKind::Delta, 11, 12, current_delta_cid),
-        ];
-
-        let missing = first_missing_publication_cid(&client, &publications, &list_key, 1).await?;
-
-        assert_eq!(missing, None);
-        Ok(())
-    }
-
-    #[test]
-    fn retained_delta_descriptor_includes_range_and_tip_root() -> Result<()> {
-        let delta_cid = raw_block_cid(b"retained delta")?;
-        let publication = stored_publication(SnapshotKind::Delta, 8, 10, delta_cid);
-
-        let descriptor = retained_delta_descriptor(&publication)?;
-
-        assert_eq!(descriptor.artifact.cid, delta_cid.to_string());
-        assert_eq!(descriptor.start_index, 8);
-        assert_eq!(descriptor.end_index, 10);
-        assert_eq!(descriptor.tip_merkleroot, FixedBytes::from([9_u8; 32]));
-        Ok(())
-    }
-
-    #[test]
-    fn manifest_deltas_exclude_retained_deltas_covered_by_base() -> Result<()> {
-        let base_cid = raw_block_cid(b"base")?;
-        let retained_delta_cid = raw_block_cid(b"retained delta")?;
-        let current_delta_cid = raw_block_cid(b"current delta")?;
-        let publications = vec![
-            stored_publication(SnapshotKind::Base, 0, 10, base_cid),
-            stored_publication(SnapshotKind::Delta, 8, 10, retained_delta_cid),
-            stored_publication(SnapshotKind::Delta, 11, 12, current_delta_cid),
-        ];
-        let base = active_base(&publications).expect("active base");
-
-        let deltas = manifest_deltas(&publications, base);
-
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].cid, current_delta_cid.to_string());
-        Ok(())
-    }
-
-    #[test]
-    fn released_alpha_legacy_manifest_fixture_still_verifies_and_decodes() -> Result<()> {
-        const RELEASED_ALPHA_PUBLISHER: [u8; 32] = [
-            0x19, 0x7f, 0x6b, 0x23, 0xe1, 0x6c, 0x85, 0x32, 0xc6, 0xab, 0xc8, 0x38, 0xfa, 0xcd,
-            0x5e, 0xa7, 0x89, 0xbe, 0x0c, 0x76, 0xb2, 0x92, 0x03, 0x34, 0x03, 0x9b, 0xfa, 0x8b,
-            0x3d, 0x36, 0x8d, 0x61,
-        ];
-        let bytes = include_bytes!("../tests/fixtures/released-alpha-poi-manifest-v1.json");
-        let manifest: Manifest = serde_json::from_slice(bytes)?;
-
-        manifest.verify_trusted_signature(&RELEASED_ALPHA_PUBLISHER)?;
-        assert_eq!(
-            serde_json::to_vec(&manifest)?,
-            bytes.strip_suffix(b"\n").unwrap_or(bytes)
-        );
-        assert_eq!(manifest.format_version, 1);
-        assert_eq!(manifest.entries.len(), 1);
-        assert_eq!(manifest.entries[0].current_tip_index, 9);
-        assert_eq!(manifest.entries[0].deltas.len(), 1);
-        assert_eq!(manifest.entries[0].base.cid, "bafy-alpha-1");
-        assert_eq!(manifest.entries[0].deltas[0].cid, "bafy-alpha-2");
-        assert_eq!(manifest.entries[0].blocked_shields.cid, "bafy-alpha-3");
-        Ok(())
     }
 
     #[test]
@@ -3374,60 +2506,6 @@ mod tests {
             compression: Compression::Identity,
             start_root: (start > 0).then_some(FixedBytes::from([4; 32])),
             end_root: FixedBytes::from([5; 32]),
-        }
-    }
-
-    fn stored_publication(
-        kind: SnapshotKind,
-        start_index: u64,
-        end_index: u64,
-        cid: Cid,
-    ) -> StoredPublication {
-        StoredPublication {
-            kind,
-            start_index,
-            end_index,
-            cid: cid.to_string(),
-            byte_size: 1,
-            content_hash: [8_u8; 32],
-            tip_merkleroot: Some([9_u8; 32]),
-            published_at: UNIX_EPOCH,
-        }
-    }
-
-    #[derive(Debug)]
-    struct AvailabilityClient {
-        present: Mutex<HashSet<String>>,
-    }
-
-    impl AvailabilityClient {
-        fn new(cids: impl IntoIterator<Item = Cid>) -> Self {
-            Self {
-                present: Mutex::new(cids.into_iter().map(|cid| cid.to_string()).collect()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl IpfsClient for AvailabilityClient {
-        fn service_name(&self) -> &'static str {
-            "availability"
-        }
-
-        async fn pin_bytes(&self, bytes: &[u8]) -> std::result::Result<Cid, IpfsError> {
-            raw_block_cid(bytes)
-        }
-
-        async fn unpin(&self, _cid: &Cid) -> std::result::Result<(), IpfsError> {
-            Ok(())
-        }
-
-        async fn contains(&self, cid: &Cid) -> std::result::Result<bool, IpfsError> {
-            Ok(self
-                .present
-                .lock()
-                .expect("present CID lock")
-                .contains(&cid.to_string()))
         }
     }
 }

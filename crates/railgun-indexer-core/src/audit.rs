@@ -3,7 +3,6 @@ use crate::manifest::{
     IndexedDatasetKind,
 };
 use crate::publish::ipfs::IpfsClient;
-use crate::snapshot::SnapshotKind;
 use crate::store::IPNS_SEQUENCE_STATE_KEY;
 use alloy_primitives::{FixedBytes, hex};
 use cid::Cid;
@@ -211,24 +210,15 @@ pub struct PendingIndexedManifestPublication {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoiManifestChannel {
-    Legacy,
     V4,
 }
 
 impl PoiManifestChannel {
     const fn label(self) -> &'static str {
         match self {
-            Self::Legacy => "legacy",
             Self::V4 => "v4",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveManifestPublication {
-    pub cid: String,
-    pub sequence: u64,
-    pub ipns_published_at: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,10 +260,7 @@ impl Audit {
     ) -> Result<bool, AuditError> {
         sqlx::query_scalar(
             r"
-            SELECT EXISTS(SELECT 1 FROM published_snapshots WHERE cid = $1 AND unpinned_at IS NULL)
-                OR EXISTS(SELECT 1 FROM published_blocked_shields WHERE cid = $1 AND unpinned_at IS NULL)
-                OR EXISTS(SELECT 1 FROM published_manifests WHERE cid = $1 AND unpinned_at IS NULL)
-                OR EXISTS(SELECT 1 FROM published_indexed_artifacts WHERE cid = $1 AND unpinned_at IS NULL)
+            SELECT EXISTS(SELECT 1 FROM published_indexed_artifacts WHERE cid = $1 AND unpinned_at IS NULL)
                 OR EXISTS(SELECT 1 FROM published_indexed_manifests WHERE cid = $1 AND unpinned_at IS NULL)
                 OR EXISTS(SELECT 1 FROM published_poi_v4_artifacts WHERE cid = $1 AND unpinned_at IS NULL)
                 OR EXISTS(SELECT 1 FROM published_poi_v4_manifests WHERE cid = $1 AND unpinned_at IS NULL)
@@ -345,21 +332,10 @@ impl Audit {
         Ok(())
     }
 
-    pub async fn pending_manifest_publication(
-        pool: &PgPool,
-    ) -> Result<Option<PendingManifestPublication>, AuditError> {
-        pending_manifest_publication(pool, "published_manifests", None).await
-    }
-
     pub async fn pending_poi_artifact_manifest_publication(
         pool: &PgPool,
     ) -> Result<Option<PendingManifestPublication>, AuditError> {
-        pending_manifest_publication(
-            pool,
-            "published_poi_v4_manifests",
-            Some("published_poi_v4_manifest_artifacts"),
-        )
-        .await
+        pending_manifest_publication(pool).await
     }
 
     pub async fn pending_indexed_manifest_publication(
@@ -434,33 +410,6 @@ impl Audit {
             manifest,
             manifest_json,
         }))
-    }
-
-    pub async fn active_manifest_publication(
-        pool: &PgPool,
-    ) -> Result<Option<ActiveManifestPublication>, AuditError> {
-        let row = sqlx::query_as::<_, (String, i64, i64)>(
-            r"
-            SELECT cid, ipns_sequence,
-                   EXTRACT(EPOCH FROM ipns_published_at)::BIGINT
-            FROM published_manifests
-            WHERE ipns_published_at IS NOT NULL
-              AND superseded_at IS NULL
-              AND unpinned_at IS NULL
-            ORDER BY ipns_sequence DESC, id DESC
-            LIMIT 1
-            ",
-        )
-        .fetch_optional(pool)
-        .await?;
-        row.map(|(cid, sequence, published_at)| {
-            Ok(ActiveManifestPublication {
-                cid,
-                sequence: i64_to_u64(sequence, "ipns_sequence")?,
-                ipns_published_at: i64_to_system_time(published_at, "ipns_published_at")?,
-            })
-        })
-        .transpose()
     }
 
     pub async fn active_poi_artifact_manifest_publication(
@@ -873,238 +822,6 @@ impl Audit {
         cid.map(|cid| parse_cid(&cid)).transpose()
     }
 
-    pub async fn record_publication(
-        tx: &mut Transaction<'_, Postgres>,
-        list_key: &FixedBytes<32>,
-        chain_id: u64,
-        upstream_url: &str,
-        kind: SnapshotKind,
-        start_index: u64,
-        end_index: u64,
-        cid: &Cid,
-        byte_size: u64,
-        content_hash: &[u8; 32],
-        format_version: u16,
-        tip_merkleroot: &[u8; 32],
-    ) -> Result<(), AuditError> {
-        let chain_id = u64_to_i64(chain_id, "chain_id")?;
-        let start_index = u64_to_i64(start_index, "start_index")?;
-        let end_index = u64_to_i64(end_index, "end_index")?;
-        let byte_size = u64_to_i64(byte_size, "byte_size")?;
-        let format_version = i32::from(format_version);
-
-        if matches!(kind, SnapshotKind::Base) {
-            sqlx::query(
-                r"
-                UPDATE published_snapshots
-                SET superseded_at = now()
-                WHERE list_key = $1
-                    AND chain_id = $2
-                    AND upstream_url = $3
-                    AND kind = 'base'
-                    AND superseded_at IS NULL
-                ",
-            )
-            .bind(list_key.as_slice())
-            .bind(chain_id)
-            .bind(upstream_url)
-            .execute(&mut **tx)
-            .await?;
-        }
-
-        sqlx::query(
-            r"
-            INSERT INTO published_snapshots (
-                list_key,
-                chain_id,
-                upstream_url,
-                kind,
-                start_index,
-                end_index,
-                cid,
-                byte_size,
-                content_hash,
-                format_version,
-                tip_merkleroot
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ",
-        )
-        .bind(list_key.as_slice())
-        .bind(chain_id)
-        .bind(upstream_url)
-        .bind(snapshot_kind_str(kind))
-        .bind(start_index)
-        .bind(end_index)
-        .bind(cid.to_string())
-        .bind(byte_size)
-        .bind(content_hash.as_slice())
-        .bind(format_version)
-        .bind(tip_merkleroot.as_slice())
-        .execute(&mut **tx)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn record_blocked_shields_publication(
-        tx: &mut Transaction<'_, Postgres>,
-        list_key: &FixedBytes<32>,
-        chain_id: u64,
-        upstream_url: &str,
-        cid: &Cid,
-        byte_size: u64,
-        format_version: u16,
-        content_hash: &[u8; 32],
-    ) -> Result<(), AuditError> {
-        let chain_id = u64_to_i64(chain_id, "chain_id")?;
-        let byte_size = u64_to_i64(byte_size, "byte_size")?;
-        let format_version = i32::from(format_version);
-
-        sqlx::query(
-            r"
-            UPDATE published_blocked_shields
-            SET superseded_at = now()
-            WHERE list_key = $1
-                AND chain_id = $2
-                AND superseded_at IS NULL
-            ",
-        )
-        .bind(list_key.as_slice())
-        .bind(chain_id)
-        .execute(&mut **tx)
-        .await?;
-
-        sqlx::query(
-            r"
-            INSERT INTO published_blocked_shields (
-                list_key,
-                chain_id,
-                upstream_url,
-                cid,
-                byte_size,
-                format_version,
-                content_hash
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ",
-        )
-        .bind(list_key.as_slice())
-        .bind(chain_id)
-        .bind(upstream_url)
-        .bind(cid.to_string())
-        .bind(byte_size)
-        .bind(format_version)
-        .bind(content_hash.as_slice())
-        .execute(&mut **tx)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn record_manifest_pin(
-        tx: &mut Transaction<'_, Postgres>,
-        cid: &Cid,
-        sequence: u64,
-        byte_size: u64,
-        content_hash: &[u8; 32],
-        format_version: u16,
-    ) -> Result<(), AuditError> {
-        let sequence = u64_to_i64(sequence, "sequence")?;
-        let byte_size = u64_to_i64(byte_size, "byte_size")?;
-        let format_version = i32::from(format_version);
-
-        reject_unresolved_pending(tx, "published_manifests", "legacy").await?;
-
-        sqlx::query(
-            r"
-            INSERT INTO published_manifests (
-                cid,
-                ipns_sequence,
-                byte_size,
-                content_hash,
-                format_version
-            )
-            VALUES ($1, $2, $3, $4, $5)
-            ",
-        )
-        .bind(cid.to_string())
-        .bind(sequence)
-        .bind(byte_size)
-        .bind(content_hash.as_slice())
-        .bind(format_version)
-        .execute(&mut **tx)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn record_manifest_ipns_publication(
-        tx: &mut Transaction<'_, Postgres>,
-        cid: &Cid,
-        sequence: u64,
-    ) -> Result<(), AuditError> {
-        let cid = cid.to_string();
-        let sequence = u64_to_i64(sequence, "sequence")?;
-        ensure_newer_than_invalidated_pending(tx, "published_manifests", "legacy", &cid, sequence)
-            .await?;
-        let result = sqlx::query(
-            r"
-            UPDATE published_manifests
-            SET ipns_published_at = COALESCE(ipns_published_at, now())
-            WHERE cid = $1
-                AND ipns_sequence = $2
-                AND superseded_at IS NULL
-                AND unpinned_at IS NULL
-                AND reconciliation_invalidated_at IS NULL
-            ",
-        )
-        .bind(&cid)
-        .bind(sequence)
-        .execute(&mut **tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            let (superseded, unpinned): (bool, bool) = sqlx::query_as(
-                r"
-                SELECT
-                    EXISTS(SELECT 1 FROM published_manifests WHERE cid = $1 AND superseded_at IS NOT NULL),
-                    EXISTS(SELECT 1 FROM published_manifests WHERE cid = $1 AND unpinned_at IS NOT NULL)
-                ",
-            )
-            .bind(&cid)
-            .fetch_one(&mut **tx)
-            .await?;
-            if unpinned {
-                return Err(AuditError::UnpinnedManifest { cid });
-            }
-            if superseded {
-                return Err(AuditError::SupersededManifest { cid });
-            }
-            return Err(AuditError::UnrecordedManifest { cid });
-        }
-
-        sqlx::query(
-            r"
-            UPDATE published_manifests
-            SET superseded_at = now()
-            WHERE superseded_at IS NULL
-              AND (
-                    (cid <> $1 AND ipns_published_at IS NOT NULL)
-                    OR (
-                        reconciliation_invalidated_at IS NOT NULL
-                        AND ipns_sequence < $2
-                    )
-              )
-            ",
-        )
-        .bind(&cid)
-        .bind(sequence)
-        .execute(&mut **tx)
-        .await?;
-
-        Ok(())
-    }
-
     pub async fn record_indexed_artifact_pin(
         tx: &mut Transaction<'_, Postgres>,
         artifact_kind: IndexedArtifactPublicationKind,
@@ -1329,40 +1046,20 @@ async fn invalidate_pending_poi_manifest_reconciliation(
 ) -> Result<(), AuditError> {
     let cid = cid.to_string();
     let sequence = u64_to_i64(sequence, "sequence")?;
-    let unresolved = match channel {
-        PoiManifestChannel::Legacy => {
-            sqlx::query_as::<_, (i64, String, i64)>(
-                r"
-                SELECT id, cid, ipns_sequence
-                FROM published_manifests
-                WHERE ipns_published_at IS NULL
-                  AND superseded_at IS NULL
-                  AND unpinned_at IS NULL
-                  AND reconciliation_invalidated_at IS NULL
-                ORDER BY id
-                FOR UPDATE
-                ",
-            )
-            .fetch_all(&mut **tx)
-            .await?
-        }
-        PoiManifestChannel::V4 => {
-            sqlx::query_as::<_, (i64, String, i64)>(
-                r"
-                SELECT id, cid, ipns_sequence
-                FROM published_poi_v4_manifests
-                WHERE ipns_published_at IS NULL
-                  AND superseded_at IS NULL
-                  AND unpinned_at IS NULL
-                  AND reconciliation_invalidated_at IS NULL
-                ORDER BY id
-                FOR UPDATE
-                ",
-            )
-            .fetch_all(&mut **tx)
-            .await?
-        }
-    };
+    let unresolved = sqlx::query_as::<_, (i64, String, i64)>(
+        r"
+        SELECT id, cid, ipns_sequence
+        FROM published_poi_v4_manifests
+        WHERE ipns_published_at IS NULL
+          AND superseded_at IS NULL
+          AND unpinned_at IS NULL
+          AND reconciliation_invalidated_at IS NULL
+        ORDER BY id
+        FOR UPDATE
+        ",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     if unresolved.len() > 1 {
         return Err(AuditError::AmbiguousPendingManifests {
             channel: channel.label(),
@@ -1377,40 +1074,20 @@ async fn invalidate_pending_poi_manifest_reconciliation(
                 sequence: i64_to_u64(sequence, "sequence")?,
             });
         }
-        let result = match channel {
-            PoiManifestChannel::Legacy => {
-                sqlx::query(
-                    r"
-                    UPDATE published_manifests
-                    SET reconciliation_invalidated_at = now()
-                    WHERE id = $1
-                      AND ipns_published_at IS NULL
-                      AND superseded_at IS NULL
-                      AND unpinned_at IS NULL
-                      AND reconciliation_invalidated_at IS NULL
-                    ",
-                )
-                .bind(id)
-                .execute(&mut **tx)
-                .await?
-            }
-            PoiManifestChannel::V4 => {
-                sqlx::query(
-                    r"
-                    UPDATE published_poi_v4_manifests
-                    SET reconciliation_invalidated_at = now()
-                    WHERE id = $1
-                      AND ipns_published_at IS NULL
-                      AND superseded_at IS NULL
-                      AND unpinned_at IS NULL
-                      AND reconciliation_invalidated_at IS NULL
-                    ",
-                )
-                .bind(id)
-                .execute(&mut **tx)
-                .await?
-            }
-        };
+        let result = sqlx::query(
+            r"
+            UPDATE published_poi_v4_manifests
+            SET reconciliation_invalidated_at = now()
+            WHERE id = $1
+              AND ipns_published_at IS NULL
+              AND superseded_at IS NULL
+              AND unpinned_at IS NULL
+              AND reconciliation_invalidated_at IS NULL
+            ",
+        )
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
         if result.rows_affected() != 1 {
             return Err(AuditError::PendingManifestAuthorizationMismatch {
                 channel: channel.label(),
@@ -1434,44 +1111,22 @@ async fn invalidate_pending_poi_manifest_reconciliation(
         return Ok(());
     }
 
-    let states = match channel {
-        PoiManifestChannel::Legacy => {
-            sqlx::query_as::<_, (bool, bool, bool, bool)>(
-                r"
-                SELECT ipns_published_at IS NOT NULL,
-                       superseded_at IS NOT NULL,
-                       unpinned_at IS NOT NULL,
-                       reconciliation_invalidated_at IS NOT NULL
-                FROM published_manifests
-                WHERE cid = $1 AND ipns_sequence = $2
-                ORDER BY id
-                FOR UPDATE
-                ",
-            )
-            .bind(&cid)
-            .bind(sequence)
-            .fetch_all(&mut **tx)
-            .await?
-        }
-        PoiManifestChannel::V4 => {
-            sqlx::query_as::<_, (bool, bool, bool, bool)>(
-                r"
-                SELECT ipns_published_at IS NOT NULL,
-                       superseded_at IS NOT NULL,
-                       unpinned_at IS NOT NULL,
-                       reconciliation_invalidated_at IS NOT NULL
-                FROM published_poi_v4_manifests
-                WHERE cid = $1 AND ipns_sequence = $2
-                ORDER BY id
-                FOR UPDATE
-                ",
-            )
-            .bind(&cid)
-            .bind(sequence)
-            .fetch_all(&mut **tx)
-            .await?
-        }
-    };
+    let states = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        r"
+        SELECT ipns_published_at IS NOT NULL,
+               superseded_at IS NOT NULL,
+               unpinned_at IS NOT NULL,
+               reconciliation_invalidated_at IS NOT NULL
+        FROM published_poi_v4_manifests
+        WHERE cid = $1 AND ipns_sequence = $2
+        ORDER BY id
+        FOR UPDATE
+        ",
+    )
+    .bind(&cid)
+    .bind(sequence)
+    .fetch_all(&mut **tx)
+    .await?;
     if states.len() > 1 {
         return Err(AuditError::AmbiguousPendingManifests {
             channel: channel.label(),
@@ -1506,72 +1161,41 @@ async fn invalidate_pending_poi_manifest_reconciliation(
 
 async fn pending_manifest_publication(
     pool: &PgPool,
-    manifest_table: &'static str,
-    artifact_table: Option<&'static str>,
 ) -> Result<Option<PendingManifestPublication>, AuditError> {
-    let rows = match manifest_table {
-        "published_manifests" => {
-            sqlx::query_as::<_, (i64, String, i64)>(
-                r"
-                SELECT id, cid, ipns_sequence
-                FROM published_manifests
-                WHERE ipns_published_at IS NULL
-                  AND superseded_at IS NULL
-                  AND unpinned_at IS NULL
-                  AND reconciliation_invalidated_at IS NULL
-                ORDER BY ipns_sequence DESC, id DESC
-                LIMIT 2
-                ",
-            )
-            .fetch_all(pool)
-            .await?
-        }
-        "published_poi_v4_manifests" => {
-            sqlx::query_as::<_, (i64, String, i64)>(
-                r"
-                SELECT id, cid, ipns_sequence
-                FROM published_poi_v4_manifests
-                WHERE ipns_published_at IS NULL
-                  AND superseded_at IS NULL
-                  AND unpinned_at IS NULL
-                  AND reconciliation_invalidated_at IS NULL
-                ORDER BY ipns_sequence DESC, id DESC
-                LIMIT 2
-                ",
-            )
-            .fetch_all(pool)
-            .await?
-        }
-        _ => unreachable!("pending manifest table is fixed by the audit API"),
-    };
+    let rows = sqlx::query_as::<_, (i64, String, i64)>(
+        r"
+        SELECT id, cid, ipns_sequence
+        FROM published_poi_v4_manifests
+        WHERE ipns_published_at IS NULL
+          AND superseded_at IS NULL
+          AND unpinned_at IS NULL
+          AND reconciliation_invalidated_at IS NULL
+        ORDER BY ipns_sequence DESC, id DESC
+        LIMIT 2
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
     if rows.len() > 1 {
         return Err(AuditError::AmbiguousPendingManifests {
-            channel: if artifact_table.is_some() {
-                "v4"
-            } else {
-                "legacy"
-            },
+            channel: "v4",
             count: rows.len(),
         });
     }
     let Some((manifest_id, cid, sequence)) = rows.into_iter().next() else {
         return Ok(None);
     };
-    let artifact_cids = if artifact_table.is_some() {
-        sqlx::query_scalar::<_, String>(
-            r"
-            SELECT artifact_cid
-            FROM published_poi_v4_manifest_artifacts
-            WHERE manifest_id = $1
-            ORDER BY artifact_cid
-            ",
-        )
-        .bind(manifest_id)
-        .fetch_all(pool)
-        .await?
-    } else {
-        Vec::new()
-    };
+    let artifact_cids = sqlx::query_scalar::<_, String>(
+        r"
+        SELECT artifact_cid
+        FROM published_poi_v4_manifest_artifacts
+        WHERE manifest_id = $1
+        ORDER BY artifact_cid
+        ",
+    )
+    .bind(manifest_id)
+    .fetch_all(pool)
+    .await?;
     Ok(Some(PendingManifestPublication {
         cid,
         sequence: i64_to_u64(sequence, "ipns_sequence")?,
@@ -1585,21 +1209,6 @@ async fn reject_unresolved_pending(
     channel: &'static str,
 ) -> Result<(), AuditError> {
     let row = match manifest_table {
-        "published_manifests" => {
-            sqlx::query_as::<_, (String, i64)>(
-                r"
-                SELECT cid, ipns_sequence
-                FROM published_manifests
-                WHERE ipns_published_at IS NULL
-                  AND superseded_at IS NULL
-                  AND unpinned_at IS NULL
-                  AND reconciliation_invalidated_at IS NULL
-                LIMIT 1
-                ",
-            )
-            .fetch_optional(&mut **tx)
-            .await?
-        }
         "published_poi_v4_manifests" => {
             sqlx::query_as::<_, (String, i64)>(
                 r"
@@ -1650,18 +1259,6 @@ async fn ensure_newer_than_invalidated_pending(
     sequence: i64,
 ) -> Result<(), AuditError> {
     let invalidated_sequence = match manifest_table {
-        "published_manifests" => {
-            sqlx::query_scalar::<_, Option<i64>>(
-                r"
-                SELECT MAX(ipns_sequence)
-                FROM published_manifests
-                WHERE reconciliation_invalidated_at IS NOT NULL
-                  AND superseded_at IS NULL
-                ",
-            )
-            .fetch_one(&mut **tx)
-            .await?
-        }
         "published_poi_v4_manifests" => {
             sqlx::query_scalar::<_, Option<i64>>(
                 r"
@@ -1728,60 +1325,9 @@ impl Retention {
         let swept_at = unix_seconds(now)?;
         let (mut unpinned_cids, mut failed_cids) =
             retry_pin_cleanup_debt(pool, ipfs_client, coordinator).await?;
-        sqlx::query(
-            r"
-            UPDATE published_snapshots AS delta
-            SET superseded_at = to_timestamp($2)
-            WHERE delta.kind = 'delta'
-                AND delta.superseded_at IS NULL
-                AND EXISTS (
-                    SELECT 1
-                    FROM published_snapshots AS active_base
-                    WHERE active_base.list_key = delta.list_key
-                        AND active_base.chain_id = delta.chain_id
-                        AND active_base.upstream_url = delta.upstream_url
-                        AND active_base.kind = 'base'
-                        AND active_base.superseded_at IS NULL
-                        AND active_base.end_index >= delta.end_index
-                )
-                AND EXISTS (
-                    SELECT 1
-                    FROM published_snapshots AS retained_base
-                    WHERE retained_base.list_key = delta.list_key
-                        AND retained_base.chain_id = delta.chain_id
-                        AND retained_base.upstream_url = delta.upstream_url
-                        AND retained_base.kind = 'base'
-                        AND retained_base.unpinned_at IS NULL
-                        AND retained_base.end_index >= delta.end_index
-                        AND retained_base.published_at <= to_timestamp($1)
-                )
-            ",
-        )
-        .bind(cutoff)
-        .bind(swept_at)
-        .execute(pool)
-        .await?;
         let cids = sqlx::query_scalar::<_, String>(
             r"
             WITH candidates AS (
-                SELECT cid
-                FROM published_snapshots
-                WHERE superseded_at IS NOT NULL
-                    AND superseded_at <= to_timestamp($1)
-                    AND unpinned_at IS NULL
-                UNION
-                SELECT cid
-                FROM published_blocked_shields
-                WHERE superseded_at IS NOT NULL
-                    AND superseded_at <= to_timestamp($1)
-                    AND unpinned_at IS NULL
-                UNION
-                SELECT cid
-                FROM published_manifests
-                WHERE unpinned_at IS NULL
-                    AND superseded_at IS NOT NULL
-                    AND superseded_at <= to_timestamp($1)
-                UNION
                 SELECT cid
                 FROM published_indexed_manifests
                 WHERE unpinned_at IS NULL
@@ -1809,25 +1355,6 @@ impl Retention {
             SELECT DISTINCT candidates.cid
             FROM candidates
             WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM published_snapshots AS active
-                    WHERE active.cid = candidates.cid
-                        AND active.superseded_at IS NULL
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM published_blocked_shields AS active
-                    WHERE active.cid = candidates.cid
-                        AND active.superseded_at IS NULL
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM published_manifests AS active
-                    WHERE active.cid = candidates.cid
-                        AND active.ipns_published_at IS NOT NULL
-                        AND active.superseded_at IS NULL
-                )
-                AND NOT EXISTS (
                     SELECT 1
                     FROM published_indexed_manifests AS active
                     WHERE active.cid = candidates.cid
@@ -1891,30 +1418,6 @@ impl Retention {
                     (
                         EXISTS (
                             SELECT 1
-                            FROM published_snapshots
-                            WHERE cid = $1
-                                AND superseded_at IS NOT NULL
-                                AND superseded_at <= to_timestamp($2)
-                                AND unpinned_at IS NULL
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM published_blocked_shields
-                            WHERE cid = $1
-                                AND superseded_at IS NOT NULL
-                                AND superseded_at <= to_timestamp($2)
-                                AND unpinned_at IS NULL
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM published_manifests
-                            WHERE cid = $1
-                                AND unpinned_at IS NULL
-                                AND superseded_at IS NOT NULL
-                                AND superseded_at <= to_timestamp($2)
-                        )
-                        OR EXISTS (
-                            SELECT 1
                             FROM published_indexed_manifests
                             WHERE cid = $1
                                 AND unpinned_at IS NULL
@@ -1944,25 +1447,6 @@ impl Retention {
                             GROUP BY cid
                             HAVING MAX(last_referenced_at) <= to_timestamp($2)
                         )
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_snapshots AS active
-                        WHERE active.cid = $1
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_blocked_shields AS active
-                        WHERE active.cid = $1
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_manifests AS active
-                        WHERE active.cid = $1
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
                     )
                     AND NOT EXISTS (
                         SELECT 1
@@ -2032,175 +1516,12 @@ impl Retention {
             }
             sqlx::query(
                 r"
-                UPDATE published_snapshots
-                SET unpinned_at = to_timestamp($1)
-                WHERE cid = $2
-                    AND superseded_at IS NOT NULL
-                    AND superseded_at <= to_timestamp($3)
-                    AND unpinned_at IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_snapshots AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_blocked_shields AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_artifacts AS active
-                        WHERE active.cid = $2
-                            AND active.unpinned_at IS NULL
-                            AND active.last_referenced_at > to_timestamp($3)
-                    )
-                ",
-            )
-            .bind(swept_at)
-            .bind(&cid_text)
-            .bind(cutoff)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                r"
-                UPDATE published_blocked_shields
-                SET unpinned_at = to_timestamp($1)
-                WHERE cid = $2
-                    AND superseded_at IS NOT NULL
-                    AND superseded_at <= to_timestamp($3)
-                    AND unpinned_at IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_snapshots AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_blocked_shields AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_artifacts AS active
-                        WHERE active.cid = $2
-                            AND active.unpinned_at IS NULL
-                            AND active.last_referenced_at > to_timestamp($3)
-                    )
-                ",
-            )
-            .bind(swept_at)
-            .bind(&cid_text)
-            .bind(cutoff)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                r"
-                UPDATE published_manifests
-                SET unpinned_at = to_timestamp($1)
-                WHERE cid = $2
-                    AND unpinned_at IS NULL
-                    AND superseded_at IS NOT NULL
-                    AND superseded_at <= to_timestamp($3)
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_snapshots AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_blocked_shields AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_artifacts AS active
-                        WHERE active.cid = $2
-                            AND active.unpinned_at IS NULL
-                            AND active.last_referenced_at > to_timestamp($3)
-                    )
-                ",
-            )
-            .bind(swept_at)
-            .bind(&cid_text)
-            .bind(cutoff)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                r"
                 UPDATE published_indexed_manifests
                 SET unpinned_at = to_timestamp($1)
                 WHERE cid = $2
                     AND unpinned_at IS NULL
                     AND superseded_at IS NOT NULL
                     AND superseded_at <= to_timestamp($3)
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_snapshots AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_blocked_shields AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
                     AND NOT EXISTS (
                         SELECT 1
                         FROM published_indexed_manifests AS active
@@ -2229,25 +1550,6 @@ impl Retention {
                 WHERE cid = $2
                     AND unpinned_at IS NULL
                     AND last_referenced_at <= to_timestamp($3)
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_snapshots AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_blocked_shields AS active
-                        WHERE active.cid = $2
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_manifests AS active
-                        WHERE active.cid = $2
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
                     AND NOT EXISTS (
                         SELECT 1
                         FROM published_indexed_manifests AS active
@@ -2452,13 +1754,6 @@ pub enum AuditError {
     PoiArtifactConflict { cid: String, byte_size: u64 },
     #[error("POI v4 manifest references {expected} artifacts but only {actual} remain live")]
     MissingManifestArtifacts { expected: usize, actual: usize },
-}
-
-const fn snapshot_kind_str(kind: SnapshotKind) -> &'static str {
-    match kind {
-        SnapshotKind::Base => "base",
-        SnapshotKind::Delta => "delta",
-    }
 }
 
 const fn indexed_artifact_publication_kind_str(

@@ -3,7 +3,7 @@ railgun_indexer:
   # PostgreSQL connection string used for durable indexer state.
   postgres_connection_string: "postgres://railgun_indexer:railgun_indexer@localhost:5432/railgun_indexer"
 
-  # IPFS or pinning-service endpoint used for snapshot and manifest publication.
+  # IPFS or pinning-service endpoint used for artifact and manifest publication.
   ipfs_endpoint: "https://api.example-ipfs.invalid"
 
   # Plain ed25519 signing key file used for manifest signing and IPNS publication.
@@ -68,10 +68,10 @@ poi:
   # Cadence for full blocked-shield refreshes. This runs separately from event sync.
   blocked_shield_resync_interval: "30m"
 
-  # Cadence for publishing delta snapshots after new events are indexed.
+  # POI publication tick. Each tick publishes a new POI manifest when the graph changed.
   delta_publish_interval: "10m"
 
-  # Cadence for rebuilding the base snapshot and resetting the delta chain.
+  # Age at which the POI checkpoint rotates and the previous current tail becomes a bridge.
   base_rebuild_interval: "24h"
 
   # Maximum number of (list_key, chain_id) pairs synced concurrently.

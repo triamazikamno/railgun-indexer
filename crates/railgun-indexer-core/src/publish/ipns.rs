@@ -248,22 +248,15 @@ impl IpnsPublisher {
 }
 
 pub fn validate_publisher_identities(
-    legacy_poi: &IpnsPublisher,
     v4_poi: &IpnsPublisher,
     chain_indexed: &IpnsPublisher,
 ) -> Result<(), IpnsError> {
-    for (left_label, left, right_label, right) in [
-        ("legacy POI", legacy_poi, "v4 POI", v4_poi),
-        ("legacy POI", legacy_poi, "chain-indexed", chain_indexed),
-        ("v4 POI", v4_poi, "chain-indexed", chain_indexed),
-    ] {
-        if left.peer_id == right.peer_id {
-            return Err(IpnsError::PublisherIdentityCollision {
-                left: left_label,
-                right: right_label,
-                peer_id: left.peer_id,
-            });
-        }
+    if v4_poi.peer_id == chain_indexed.peer_id {
+        return Err(IpnsError::PublisherIdentityCollision {
+            left: "v4 POI",
+            right: "chain-indexed",
+            peer_id: v4_poi.peer_id,
+        });
     }
 
     Ok(())
@@ -1103,26 +1096,17 @@ mod tests {
 
     #[test]
     fn every_publisher_identity_collision_is_rejected() {
-        let (legacy, _legacy_task) =
-            IpnsPublisher::new(&SigningKey::from_bytes(&[1; 32]), test_config())
-                .expect("legacy publisher");
         let (v4, _v4_task) = IpnsPublisher::new(&SigningKey::from_bytes(&[2; 32]), test_config())
             .expect("v4 publisher");
         let (chain, _chain_task) =
             IpnsPublisher::new(&SigningKey::from_bytes(&[3; 32]), test_config())
                 .expect("chain publisher");
-        for (legacy_candidate, v4_candidate, chain_candidate) in [
-            (&legacy, &legacy, &chain),
-            (&legacy, &v4, &legacy),
-            (&legacy, &v4, &v4),
-        ] {
-            assert!(matches!(
-                validate_publisher_identities(legacy_candidate, v4_candidate, chain_candidate),
-                Err(IpnsError::PublisherIdentityCollision { .. })
-            ));
-        }
+        assert!(matches!(
+            validate_publisher_identities(&v4, &v4),
+            Err(IpnsError::PublisherIdentityCollision { .. })
+        ));
 
-        validate_publisher_identities(&legacy, &v4, &chain).expect("three distinct identities");
+        validate_publisher_identities(&v4, &chain).expect("distinct identities");
     }
 
     #[test]

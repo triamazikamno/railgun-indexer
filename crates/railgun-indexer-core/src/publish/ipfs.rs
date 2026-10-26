@@ -32,14 +32,6 @@ pub trait IpfsClient: Send + Sync {
     async fn contains(&self, cid: &Cid) -> Result<bool, IpfsError>;
 }
 
-pub async fn pin_snapshot_file(client: &dyn IpfsClient, bytes: &[u8]) -> Result<Cid, IpfsError> {
-    client.pin_bytes(bytes).await
-}
-
-pub async fn pin_blocked_shields(client: &dyn IpfsClient, bytes: &[u8]) -> Result<Cid, IpfsError> {
-    client.pin_bytes(bytes).await
-}
-
 pub async fn pin_indexed_chunk(client: &dyn IpfsClient, bytes: &[u8]) -> Result<Cid, IpfsError> {
     client.pin_bytes(bytes).await
 }
@@ -715,26 +707,14 @@ mod tests {
         };
         let ipfs_client: &dyn IpfsClient = &client;
 
-        let snapshot_cid = pin_snapshot_file(ipfs_client, b"snapshot")
-            .await
-            .expect("pin snapshot");
-        let blocked_cid = pin_blocked_shields(ipfs_client, b"blocked")
-            .await
-            .expect("pin blocked shields");
         let manifest_cid = pin_manifest(ipfs_client, b"manifest")
             .await
             .expect("pin manifest");
 
-        assert_eq!(snapshot_cid, client.cid);
-        assert_eq!(blocked_cid, client.cid);
         assert_eq!(manifest_cid, client.cid);
         assert_eq!(
             client.calls.lock().expect("calls lock").as_slice(),
-            &[
-                b"snapshot".to_vec(),
-                b"blocked".to_vec(),
-                b"manifest".to_vec()
-            ]
+            &[b"manifest".to_vec()]
         );
     }
 

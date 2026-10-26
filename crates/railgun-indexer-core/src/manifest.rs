@@ -1,6 +1,5 @@
 pub use poi::artifacts::manifest::{
-    ArtifactDescriptor, Manifest, ManifestEntry, ManifestError, RetainedDeltaDescriptor,
-    content_hash, load_publisher_signing_key,
+    ArtifactDescriptor, ManifestError, content_hash, load_publisher_signing_key,
 };
 
 pub use railgun_indexed_artifacts::{

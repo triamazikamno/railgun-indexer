@@ -10,12 +10,9 @@ pub type SharedStatus = Arc<RwLock<Status>>;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub pairs: Vec<PairSyncStatus>,
-    pub last_published_manifest_cid: Option<String>,
     pub ipfs_reachable: bool,
-    pub poi_ipns_name: Option<String>,
     pub poi_v4_ipns_name: Option<String>,
     pub chain_indexed_ipns_name: Option<String>,
-    pub poi_peer_id: Option<String>,
     pub poi_v4_peer_id: Option<String>,
     pub chain_indexed_peer_id: Option<String>,
     #[serde(rename = "poi_v4_publication")]
@@ -41,12 +38,9 @@ impl Status {
 
         Self {
             pairs,
-            last_published_manifest_cid: None,
             ipfs_reachable: false,
-            poi_ipns_name: None,
             poi_v4_ipns_name: None,
             chain_indexed_ipns_name: None,
-            poi_peer_id: None,
             poi_v4_peer_id: None,
             chain_indexed_peer_id: None,
             poi_artifact_publication: None,
@@ -98,28 +92,19 @@ impl Status {
         };
     }
 
-    pub fn record_manifest_publication(&mut self, manifest_cid: impl Into<String>) {
-        self.last_published_manifest_cid = Some(manifest_cid.into());
-        self.ipfs_reachable = true;
-    }
-
     pub const fn set_ipfs_reachable(&mut self, reachable: bool) {
         self.ipfs_reachable = reachable;
     }
 
     pub fn set_ipns_identities(
         &mut self,
-        poi_ipns_name: impl Into<String>,
         poi_v4_ipns_name: impl Into<String>,
         chain_indexed_ipns_name: impl Into<String>,
-        poi_peer_id: impl Into<String>,
         poi_v4_peer_id: impl Into<String>,
         chain_indexed_peer_id: impl Into<String>,
     ) {
-        self.poi_ipns_name = Some(poi_ipns_name.into());
         self.poi_v4_ipns_name = Some(poi_v4_ipns_name.into());
         self.chain_indexed_ipns_name = Some(chain_indexed_ipns_name.into());
-        self.poi_peer_id = Some(poi_peer_id.into());
         self.poi_v4_peer_id = Some(poi_v4_peer_id.into());
         self.chain_indexed_peer_id = Some(chain_indexed_peer_id.into());
     }
