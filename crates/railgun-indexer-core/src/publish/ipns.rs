@@ -117,7 +117,9 @@ pub struct V4PoiPublicIdentity {
     pub ipns_name: String,
 }
 
+// async_trait marks the boxed futures `#[must_use]`.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait ManifestIpnsPublisher: Send + Sync {
     async fn publish_manifest_cid(
         &self,

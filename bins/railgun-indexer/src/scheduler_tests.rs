@@ -412,7 +412,7 @@ async fn pending_v4_survives_activation_failure_retention_and_restart() -> Resul
         &PinLifecycleCoordinator::default(),
     )
     .await?;
-    assert!(sweep.unpinned_cids.is_empty());
+    assert_eq!(sweep.unpinned_cids, [] as [Cid; 0]);
     drop_v4_activation_failure(store.pool()).await?;
 
     let mut restarted = scheduler(
@@ -700,7 +700,7 @@ async fn pending_graph_is_retention_protected_while_ipns_is_blocked() -> Result<
         &PinLifecycleCoordinator::default(),
     )
     .await?;
-    assert!(sweep.unpinned_cids.is_empty());
+    assert_eq!(sweep.unpinned_cids, [] as [Cid; 0]);
     v4.release.notify_waiters();
     publication.await??;
     Ok(())

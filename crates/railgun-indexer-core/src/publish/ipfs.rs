@@ -21,7 +21,9 @@ const FILEBASE_CID_HEADER: &str = "x-amz-meta-cid";
 
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
+// async_trait marks the boxed futures `#[must_use]`.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait IpfsClient: Send + Sync {
     fn service_name(&self) -> &'static str;
 
@@ -800,7 +802,7 @@ mod tests {
                 assert_eq!(mismatches.len(), 1);
                 assert_eq!(mismatches[0].service, "second");
                 assert_eq!(mismatches[0].returned, wrong);
-                assert!(failures.is_empty());
+                assert_eq!(failures, [] as [PinningServiceFailure; 0]);
             }
             other => panic!("unexpected error: {other:?}"),
         }

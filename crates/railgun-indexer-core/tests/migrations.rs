@@ -32,8 +32,9 @@ use railgun_indexer_core::manifest::{
 use railgun_indexer_core::publication_sequence::PoiPublicationSequenceAllocator;
 use railgun_indexer_core::publish::ipfs::{IpfsClient, IpfsError, raw_block_cid};
 use railgun_indexer_core::store::{
-    IndexedDatasetKind, PublicTxidUnshieldPreimageUpdate, Store, StoreError,
-    StoredCommitmentFamily, StoredWalletScanTimestampBackfill, run_migrations,
+    IndexedDatasetKind, PublicTxidUnshieldPreimageUpdate, Store, StoreError, StoredBlockRange,
+    StoredCommitmentFamily, StoredMissingPublicTxidUnshieldPreimage,
+    StoredWalletScanTimestampBackfill, run_migrations,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::collections::BTreeMap;
@@ -1079,7 +1080,7 @@ async fn v15_to_v17_invalidates_bodyless_indexed_pending_and_replaces_at_higher_
         Duration::from_secs(50),
     )
     .await?;
-    assert!(protected.unpinned_cids.is_empty());
+    assert_eq!(protected.unpinned_cids, [] as [Cid; 0]);
 
     let (equal_manifest, equal_json) = signed_indexed_manifest(17)?;
     let mut tx = store.begin().await?;
@@ -1667,11 +1668,11 @@ async fn unshield_preimage_migration_backfill_and_new_ingest_roundtrip()
         1
     );
     tx.commit().await?;
-    assert!(
+    assert_eq!(
         store
             .missing_public_txid_unshield_preimages(0, 1, railgun_contract, 0, 200)
-            .await?
-            .is_empty()
+            .await?,
+        [] as [StoredMissingPublicTxidUnshieldPreimage; 0]
     );
     assert_eq!(
         store
@@ -2098,7 +2099,7 @@ async fn indexed_artifact_reuse_and_sparse_wallet_ranges() -> Result<(), Box<dyn
     let empty_ranges = store
         .wallet_scan_populated_block_ranges(0, 1, railgun_contract, 106, 355, 100)
         .await?;
-    assert!(empty_ranges.is_empty());
+    assert_eq!(empty_ranges, [] as [StoredBlockRange; 0]);
 
     Ok(())
 }
@@ -2330,7 +2331,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         Duration::from_secs(50),
     )
     .await?;
-    assert!(second_sweep.unpinned_cids.is_empty());
+    assert_eq!(second_sweep.unpinned_cids, [] as [Cid; 0]);
     assert_eq!(ipfs_client.unpinned_cids(), expected);
 
     Ok(())
@@ -2664,7 +2665,7 @@ async fn v15_invalidated_manifests_and_v4_descendants_wait_for_newer_channel_act
         Duration::from_secs(50),
     )
     .await?;
-    assert!(before_replacement.unpinned_cids.is_empty());
+    assert_eq!(before_replacement.unpinned_cids, [] as [Cid; 0]);
 
     let replacement_sequence = store.reserve_poi_publication_sequence(1).await?;
     assert_eq!(replacement_sequence, 2);

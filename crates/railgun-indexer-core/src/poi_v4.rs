@@ -373,9 +373,9 @@ mod tests {
             checkpoint_catalog(corpus.scope().clone(), Vec::new()).expect("empty catalog");
 
         assert_eq!(corpus.event_count(), 0);
-        assert!(catalog.chunks.is_empty());
+        assert_eq!(catalog.chunks, [] as [EventArtifactDescriptor; 0]);
         assert!(catalog.range.is_none());
-        assert!(!bytes.is_empty());
+        assert_ne!(bytes, [] as [u8; 0]);
     }
 
     #[test]

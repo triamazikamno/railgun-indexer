@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,9 +8,10 @@ use alloy::eips::BlockNumberOrTag;
 use alloy::hex;
 use alloy::primitives::FixedBytes;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use alloy::pubsub::SubscriptionStream;
 use alloy::sol_types::SolEvent;
 use alloy::transports::TransportError;
-use alloy_rpc_types_eth::Filter;
+use alloy_rpc_types_eth::{Filter, Log};
 use broadcaster_core::contracts::railgun::{
     CommitmentBatch, GeneratedCommitmentBatch, Nullified, Nullifiers, RailgunLegacyShieldEvents,
     Shield, Transact,
@@ -17,7 +19,7 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use ed25519_dalek::SigningKey;
 use eyre::{Result, WrapErr, eyre};
-use futures_util::{StreamExt, future::join_all};
+use futures_util::{FutureExt, StreamExt, future::join_all};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -156,6 +158,8 @@ async fn run_chain_indexing_loop(
     let mut max_batch_span = configured_batch_span;
     let mut batch_span = configured_batch_span;
     let mut historical_catch_up_complete = false;
+    let mut tail_subscription = None;
+    let mut known_safe_head = None;
 
     loop {
         if shutdown_requested(&shutdown) {
@@ -180,6 +184,7 @@ async fn run_chain_indexing_loop(
             &canonicality,
             requested_batch_span,
             provider_mode,
+            known_safe_head.take(),
         )
         .await
         {
@@ -196,32 +201,36 @@ async fn run_chain_indexing_loop(
                 if indexing_lag_blocks == 0 {
                     historical_catch_up_complete = true;
                     batch_span = max_batch_span;
-                    if wait_for_tail_wakeup(
+                    match wait_for_tail_wakeup(
                         &config,
                         &runtime,
+                        &mut tail_subscription,
                         tail_safety_interval,
                         idle_interval,
                         &mut shutdown,
                     )
                     .await
                     {
-                        return Ok(());
+                        ControlFlow::Break(()) => return Ok(()),
+                        ControlFlow::Continue(safe_head) => known_safe_head = safe_head,
                     }
                 }
             }
             Ok(ChainIndexStep::CaughtUp) => {
                 historical_catch_up_complete = true;
                 batch_span = max_batch_span;
-                if wait_for_tail_wakeup(
+                match wait_for_tail_wakeup(
                     &config,
                     &runtime,
+                    &mut tail_subscription,
                     tail_safety_interval,
                     idle_interval,
                     &mut shutdown,
                 )
                 .await
                 {
-                    return Ok(());
+                    ControlFlow::Break(()) => return Ok(()),
+                    ControlFlow::Continue(safe_head) => known_safe_head = safe_head,
                 }
             }
             Err(error) => {
@@ -261,28 +270,47 @@ async fn run_chain_indexing_loop(
     }
 }
 
+/// Websocket provider kept alive alongside its log stream and reused across waits. The next
+/// wait recreates it after the stream ends or an idle safety timeout, because Alloy's reconnect
+/// does not retry a failed resubscribe and can leave the stream open with no subscription.
+type TailLogSubscription = (RootProvider, SubscriptionStream<Log>);
+
+/// `Break` on shutdown; otherwise `Continue` with the safe head when one was
+/// already fetched while waiting.
+type TailWakeup = ControlFlow<(), Option<u64>>;
+
+const fn tail_wakeup_after_sleep(shutdown: bool) -> TailWakeup {
+    if shutdown {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(None)
+    }
+}
+
 async fn wait_for_tail_wakeup(
     config: &Config,
     runtime: &ChainRuntime,
+    subscription: &mut Option<TailLogSubscription>,
     tail_safety_interval: Duration,
     finality_poll_interval: Duration,
     shutdown: &mut watch::Receiver<bool>,
-) -> bool {
+) -> TailWakeup {
     let Some(ws_url) = runtime.chain.ws_url.as_deref() else {
-        return sleep_or_shutdown(tail_safety_interval, shutdown).await;
+        return tail_wakeup_after_sleep(sleep_or_shutdown(tail_safety_interval, shutdown).await);
     };
 
     match wait_for_ws_log_or_safety_interval(
         config,
         runtime,
         ws_url,
+        subscription,
         tail_safety_interval,
         finality_poll_interval,
         shutdown,
     )
     .await
     {
-        Ok(shutdown) => shutdown,
+        Ok(wakeup) => wakeup,
         Err(error) => {
             warn!(
                 chain_id = runtime.chain.chain_id,
@@ -291,65 +319,94 @@ async fn wait_for_tail_wakeup(
                 error = %format_report_chain(&error),
                 "chain-indexed websocket subscription failed; using safety interval fallback"
             );
-            sleep_or_shutdown(tail_safety_interval, shutdown).await
+            tail_wakeup_after_sleep(sleep_or_shutdown(tail_safety_interval, shutdown).await)
         }
     }
+}
+
+async fn subscribe_tail_logs(runtime: &ChainRuntime, ws_url: &str) -> Result<TailLogSubscription> {
+    let ws = WsConnect::new(ws_url.to_string());
+    let provider = ProviderBuilder::new()
+        .connect_ws(ws)
+        .await
+        .wrap_err("connect chain-indexed websocket provider")?
+        .root()
+        .clone();
+    let filter = chain_index_subscription_filter(runtime);
+    let subscription = provider
+        .subscribe_logs(&filter)
+        .await
+        .wrap_err("subscribe to chain-indexed Railgun logs")?;
+    debug!(
+        chain_id = runtime.chain.chain_id,
+        railgun_contract = %runtime.chain.railgun_contract,
+        ws_url,
+        "subscribed to chain-indexed websocket logs"
+    );
+    Ok((provider, subscription.into_stream()))
 }
 
 async fn wait_for_ws_log_or_safety_interval(
     config: &Config,
     runtime: &ChainRuntime,
     ws_url: &str,
+    subscription: &mut Option<TailLogSubscription>,
     tail_safety_interval: Duration,
     finality_poll_interval: Duration,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<bool> {
-    let ws = WsConnect::new(ws_url.to_string());
-    let provider = ProviderBuilder::new()
-        .connect_ws(ws)
-        .await
-        .wrap_err("connect chain-indexed websocket provider")?;
-    let filter = chain_index_subscription_filter(runtime);
-    let subscription = provider
-        .subscribe_logs(&filter)
-        .await
-        .wrap_err("subscribe to chain-indexed Railgun logs")?;
-    let mut stream = Box::pin(subscription.into_stream());
-    debug!(
-        chain_id = runtime.chain.chain_id,
-        railgun_contract = %runtime.chain.railgun_contract,
-        ws_url,
-        tail_safety_interval_ms = tail_safety_interval.as_millis(),
-        "waiting for chain-indexed websocket log or safety interval"
-    );
+) -> Result<TailWakeup> {
+    let (_, stream) = match subscription {
+        Some(subscription) => subscription,
+        None => subscription.insert(subscribe_tail_logs(runtime, ws_url).await?),
+    };
 
-    tokio::select! {
-        () = tokio::time::sleep(tail_safety_interval) => Ok(shutdown_requested(shutdown)),
-        shutdown = shutdown_changed_or_requested(shutdown) => Ok(shutdown),
-        maybe_log = stream.next() => {
-            let log = maybe_log.ok_or_else(|| eyre!("chain-indexed websocket log stream ended"))?;
-            let block_number = log.block_number;
-            debug!(
-                chain_id = runtime.chain.chain_id,
-                railgun_contract = %runtime.chain.railgun_contract,
-                ws_url,
-                block_number,
-                transaction_hash = ?log.transaction_hash,
-                "chain-indexed websocket log wakeup"
-            );
-            if let Some(block_number) = block_number {
-                wait_for_ws_log_finality(
-                    config,
-                    runtime,
-                    block_number,
-                    finality_poll_interval,
-                    shutdown,
-                )
-                .await
-            } else {
-                Ok(false)
+    // Collapse logs that arrived while indexing into one wakeup for the newest block.
+    let mut queued_log_block = None;
+    while let Some(Some(log)) = stream.next().now_or_never() {
+        queued_log_block = queued_log_block.max(log.block_number);
+    }
+
+    let log_block = if queued_log_block.is_some() {
+        queued_log_block
+    } else {
+        debug!(
+            chain_id = runtime.chain.chain_id,
+            railgun_contract = %runtime.chain.railgun_contract,
+            ws_url,
+            tail_safety_interval_ms = tail_safety_interval.as_millis(),
+            "waiting for chain-indexed websocket log or safety interval"
+        );
+        let maybe_log = tokio::select! {
+            () = tokio::time::sleep(tail_safety_interval) => {
+                *subscription = None;
+                return Ok(tail_wakeup_after_sleep(shutdown_requested(shutdown)));
             }
+            shutdown = shutdown_changed_or_requested(shutdown) => {
+                return Ok(tail_wakeup_after_sleep(shutdown));
+            }
+            maybe_log = stream.next() => maybe_log,
+        };
+        let Some(log) = maybe_log else {
+            *subscription = None;
+            return Err(eyre!("chain-indexed websocket log stream ended"));
+        };
+        debug!(
+            chain_id = runtime.chain.chain_id,
+            railgun_contract = %runtime.chain.railgun_contract,
+            ws_url,
+            block_number = log.block_number,
+            transaction_hash = ?log.transaction_hash,
+            "chain-indexed websocket log wakeup"
+        );
+        log.block_number
+    };
+
+    match log_block {
+        Some(log_block) => {
+            wait_for_ws_log_finality(config, runtime, log_block, finality_poll_interval, shutdown)
+                .await
         }
+        None => Ok(ControlFlow::Continue(None)),
     }
 }
 
@@ -359,7 +416,7 @@ async fn wait_for_ws_log_finality(
     log_block: u64,
     poll_interval: Duration,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<bool> {
+) -> Result<TailWakeup> {
     loop {
         let safe_head = runtime
             .provider
@@ -368,10 +425,10 @@ async fn wait_for_ws_log_finality(
             .wrap_err("fetch chain head while waiting for websocket log finality")?
             .saturating_sub(config.chain_indexed.safe_confirmations);
         if safe_head >= log_block {
-            return Ok(false);
+            return Ok(ControlFlow::Continue(Some(safe_head)));
         }
         if sleep_or_shutdown(poll_interval, shutdown).await {
-            return Ok(true);
+            return Ok(ControlFlow::Break(()));
         }
     }
 }
@@ -474,13 +531,17 @@ async fn index_chain_once(
     canonicality: &ChainCanonicalityCoordinator,
     batch_span: u64,
     provider_mode: ChainIndexProviderMode,
+    known_safe_head: Option<u64>,
 ) -> Result<ChainIndexStep> {
-    let safe_head = runtime
-        .provider
-        .get_block_number()
-        .await
-        .wrap_err("fetch chain head")?
-        .saturating_sub(config.chain_indexed.safe_confirmations);
+    let safe_head = match known_safe_head {
+        Some(safe_head) => safe_head,
+        None => runtime
+            .provider
+            .get_block_number()
+            .await
+            .wrap_err("fetch chain head")?
+            .saturating_sub(config.chain_indexed.safe_confirmations),
+    };
     let from_block = resume_block_after_reorg(store, config, runtime, canonicality).await?;
     if from_block > safe_head {
         return Ok(ChainIndexStep::CaughtUp);
@@ -2651,7 +2712,7 @@ mod tests {
         );
         let decoded: IndexedArtifactCatalog =
             serde_json::from_slice(&catalog_bytes).expect("decode empty catalog");
-        assert!(decoded.chunks.is_empty());
+        assert_eq!(decoded.chunks, [] as [IndexedArtifactDescriptor; 0]);
         assert_eq!(descriptor.range.start, 14_737_691);
         assert_eq!(descriptor.range.end, 14_751_289);
         assert_eq!(descriptor.row_count, 0);

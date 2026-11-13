@@ -858,9 +858,9 @@ fn default_squid_endpoint(chain_id: u64) -> Result<&'static str> {
         137 => Ok("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql"),
         42161 => Ok("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql"),
         11_155_111 => Ok("https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql"),
-        _ => bail!(
+        _ => Err(eyre!(
             "unsupported default Squid endpoint for chain {chain_id}; pass --squid-endpoint {chain_id}=URL"
-        ),
+        )),
     }
 }
 

@@ -4356,7 +4356,10 @@ mod tests {
             };
             assert_eq!(transaction_hash, fixed_bytes(LEGACY_TRANSACTION_HASH));
             assert_eq!(block_number, LEGACY_BLOCK_NUMBER);
-            assert!(batch.public_transactions.is_empty());
+            assert_eq!(
+                batch.public_transactions,
+                [] as [IndexedPublicTransaction; 0]
+            );
         }
     }
 
@@ -4553,7 +4556,10 @@ mod tests {
                     expected_field
                 )
             );
-            assert!(batch.public_transactions.is_empty());
+            assert_eq!(
+                batch.public_transactions,
+                [] as [IndexedPublicTransaction; 0]
+            );
         }
     }
 
@@ -4597,7 +4603,7 @@ mod tests {
         }
         let log_rows = rows.pop().expect("log rows");
         let calldata_rows = rows.pop().expect("calldata rows");
-        assert!(!calldata_rows.is_empty());
+        assert_ne!(calldata_rows, [] as [IndexedPublicTransaction; 0]);
         assert_eq!(log_rows, calldata_rows);
         log_rows
     }

@@ -704,7 +704,7 @@ fn u64_field(value: &Value, field: &'static str) -> Result<u64> {
     match value {
         Value::String(value) => parse_u64_string(value),
         Value::Number(value) => value.as_u64().ok_or_else(|| eyre!("field {field} not u64")),
-        _ => bail!("field {field} is not numeric"),
+        _ => Err(eyre!("field {field} is not numeric")),
     }
 }
 
@@ -752,7 +752,7 @@ fn parse_u256_value(value: &Value) -> Result<[u8; 32]> {
             let value = value.as_u64().ok_or_else(|| eyre!("number is not u64"))?;
             Ok(U256::from(value).to_be_bytes::<32>())
         }
-        _ => bail!("value is not U256-compatible"),
+        _ => Err(eyre!("value is not U256-compatible")),
     }
 }
 
@@ -818,6 +818,6 @@ fn chain_defaults(chain_id: u64) -> Result<ChainDefaults> {
             action_start_block: None,
             squid_endpoint: "https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql",
         }),
-        _ => bail!("unsupported chain id {chain_id}"),
+        _ => Err(eyre!("unsupported chain id {chain_id}")),
     }
 }

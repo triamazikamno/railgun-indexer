@@ -471,7 +471,7 @@ fn parse_wallet_payload(envelope: &ChunkEnvelope) -> Result<WalletArtifacts> {
             WALLET_LEGACY_GENERATED_SECTION_ID => {
                 wallet.legacy_generated = parse_wallet_legacy_generated(&mut cursor)?;
             }
-            other => bail!("unknown wallet scan section id {other}"),
+            other => return Err(eyre!("unknown wallet scan section id {other}")),
         }
         cursor.expect_end("wallet section")?;
     }
@@ -1722,7 +1722,10 @@ async fn fetch_ipfs(client: &Client, cid: &str) -> Result<Vec<u8>> {
             Err(error) => errors.push(format!("{url}: {error}")),
         }
     }
-    bail!("failed to fetch IPFS CID {cid}: {}", errors.join("; "))
+    Err(eyre!(
+        "failed to fetch IPFS CID {cid}: {}",
+        errors.join("; ")
+    ))
 }
 
 async fn fetch_ipns(client: &Client, ipns_name: &str) -> Result<Vec<u8>> {
@@ -1737,10 +1740,10 @@ async fn fetch_ipns(client: &Client, ipns_name: &str) -> Result<Vec<u8>> {
             Err(error) => errors.push(format!("{url}: {error}")),
         }
     }
-    bail!(
+    Err(eyre!(
         "failed to resolve IPNS name {ipns_name}: {}",
         errors.join("; ")
-    )
+    ))
 }
 
 fn normalize_ipns_name(value: &str) -> Result<&str> {
@@ -1759,7 +1762,7 @@ fn squid_endpoint(chain_id: u64) -> Result<&'static str> {
         137 => Ok("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql"),
         42161 => Ok("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql"),
         11_155_111 => Ok("https://rail-squid.squids.live/squid-railgun-eth-sepolia-v2/graphql"),
-        _ => bail!("unsupported chain id {chain_id}"),
+        _ => Err(eyre!("unsupported chain id {chain_id}")),
     }
 }
 
@@ -1877,7 +1880,7 @@ fn u64_field(value: &Value, field: &'static str) -> Result<u64> {
     match value {
         Value::String(value) => parse_u64_string(value),
         Value::Number(value) => value.as_u64().ok_or_else(|| eyre!("field {field} not u64")),
-        _ => bail!("field {field} is not numeric"),
+        _ => Err(eyre!("field {field} is not numeric")),
     }
 }
 
@@ -1938,7 +1941,7 @@ fn token_type(value: &Value) -> Result<u8> {
             .as_u64()
             .and_then(|value| u8::try_from(value).ok())
             .ok_or_else(|| eyre!("token type out of range")),
-        _ => bail!("unsupported token type"),
+        _ => Err(eyre!("unsupported token type")),
     }
 }
 
@@ -1964,7 +1967,7 @@ fn parse_u256_value(value: &Value) -> Result<[u8; 32]> {
             let value = value.as_u64().ok_or_else(|| eyre!("number is not u64"))?;
             Ok(U256::from(value).to_be_bytes::<32>())
         }
-        _ => bail!("value is not U256-compatible"),
+        _ => Err(eyre!("value is not U256-compatible")),
     }
 }
 
