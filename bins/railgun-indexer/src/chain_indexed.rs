@@ -48,7 +48,8 @@ use railgun_indexer_core::merkle_checkpoint::{
     MerkleCheckpointArtifact, prepare_merkle_checkpoint_artifact,
 };
 use railgun_indexer_core::public_txid::{
-    prepare_public_txid_chunk, public_txid_checkpoint_root, public_txid_chunk_plan_item,
+    PublicTxidCheckpoint, PublishedPublicTxidChunk, prepare_public_txid_chunk,
+    public_txid_chunk_plan_item,
 };
 use railgun_indexer_core::publish::ipfs::{IpfsClient, IpfsError, pin_indexed_chunk, pin_manifest};
 use railgun_indexer_core::publish::ipns::IpnsPublisher;
@@ -75,7 +76,7 @@ use amount_statistics::next_manifest_chains;
 use catalog_descriptors::catalog_descriptor;
 use catalog_descriptors::{
     CatalogCoverage, commitment_plan_items, fixed_bytes, latest_indexed_block,
-    prepare_catalog_artifact, public_txid_chunk_row_limit, public_txid_plan_items,
+    prepare_catalog_artifact, prepare_public_txid_page, public_txid_chunk_row_limit, run_blocking,
     store_dataset_kind,
 };
 #[cfg(test)]

@@ -1,6 +1,9 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Provider availability checks in flight at once before a manifest is published.
+const ARTIFACT_AVAILABILITY_CHECK_CONCURRENCY: usize = 8;
+
 impl ChainIndexedPublicationScheduler {
     pub(super) fn ensure_publication_running(&self) -> Result<()> {
         if shutdown_requested(&self.shutdown) {
@@ -350,20 +353,30 @@ impl ChainIndexedPublicationScheduler {
         &self,
         artifact_cids: &[String],
     ) -> Result<()> {
-        for cid in artifact_cids {
-            let parsed = cid
-                .parse::<cid::Cid>()
-                .wrap_err_with(|| format!("parse indexed manifest artifact CID {cid}"))?;
-            if !self
-                .ipfs_client
-                .contains(&parsed)
-                .await
-                .wrap_err_with(|| format!("check indexed manifest artifact CID {cid}"))?
-            {
-                return Err(eyre!(
-                    "indexed manifest artifact CID {cid} is unavailable before manifest publication"
-                ));
+        for batch in artifact_cids.chunks(ARTIFACT_AVAILABILITY_CHECK_CONCURRENCY) {
+            let checks = batch
+                .iter()
+                .map(|cid| self.ensure_indexed_artifact_available(cid));
+            for result in join_all(checks).await {
+                result?;
             }
+        }
+        Ok(())
+    }
+
+    async fn ensure_indexed_artifact_available(&self, cid: &str) -> Result<()> {
+        let parsed = cid
+            .parse::<cid::Cid>()
+            .wrap_err_with(|| format!("parse indexed manifest artifact CID {cid}"))?;
+        if !self
+            .ipfs_client
+            .contains(&parsed)
+            .await
+            .wrap_err_with(|| format!("check indexed manifest artifact CID {cid}"))?
+        {
+            return Err(eyre!(
+                "indexed manifest artifact CID {cid} is unavailable before manifest publication"
+            ));
         }
         Ok(())
     }

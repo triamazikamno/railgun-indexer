@@ -194,6 +194,44 @@ pub fn public_txid_checkpoint_root(
     )
 }
 
+/// Leaf hashes of the TXID tree being published, so each chunk's checkpoint root reuses the hashes
+/// of earlier chunks.
+#[derive(Debug, Default)]
+pub struct PublicTxidCheckpoint {
+    leaves: Vec<U256>,
+}
+
+impl PublicTxidCheckpoint {
+    /// Appends `records` and returns the root of the tree prefix ending at the last record.
+    pub fn extend(
+        &mut self,
+        records: &[StoredPublicTxidRow],
+    ) -> Result<[u8; 32], PublicTxidChunkError> {
+        let range = public_txid_range(records)?;
+        validate_single_txid_tree(&range)?;
+        let tree_offset = range.start % TREE_LEAF_COUNT;
+        if tree_offset == 0 {
+            self.leaves.clear();
+        }
+        let held = u64::try_from(self.leaves.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
+        if tree_offset != held {
+            return Err(PublicTxidChunkError::NonContiguousTxidIndex {
+                expected: (range.start - tree_offset).saturating_add(held),
+                actual: range.start,
+            });
+        }
+        self.leaves
+            .extend(records.iter().map(public_txid_leaf_hash));
+        let leaf_count =
+            u64::try_from(self.leaves.len()).map_err(|_| ChunkError::PayloadTooLarge)?;
+        Ok(
+            DenseMerkleTree::from_ordered_leaves(self.leaves.iter().copied(), leaf_count)
+                .root()
+                .to_be_bytes::<32>(),
+        )
+    }
+}
+
 const fn validate_single_txid_tree(
     range: &IndexedArtifactRange,
 ) -> Result<(), PublicTxidChunkError> {
@@ -484,6 +522,27 @@ mod tests {
         assert!(matches!(
             error,
             PublicTxidChunkError::CheckpointDoesNotStartAtTreePrefix { start: 1 }
+        ));
+    }
+
+    #[test]
+    fn public_txid_checkpoint_extends_tree_prefix_across_chunks() {
+        let records = vec![record(0, 100), record(1, 101), record(2, 102)];
+        let mut checkpoint = PublicTxidCheckpoint::default();
+
+        checkpoint.extend(&records[..1]).expect("first chunk root");
+        let root = checkpoint.extend(&records[1..]).expect("second chunk root");
+
+        assert_eq!(
+            root,
+            public_txid_checkpoint_root(&records).expect("checkpoint root")
+        );
+        assert!(matches!(
+            checkpoint.extend(&[record(4, 104)]),
+            Err(PublicTxidChunkError::NonContiguousTxidIndex {
+                expected: 3,
+                actual: 4
+            })
         ));
     }
 

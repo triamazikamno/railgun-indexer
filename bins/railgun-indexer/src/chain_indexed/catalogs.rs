@@ -19,6 +19,7 @@ impl ChainIndexedPublicationScheduler {
         }
         let mut offset = 0_u64;
         let mut chunks = Vec::new();
+        let mut checkpoint = PublicTxidCheckpoint::default();
         loop {
             let row_limit = public_txid_chunk_row_limit(
                 offset,
@@ -40,41 +41,22 @@ impl ChainIndexedPublicationScheduler {
             if rows.is_empty() {
                 break;
             }
-            let plan_items = public_txid_plan_items(scope, &rows)?;
-            let planned_chunks = plan_chunks(&plan_items, ChunkPlanningConfig::default())
-                .wrap_err("plan public TXID artifact chunks")?;
-            for planned in planned_chunks {
-                let chunk_rows = self
-                    .store
-                    .published_public_txid_rows_through_block(
-                        EVM_CHAIN_TYPE,
-                        chain.chain_id,
-                        chain.railgun_contract,
-                        planned.range.start,
-                        planned.row_count,
-                        max_block,
-                        &chain.public_txid_compatibility_omissions,
-                    )
-                    .await
-                    .wrap_err("read planned public TXID rows for artifact publication")?;
-                let checkpoint_root = self
-                    .public_txid_checkpoint_root(chain, &chunk_rows, max_block)
-                    .await
-                    .wrap_err("compute public TXID checkpoint root")?;
-                let mut published = prepare_public_txid_chunk(
-                    scope.clone(),
-                    &chunk_rows,
-                    checkpoint_root,
-                    CompressionAlgorithm::Zstd,
-                )
-                .wrap_err("publish public TXID chunk")?;
+            let page_row_count = rows.len();
+            let page_scope = scope.clone();
+            let (returned_checkpoint, prepared) = run_blocking(move || {
+                let prepared = prepare_public_txid_page(&page_scope, &rows, &mut checkpoint)?;
+                Ok((checkpoint, prepared))
+            })
+            .await?;
+            checkpoint = returned_checkpoint;
+            for mut published in prepared {
                 published.descriptor = self
                     .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                     .await?;
                 offset = published.descriptor.range.end.saturating_add(1);
                 chunks.push(published.descriptor);
             }
-            if rows.len() < row_limit as usize {
+            if page_row_count < row_limit as usize {
                 break;
             }
         }
@@ -120,37 +102,6 @@ impl ChainIndexedPublicationScheduler {
         Ok(())
     }
 
-    async fn public_txid_checkpoint_root(
-        &self,
-        chain: &ChainIndexedChainConfig,
-        rows: &[StoredPublicTxidRow],
-        max_block: u64,
-    ) -> Result<[u8; 32]> {
-        let last = rows
-            .last()
-            .ok_or_else(|| eyre!("public TXID checkpoint root requires rows"))?;
-        let tree_start = last.txid_index / TREE_LEAF_COUNT * TREE_LEAF_COUNT;
-        let row_count = last
-            .txid_index
-            .checked_sub(tree_start)
-            .and_then(|count| count.checked_add(1))
-            .ok_or_else(|| eyre!("public TXID checkpoint range overflow"))?;
-        let checkpoint_rows = self
-            .store
-            .published_public_txid_rows_through_block(
-                EVM_CHAIN_TYPE,
-                chain.chain_id,
-                chain.railgun_contract,
-                tree_start,
-                row_count,
-                max_block,
-                &chain.public_txid_compatibility_omissions,
-            )
-            .await
-            .wrap_err("read public TXID checkpoint rows")?;
-        public_txid_checkpoint_root(&checkpoint_rows).wrap_err("derive public TXID checkpoint root")
-    }
-
     async fn wallet_scan_plan_items(
         &self,
         chain: &ChainIndexedChainConfig,
@@ -186,15 +137,19 @@ impl ChainIndexedPublicationScheduler {
             if rows.is_empty() {
                 continue;
             }
+            let item_scope = scope.clone();
             items.push(
-                wallet_scan_chunk_plan_item(
-                    scope,
-                    range.start_block,
-                    range.end_block,
-                    &rows,
-                    CompressionAlgorithm::Zstd,
-                )
-                .wrap_err("plan wallet-scan artifact chunk unit")?,
+                run_blocking(move || {
+                    wallet_scan_chunk_plan_item(
+                        &item_scope,
+                        range.start_block,
+                        range.end_block,
+                        &rows,
+                        CompressionAlgorithm::Zstd,
+                    )
+                    .wrap_err("plan wallet-scan artifact chunk unit")
+                })
+                .await?,
             );
         }
         Ok(items)
@@ -213,8 +168,11 @@ impl ChainIndexedPublicationScheduler {
         let plan_items = self
             .wallet_scan_plan_items(chain, scope, chain.start_block, max_block)
             .await?;
-        let planned_chunks = plan_chunks(&plan_items, ChunkPlanningConfig::default())
-            .wrap_err("plan wallet-scan artifact chunks")?;
+        let planned_chunks = run_blocking(move || {
+            plan_chunks(&plan_items, ChunkPlanningConfig::default())
+                .wrap_err("plan wallet-scan artifact chunks")
+        })
+        .await?;
         let mut chunks = Vec::new();
         for planned in planned_chunks {
             let rows = self
@@ -231,14 +189,19 @@ impl ChainIndexedPublicationScheduler {
             if rows.is_empty() {
                 continue;
             }
-            let mut published = prepare_wallet_scan_chunk(
-                scope.clone(),
-                planned.range.start,
-                planned.range.end,
-                &rows,
-                CompressionAlgorithm::Zstd,
-            )
-            .wrap_err("publish wallet-scan chunk")?;
+            let chunk_scope = scope.clone();
+            let (start_block, end_block) = (planned.range.start, planned.range.end);
+            let mut published = run_blocking(move || {
+                prepare_wallet_scan_chunk(
+                    chunk_scope,
+                    start_block,
+                    end_block,
+                    &rows,
+                    CompressionAlgorithm::Zstd,
+                )
+                .wrap_err("publish wallet-scan chunk")
+            })
+            .await?;
             published.descriptor = self
                 .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                 .await?;
@@ -318,9 +281,13 @@ impl ChainIndexedPublicationScheduler {
                 start_position = end_position.saturating_add(1);
                 continue;
             }
-            let plan_items = commitment_plan_items(scope, &rows)?;
-            let planned_chunks = plan_chunks(&plan_items, ChunkPlanningConfig::default())
-                .wrap_err("plan commitment artifact chunks")?;
+            let page_scope = scope.clone();
+            let planned_chunks = run_blocking(move || {
+                let plan_items = commitment_plan_items(&page_scope, &rows)?;
+                plan_chunks(&plan_items, ChunkPlanningConfig::default())
+                    .wrap_err("plan commitment artifact chunks")
+            })
+            .await?;
             for planned in planned_chunks {
                 let chunk_rows = self
                     .store
@@ -334,12 +301,12 @@ impl ChainIndexedPublicationScheduler {
                     )
                     .await
                     .wrap_err("read planned commitment rows for artifact publication")?;
-                let mut published = prepare_commitment_chunk(
-                    scope.clone(),
-                    &chunk_rows,
-                    CompressionAlgorithm::Zstd,
-                )
-                .wrap_err("publish commitment chunk")?;
+                let chunk_scope = scope.clone();
+                let mut published = run_blocking(move || {
+                    prepare_commitment_chunk(chunk_scope, &chunk_rows, CompressionAlgorithm::Zstd)
+                        .wrap_err("publish commitment chunk")
+                })
+                .await?;
                 published.descriptor = self
                     .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                     .await?;
@@ -391,12 +358,16 @@ impl ChainIndexedPublicationScheduler {
                 last_indexed_block: checkpoint.last_indexed_block,
                 leaves: checkpoint.leaves,
             };
-            let mut published = prepare_merkle_checkpoint_artifact(
-                scope.clone(),
-                &artifact,
-                CompressionAlgorithm::Zstd,
-            )
-            .wrap_err("publish Merkle checkpoint artifact")?;
+            let artifact_scope = scope.clone();
+            let mut published = run_blocking(move || {
+                prepare_merkle_checkpoint_artifact(
+                    artifact_scope,
+                    &artifact,
+                    CompressionAlgorithm::Zstd,
+                )
+                .wrap_err("publish Merkle checkpoint artifact")
+            })
+            .await?;
             published.descriptor = self
                 .reuse_or_pin_chunk(published.descriptor, &published.compressed_bytes)
                 .await?;

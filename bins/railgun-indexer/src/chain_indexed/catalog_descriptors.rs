@@ -187,6 +187,61 @@ pub(super) fn public_txid_plan_items(
         .collect()
 }
 
+/// Plans one page of public TXID rows into chunks and prepares each chunk with its checkpoint root.
+pub(super) fn prepare_public_txid_page(
+    scope: &ChainScope,
+    rows: &[StoredPublicTxidRow],
+    checkpoint: &mut PublicTxidCheckpoint,
+) -> Result<Vec<PublishedPublicTxidChunk>> {
+    let first_index = rows
+        .first()
+        .ok_or_else(|| eyre!("public TXID page has no rows"))?
+        .txid_index;
+    let plan_items = public_txid_plan_items(scope, rows)?;
+    let planned_chunks = plan_chunks(&plan_items, ChunkPlanningConfig::default())
+        .wrap_err("plan public TXID artifact chunks")?;
+    planned_chunks
+        .into_iter()
+        .map(|planned| {
+            let chunk_rows = planned
+                .range
+                .start
+                .checked_sub(first_index)
+                .and_then(|start| usize::try_from(start).ok())
+                .zip(usize::try_from(planned.row_count).ok())
+                .and_then(|(start, count)| rows.get(start..start.checked_add(count)?))
+                .ok_or_else(|| {
+                    eyre!(
+                        "planned public TXID chunk {}-{} is outside the page",
+                        planned.range.start,
+                        planned.range.end
+                    )
+                })?;
+            let checkpoint_root = checkpoint
+                .extend(chunk_rows)
+                .wrap_err("compute public TXID checkpoint root")?;
+            prepare_public_txid_chunk(
+                scope.clone(),
+                chunk_rows,
+                checkpoint_root,
+                CompressionAlgorithm::Zstd,
+            )
+            .wrap_err("publish public TXID chunk")
+        })
+        .collect()
+}
+
+/// Runs CPU-bound artifact work off the publication task, which polls every chain's queries.
+pub(super) async fn run_blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .wrap_err("join blocking artifact preparation task")?
+}
+
 pub(super) fn commitment_plan_items(
     scope: &ChainScope,
     rows: &[railgun_indexer_core::store::StoredCommitmentRow],
