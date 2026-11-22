@@ -4,6 +4,30 @@ use super::*;
 /// Provider availability checks in flight at once before a manifest is published.
 const ARTIFACT_AVAILABILITY_CHECK_CONCURRENCY: usize = 8;
 
+/// The chains of one publication cycle: manifest entries, every artifact CID they reference, the
+/// datasets to remember once the manifest is published, the chains whose full derivation found
+/// reuse mismatches but no catalogs, and the reuse mismatches to report once every chain's
+/// watermarks are validated.
+#[derive(Default)]
+struct PublishedChains {
+    entries: Vec<IndexedArtifactChainEntry>,
+    /// Validated with the manifest entries but never published.
+    catalog_less: Vec<IndexedArtifactChainEntry>,
+    artifact_cids: BTreeSet<String>,
+    remembered: Vec<((u64, Address), Vec<RememberedDataset>)>,
+    reuse_mismatches: Vec<ReuseMismatch>,
+}
+
+/// A cycle's manifest chains after their watermarks passed validation under `canonicality_guard`,
+/// which stays held until the manifest's IPNS publication is recorded.
+struct ValidatedChains {
+    entries: Vec<IndexedArtifactChainEntry>,
+    artifact_cids: BTreeSet<String>,
+    remembered: Vec<((u64, Address), Vec<RememberedDataset>)>,
+    full_derivation: bool,
+    canonicality_guard: ChainCanonicalityLease,
+}
+
 impl ChainIndexedPublicationScheduler {
     pub(super) fn ensure_publication_running(&self) -> Result<()> {
         if shutdown_requested(&self.shutdown) {
@@ -23,45 +47,134 @@ impl ChainIndexedPublicationScheduler {
     }
 
     pub(super) async fn publish_cycle(&mut self, now: SystemTime) -> Result<()> {
+        let result = self.try_publish_cycle(now).await;
+        if result.is_err() {
+            // A reused chunk that a provider lost would otherwise fail every later cycle; a full
+            // derivation re-pins it.
+            self.remembered_chains.clear();
+        }
+        result
+    }
+
+    /// Replaces the remembered datasets with those of the manifest just published to IPNS.
+    pub(super) fn remember_published_chains(
+        &mut self,
+        chains: Vec<((u64, Address), Vec<RememberedDataset>)>,
+    ) {
+        self.remembered_chains = chains.into_iter().collect();
+    }
+
+    /// Publishes every configured chain concurrently and gathers what the manifest and the reuse
+    /// mismatch report need.
+    async fn publish_chain_entries(
+        &self,
+        configured_chains: &[ChainIndexedChainConfig],
+        full_derivation: bool,
+    ) -> Result<PublishedChains> {
+        let published_chains = join_all(
+            configured_chains
+                .iter()
+                .map(|chain| self.publish_chain_entry(chain, full_derivation)),
+        )
+        .await;
+
+        let mut published = PublishedChains::default();
+        for (chain, result) in configured_chains.iter().zip(published_chains) {
+            self.ensure_publication_running()?;
+            let Some(chain_entry) = result.wrap_err_with(|| {
+                format!(
+                    "publish chain-indexed artifacts for chain {} ({})",
+                    chain.chain_id, chain.railgun_contract
+                )
+            })?
+            else {
+                continue;
+            };
+            published
+                .reuse_mismatches
+                .extend(chain_entry.reuse_mismatches);
+            if chain_entry.entry.catalogs.is_empty() {
+                published.catalog_less.push(chain_entry.entry);
+                continue;
+            }
+            published.remembered.push((
+                (chain.chain_id, chain.railgun_contract),
+                chain_entry.remembered,
+            ));
+            published.entries.push(chain_entry.entry);
+            published.artifact_cids.extend(chain_entry.artifact_cids);
+        }
+        Ok(published)
+    }
+
+    /// Derives every chain, then validates the result and reports its reuse mismatches under the
+    /// final canonicality lease. `None` when the cycle has no manifest to publish.
+    async fn derive_validated_chains(
+        &mut self,
+        now: SystemTime,
+    ) -> Result<Option<ValidatedChains>> {
+        let rewind_generation = self
+            .canonicality
+            .publication_lease()
+            .await
+            .rewind_generation();
+        let configured_chains = self.config.chain_indexed.chains.clone();
+        let full_derivation = self.remembered_chains.is_empty()
+            || full_derivation_due(self.last_full_derivation, now);
+        let PublishedChains {
+            entries,
+            catalog_less,
+            artifact_cids,
+            remembered,
+            reuse_mismatches,
+        } = self
+            .publish_chain_entries(&configured_chains, full_derivation)
+            .await?;
+        if entries.is_empty() && reuse_mismatches.is_empty() {
+            return Ok(None);
+        }
+
+        let canonicality_guard = self.canonicality.publication_lease().await;
+        // A replay can restore every watermark header over chunks built from rewound rows.
+        if canonicality_guard.rewind_generation() != rewind_generation {
+            return Err(eyre!(
+                "reorg rewind committed during chain-indexed artifact derivation"
+            ));
+        }
+        self.validate_combined_manifest_snapshot(&configured_chains, &entries)
+            .await?;
+        self.validate_combined_manifest_snapshot(&configured_chains, &catalog_less)
+            .await?;
+        self.report_reuse_mismatches(reuse_mismatches).await;
+        if entries.is_empty() {
+            // The remembered chunks were disproved and no manifest replaces them.
+            self.remembered_chains.clear();
+            return Ok(None);
+        }
+        Ok(Some(ValidatedChains {
+            entries,
+            artifact_cids,
+            remembered,
+            full_derivation,
+            canonicality_guard,
+        }))
+    }
+
+    async fn try_publish_cycle(&mut self, now: SystemTime) -> Result<()> {
         self.ensure_publication_running()?;
         if self.reconcile_pending_manifest().await? {
             return Ok(());
         }
-        let configured_chains = self.config.chain_indexed.chains.clone();
-        let published_chains = join_all(
-            configured_chains
-                .iter()
-                .map(|chain| self.publish_chain_entry(chain)),
-        )
-        .await;
-
-        let mut chains = Vec::new();
-        let mut artifact_cids = BTreeSet::new();
-        for (chain, result) in configured_chains.iter().zip(published_chains) {
-            self.ensure_publication_running()?;
-            match result {
-                Ok(Some(published)) => {
-                    chains.push(published.entry);
-                    artifact_cids.extend(published.artifact_cids);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(error).wrap_err_with(|| {
-                        format!(
-                            "publish chain-indexed artifacts for chain {} ({})",
-                            chain.chain_id, chain.railgun_contract
-                        )
-                    });
-                }
-            }
-        }
-        if chains.is_empty() {
+        let Some(ValidatedChains {
+            entries: chains,
+            artifact_cids,
+            remembered,
+            full_derivation,
+            canonicality_guard,
+        }) = self.derive_validated_chains(now).await?
+        else {
             return Ok(());
-        }
-
-        let canonicality_guard = self.canonicality.publication_lease().await;
-        self.validate_combined_manifest_snapshot(&configured_chains, &chains)
-            .await?;
+        };
 
         let sequence = self.next_ipns_sequence(now).await?;
         let mut manifest = railgun_indexer_core::manifest::IndexedArtifactManifest::new(
@@ -156,6 +269,10 @@ impl ChainIndexedPublicationScheduler {
             .await
             .wrap_err("commit chain-indexed manifest IPNS audit")?;
         drop(canonicality_guard);
+        self.remember_published_chains(remembered);
+        if full_derivation {
+            self.last_full_derivation = Some(now);
+        }
 
         info!(target: LOG_TARGET,
             manifest_cid = %manifest_cid_string,
@@ -287,9 +404,12 @@ impl ChainIndexedPublicationScheduler {
         Ok(())
     }
 
-    async fn publish_chain_entry(
+    /// A `full_derivation` derives every chunk and checks the chunks it would have reused. Returns
+    /// `None` when the chain has neither catalogs nor reuse mismatches.
+    pub(super) async fn publish_chain_entry(
         &self,
         chain: &ChainIndexedChainConfig,
+        full_derivation: bool,
     ) -> Result<Option<PublishedChainEntry>> {
         let scope = ChainScope {
             chain_type: ChainType::Evm,
@@ -297,46 +417,48 @@ impl ChainIndexedPublicationScheduler {
             railgun_contract: chain.railgun_contract,
         };
         let latest_indexed = self.latest_indexed_heights(chain).await?;
+        let previous = self
+            .remembered_chains
+            .get(&(chain.chain_id, chain.railgun_contract))
+            .map(Vec::as_slice);
         let mut catalogs = Vec::new();
         let mut artifact_cids = BTreeSet::new();
-        for dataset in &chain.datasets {
-            match dataset {
+        let mut remembered = Vec::new();
+        let mut reuse_mismatches = Vec::new();
+        // `latest_indexed` follows `chain.datasets` order and omits datasets without progress.
+        for height in &latest_indexed {
+            let reuse = self.dataset_chunk_reuse(chain, previous, height).await?;
+            let derivation = if full_derivation {
+                ChunkReuse::DeriveAll
+            } else {
+                reuse
+            };
+            let (published, dataset) = match height.dataset_kind {
                 IndexedDatasetKind::PublicTxid => {
-                    if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
-                        let published = self
-                            .publish_public_txid_catalog(chain, &scope, max_block)
-                            .await?;
-                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
-                    }
+                    self.publish_public_txid_catalog(chain, &scope, height, derivation)
+                        .await?
                 }
                 IndexedDatasetKind::WalletScan => {
-                    if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
-                        let published = self
-                            .publish_wallet_scan_catalog(chain, &scope, max_block)
-                            .await?;
-                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
-                    }
+                    self.publish_wallet_scan_catalog(chain, &scope, height, derivation)
+                        .await?
                 }
                 IndexedDatasetKind::Commitments => {
-                    if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
-                        let published = self
-                            .publish_commitment_catalog(chain, &scope, max_block)
-                            .await?;
-                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
-                    }
+                    self.publish_commitment_catalog(chain, &scope, height, derivation)
+                        .await?
                 }
                 IndexedDatasetKind::MerkleCheckpoint => {
-                    if let Some(max_block) = latest_indexed_block(&latest_indexed, *dataset) {
-                        let published = self
-                            .publish_merkle_checkpoint_catalog(chain, &scope, max_block)
-                            .await?;
-                        extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
-                    }
+                    self.publish_merkle_checkpoint_catalog(chain, &scope, height, derivation)
+                        .await?
                 }
+            };
+            if full_derivation {
+                reuse_mismatches.extend(changed_reused_chunks(chain, reuse, &dataset));
             }
+            extend_published_catalogs(&mut catalogs, &mut artifact_cids, published);
+            remembered.push(dataset);
         }
         self.validate_chain_snapshot(chain, &latest_indexed).await?;
-        if catalogs.is_empty() {
+        if catalogs.is_empty() && reuse_mismatches.is_empty() {
             return Ok(None);
         }
         Ok(Some(PublishedChainEntry {
@@ -346,7 +468,57 @@ impl ChainIndexedPublicationScheduler {
                 catalogs,
             },
             artifact_cids: artifact_cids.into_iter().collect(),
+            remembered,
+            reuse_mismatches,
         }))
+    }
+
+    /// Logs and records reuse mismatches of chains whose watermarks were just validated.
+    async fn report_reuse_mismatches(&self, mismatches: Vec<ReuseMismatch>) {
+        for mismatch in mismatches {
+            error!(target: LOG_TARGET,
+                chain_id = mismatch.chain_id,
+                railgun_contract = %mismatch.railgun_contract,
+                dataset = ?mismatch.dataset,
+                range_start = mismatch.range.start,
+                range_end = mismatch.range.end,
+                "full derivation changed a chunk that chain-indexed publication would have reused"
+            );
+            self.status
+                .write()
+                .await
+                .record_chain_indexed_reuse_mismatch(
+                    mismatch.chain_id,
+                    mismatch.railgun_contract.to_string(),
+                    mismatch.dataset,
+                    &mismatch.range,
+                );
+        }
+    }
+
+    async fn dataset_chunk_reuse<'a>(
+        &self,
+        chain: &ChainIndexedChainConfig,
+        previous: Option<&'a [RememberedDataset]>,
+        height: &LatestIndexedHeight,
+    ) -> Result<ChunkReuse<'a>> {
+        let Some(remembered) = previous.and_then(|datasets| {
+            datasets
+                .iter()
+                .find(|dataset| dataset.dataset_kind == height.dataset_kind)
+        }) else {
+            return Ok(ChunkReuse::DeriveAll);
+        };
+        let stored_header = self
+            .store
+            .indexed_block_header(EVM_CHAIN_TYPE, chain.chain_id, remembered.height.0)
+            .await
+            .wrap_err("read remembered chain-indexed publication height")?;
+        Ok(chunk_reuse(
+            Some(remembered),
+            height,
+            stored_header.map(|header| header.block_hash),
+        ))
     }
 
     pub(super) async fn ensure_indexed_artifacts_available(
@@ -417,6 +589,30 @@ impl ChainIndexedPublicationScheduler {
         self.last_ipns_sequence = Some(sequence);
         Ok(sequence)
     }
+}
+
+/// Every chunk that `reuse` would have kept but `derived` no longer contains.
+fn changed_reused_chunks(
+    chain: &ChainIndexedChainConfig,
+    reuse: ChunkReuse<'_>,
+    derived: &RememberedDataset,
+) -> Vec<ReuseMismatch> {
+    reuse
+        .kept_chunks(chain.start_block)
+        .into_iter()
+        .enumerate()
+        .filter(|(index, kept)| {
+            !derived.chunks.get(*index).is_some_and(|chunk| {
+                chunk.range == kept.range && chunk.sha256 == kept.sha256 && chunk.cid == kept.cid
+            })
+        })
+        .map(|(_, kept)| ReuseMismatch {
+            chain_id: chain.chain_id,
+            railgun_contract: chain.railgun_contract,
+            dataset: derived.dataset_kind,
+            range: kept.range,
+        })
+        .collect()
 }
 
 pub(super) fn validate_publication_watermark(

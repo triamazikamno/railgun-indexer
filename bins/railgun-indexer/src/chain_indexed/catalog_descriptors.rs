@@ -165,16 +165,6 @@ pub(super) fn public_txid_chunk_row_limit(offset: u64, configured_limit: u64) ->
     configured_limit.min(remaining_in_tree)
 }
 
-pub(super) fn latest_indexed_block(
-    latest_indexed: &[LatestIndexedHeight],
-    dataset_kind: IndexedDatasetKind,
-) -> Option<u64> {
-    latest_indexed
-        .iter()
-        .find(|height| height.dataset_kind == dataset_kind)
-        .map(|height| height.block_number)
-}
-
 pub(super) fn public_txid_plan_items(
     scope: &ChainScope,
     rows: &[StoredPublicTxidRow],
@@ -192,14 +182,15 @@ pub(super) fn prepare_public_txid_page(
     scope: &ChainScope,
     rows: &[StoredPublicTxidRow],
     checkpoint: &mut PublicTxidCheckpoint,
+    planning: ChunkPlanningConfig,
 ) -> Result<Vec<PublishedPublicTxidChunk>> {
     let first_index = rows
         .first()
         .ok_or_else(|| eyre!("public TXID page has no rows"))?
         .txid_index;
     let plan_items = public_txid_plan_items(scope, rows)?;
-    let planned_chunks = plan_chunks(&plan_items, ChunkPlanningConfig::default())
-        .wrap_err("plan public TXID artifact chunks")?;
+    let planned_chunks =
+        plan_chunks(&plan_items, planning).wrap_err("plan public TXID artifact chunks")?;
     planned_chunks
         .into_iter()
         .map(|planned| {

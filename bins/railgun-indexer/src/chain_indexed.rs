@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::hex;
-use alloy::primitives::FixedBytes;
+use alloy::primitives::{Address, FixedBytes};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::pubsub::SubscriptionStream;
 use alloy::sol_types::SolEvent;
@@ -22,7 +22,7 @@ use eyre::{Result, WrapErr, eyre};
 use futures_util::{FutureExt, StreamExt, future::join_all};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use railgun_indexer_core::amount_statistics::derive_amount_statistics;
 use railgun_indexer_core::audit::{
@@ -68,6 +68,7 @@ mod amount_statistics;
 mod catalog_descriptors;
 mod catalogs;
 mod publication;
+mod reuse;
 
 use amount_statistics::AmountStatisticsPublication;
 #[cfg(test)]
@@ -75,12 +76,14 @@ use amount_statistics::next_manifest_chains;
 #[cfg(test)]
 use catalog_descriptors::catalog_descriptor;
 use catalog_descriptors::{
-    CatalogCoverage, commitment_plan_items, fixed_bytes, latest_indexed_block,
-    prepare_catalog_artifact, prepare_public_txid_page, public_txid_chunk_row_limit, run_blocking,
-    store_dataset_kind,
+    CatalogCoverage, commitment_plan_items, fixed_bytes, prepare_catalog_artifact,
+    prepare_public_txid_page, public_txid_chunk_row_limit, run_blocking, store_dataset_kind,
 };
 #[cfg(test)]
 use publication::validate_publication_watermark;
+#[cfg(test)]
+use reuse::FULL_DERIVATION_INTERVAL;
+use reuse::{ChunkReuse, RememberedDataset, chunk_reuse, full_derivation_due};
 
 /// Keeps the tracing target of the moved methods at this module's path.
 const LOG_TARGET: &str = module_path!();
@@ -488,16 +491,17 @@ pub(crate) struct ChainIndexedPublisher {
     pub(crate) ipns_publisher: IpnsPublisher,
 }
 
-/// `amount_statistics` holds the amount-statistics IPNS publisher and the status it reports to,
-/// and is `Some` only when amount-statistics publication is enabled.
+/// `amount_statistics` holds the amount-statistics IPNS publisher and is `Some` only when
+/// amount-statistics publication is enabled. Both publications report to `status`.
 pub(crate) async fn run_publication_loop(
     config: Config,
     store: Store,
     ipfs_client: Arc<dyn IpfsClient>,
     publisher: ChainIndexedPublisher,
-    amount_statistics: Option<(IpnsPublisher, SharedStatus)>,
+    amount_statistics: Option<IpnsPublisher>,
     pin_lifecycle: PinLifecycleCoordinator,
     canonicality: ChainCanonicalityCoordinator,
+    status: SharedStatus,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let interval = checked_interval(
@@ -505,8 +509,8 @@ pub(crate) async fn run_publication_loop(
         "chain_indexed.publish_interval",
     )?;
     let amount_statistics = amount_statistics
-        .map(|(ipns_publisher, status)| {
-            AmountStatisticsPublication::new(&config, ipns_publisher, status)
+        .map(|ipns_publisher| {
+            AmountStatisticsPublication::new(&config, ipns_publisher, status.clone())
         })
         .transpose()?;
     let mut scheduler = ChainIndexedPublicationScheduler {
@@ -521,6 +525,10 @@ pub(crate) async fn run_publication_loop(
         last_ipns_sequence: None,
         ipns_sequence_loaded: false,
         shutdown: shutdown.clone(),
+        chunk_planning: ChunkPlanningConfig::default(),
+        remembered_chains: HashMap::new(),
+        last_full_derivation: None,
+        status,
     };
     match scheduler.reconcile_pending_manifest().await {
         Ok(_) => {}
@@ -773,7 +781,7 @@ async fn resume_block_after_reorg(
             return Ok(progress.indexed_through_block.saturating_add(1));
         }
 
-        let _canonicality = canonicality.reorg_lease().await;
+        let mut rewind_generation = canonicality.reorg_lease().await;
         let Some(progress) = store
             .chain_indexing_progress(
                 EVM_CHAIN_TYPE,
@@ -832,6 +840,8 @@ async fn resume_block_after_reorg(
         )
         .await
         .wrap_err("rewind indexed rows after reorg")?;
+        // Publication cycles that derived across this rewind compare generations and give up.
+        *rewind_generation += 1;
         tx.commit().await.wrap_err("commit reorg rewind")?;
         info!(
             chain_id = runtime.chain.chain_id,
@@ -875,6 +885,12 @@ struct ChainIndexedPublicationScheduler {
     last_ipns_sequence: Option<u64>,
     ipns_sequence_loaded: bool,
     shutdown: watch::Receiver<bool>,
+    chunk_planning: ChunkPlanningConfig,
+    /// Datasets of the last published manifest, keyed by chain ID and contract.
+    remembered_chains: HashMap<(u64, Address), Vec<RememberedDataset>>,
+    /// When the last manifest derived from every indexed row was published.
+    last_full_derivation: Option<SystemTime>,
+    status: SharedStatus,
 }
 
 struct PublishedCatalog {
@@ -885,6 +901,16 @@ struct PublishedCatalog {
 struct PublishedChainEntry {
     entry: IndexedArtifactChainEntry,
     artifact_cids: Vec<String>,
+    remembered: Vec<RememberedDataset>,
+    reuse_mismatches: Vec<ReuseMismatch>,
+}
+
+/// A chunk that a forced full derivation found changed from the one reuse would have kept.
+struct ReuseMismatch {
+    chain_id: u64,
+    railgun_contract: Address,
+    dataset: IndexedDatasetKind,
+    range: IndexedArtifactRange,
 }
 
 fn extend_published_catalogs(

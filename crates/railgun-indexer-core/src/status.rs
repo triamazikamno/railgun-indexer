@@ -1,3 +1,4 @@
+use crate::manifest::{IndexedArtifactRange, IndexedDatasetKind};
 use alloy_primitives::{FixedBytes, hex};
 use poi::artifacts::v4::ManifestEntry;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ pub struct Status {
     pub last_retention_sweep: Option<RetentionSweepStatus>,
     /// Absent while amount-statistics publication is disabled or has not run.
     pub amount_statistics: Option<AmountStatisticsPublicationStatus>,
+    /// Remembered chunks a periodic full derivation found stale since the process started.
+    pub chain_indexed_reuse_mismatches: Vec<ChainIndexedReuseMismatch>,
 }
 
 impl Status {
@@ -48,6 +51,7 @@ impl Status {
             poi_artifact_publication: None,
             last_retention_sweep: None,
             amount_statistics: None,
+            chain_indexed_reuse_mismatches: Vec::new(),
         }
     }
 
@@ -197,6 +201,24 @@ impl Status {
     /// Records how the last amount-statistics cycle ended; `None` means it succeeded.
     pub fn record_amount_statistics_error(&mut self, error: Option<String>) {
         self.amount_statistics.get_or_insert_default().last_error = error;
+    }
+
+    pub fn record_chain_indexed_reuse_mismatch(
+        &mut self,
+        chain_id: u64,
+        railgun_contract: String,
+        dataset: IndexedDatasetKind,
+        range: &IndexedArtifactRange,
+    ) {
+        self.chain_indexed_reuse_mismatches
+            .push(ChainIndexedReuseMismatch {
+                chain_id,
+                railgun_contract,
+                dataset,
+                range_start: range.start,
+                range_end: range.end,
+                detected_unix_seconds: unix_now(),
+            });
     }
 
     pub fn record_retention_sweep(&mut self, unpinned_count: usize, failed_count: usize) {
@@ -353,6 +375,16 @@ pub struct AmountStatisticsChainFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainIndexedReuseMismatch {
+    pub chain_id: u64,
+    pub railgun_contract: String,
+    pub dataset: IndexedDatasetKind,
+    pub range_start: u64,
+    pub range_end: u64,
+    pub detected_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetentionSweepStatus {
     pub completed_unix_seconds: i64,
     pub unpinned_count: usize,
@@ -449,5 +481,33 @@ mod tests {
             snapshot.pairs[0].retry_backoff.state,
             RetryBackoffState::Idle
         );
+    }
+
+    #[test]
+    fn reuse_mismatch_is_served_in_status_json() {
+        let mut status = Status::for_pairs(&[], &[], 500);
+
+        status.record_chain_indexed_reuse_mismatch(
+            1,
+            "0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9".to_string(),
+            IndexedDatasetKind::PublicTxid,
+            &IndexedArtifactRange {
+                kind: crate::manifest::IndexedArtifactRangeKind::TxidIndex,
+                start: 0,
+                end: 1,
+            },
+        );
+
+        let json = serde_json::to_value(&status).expect("serialize status");
+        let mismatch = &json["chain_indexed_reuse_mismatches"][0];
+        assert_eq!(mismatch["chain_id"], 1);
+        assert_eq!(
+            mismatch["railgun_contract"],
+            "0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9"
+        );
+        assert_eq!(mismatch["dataset"], "public_txid");
+        assert_eq!(mismatch["range_start"], 0);
+        assert_eq!(mismatch["range_end"], 1);
+        assert!(mismatch["detected_unix_seconds"].as_i64() > Some(0));
     }
 }

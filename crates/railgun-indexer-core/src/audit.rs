@@ -143,14 +143,23 @@ impl Drop for PinOwnershipLease {
     }
 }
 
+/// The gate holds the reorg rewind generation; readers see an increment once its writer releases.
 #[derive(Clone, Default)]
 pub struct ChainCanonicalityCoordinator {
-    gate: Arc<RwLock<()>>,
+    gate: Arc<RwLock<u64>>,
 }
 
 #[derive(Clone)]
 pub struct ChainCanonicalityLease {
-    _guard: Arc<OwnedRwLockReadGuard<()>>,
+    guard: Arc<OwnedRwLockReadGuard<u64>>,
+}
+
+impl ChainCanonicalityLease {
+    /// How many reorg rewinds had been attempted when this lease was acquired.
+    #[must_use]
+    pub fn rewind_generation(&self) -> u64 {
+        **self.guard
+    }
 }
 
 impl std::fmt::Debug for ChainCanonicalityLease {
@@ -162,11 +171,11 @@ impl std::fmt::Debug for ChainCanonicalityLease {
 impl ChainCanonicalityCoordinator {
     pub async fn publication_lease(&self) -> ChainCanonicalityLease {
         ChainCanonicalityLease {
-            _guard: Arc::new(Arc::clone(&self.gate).read_owned().await),
+            guard: Arc::new(Arc::clone(&self.gate).read_owned().await),
         }
     }
 
-    pub async fn reorg_lease(&self) -> OwnedRwLockWriteGuard<()> {
+    pub async fn reorg_lease(&self) -> OwnedRwLockWriteGuard<u64> {
         Arc::clone(&self.gate).write_owned().await
     }
 }
@@ -961,18 +970,7 @@ impl Audit {
         .await?;
 
         if !artifact_cids.is_empty() {
-            sqlx::query(
-                r"
-                INSERT INTO published_indexed_manifest_artifacts (manifest_id, artifact_cid)
-                SELECT $1, artifact_cid
-                FROM UNNEST($2::TEXT[]) AS artifact_cid
-                ON CONFLICT (manifest_id, artifact_cid) DO NOTHING
-                ",
-            )
-            .bind(manifest_id)
-            .bind(artifact_cids)
-            .execute(&mut **tx)
-            .await?;
+            link_indexed_manifest_artifacts(tx, manifest_id, artifact_cids).await?;
         }
 
         Ok(())
@@ -1490,6 +1488,39 @@ async fn pending_manifest_publication(
         sequence: i64_to_u64(sequence, "ipns_sequence")?,
         artifact_cids,
     }))
+}
+
+async fn link_indexed_manifest_artifacts(
+    tx: &mut Transaction<'_, Postgres>,
+    manifest_id: i64,
+    artifact_cids: &[String],
+) -> Result<(), AuditError> {
+    sqlx::query(
+        r"
+        INSERT INTO published_indexed_manifest_artifacts (manifest_id, artifact_cid)
+        SELECT $1, artifact_cid
+        FROM UNNEST($2::TEXT[]) AS artifact_cid
+        ON CONFLICT (manifest_id, artifact_cid) DO NOTHING
+        ",
+    )
+    .bind(manifest_id)
+    .bind(artifact_cids)
+    .execute(&mut **tx)
+    .await?;
+    // A reused chunk gets no new artifact pin, so this keeps it retained for the retention
+    // interval after its last referencing manifest.
+    sqlx::query(
+        r"
+        UPDATE published_indexed_artifacts
+        SET last_referenced_at = now()
+        WHERE cid = ANY($1::TEXT[])
+          AND unpinned_at IS NULL
+        ",
+    )
+    .bind(artifact_cids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn reject_unresolved_pending(

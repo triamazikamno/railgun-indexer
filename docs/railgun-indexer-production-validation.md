@@ -402,6 +402,38 @@ Expected result:
 - Wallet scan chunks use `range_kind = 'block'` and may be sparse; chunk gaps are valid empty block spans, not publication failures.
 - Commitment chunks use `range_kind = 'tree_position'`.
 
+## Incremental Publication And Offline Maintenance
+
+Between full derivations the publisher keeps the chunks of the manifest it last
+published and derives only the tail of each dataset from indexed rows. It
+derives every chunk in the first cycle after start, in the cycle after a failed
+one, and once 24 hours have passed since the last full derivation. It notices a
+reorg rewind through the indexed block headers, but not a row changed by
+anything other than the indexer.
+
+`backfill_legacy_shields` and `backfill_indexed_log_timestamps` rewrite indexed
+rows, so they refuse to run while the publisher holds its database lock. They
+exit with `publisher advisory lock is held; stop the publisher before running
+this process` and write nothing. Stop the publisher, run the tool, then start
+the publisher again. Its first cycle derives every chunk, so expect that cycle
+to take as long as a cycle did before chunk reuse.
+
+After editing indexed rows by hand, restart the publisher so that its next cycle
+derives every chunk from the edited rows.
+
+Each periodic full derivation compares the chunks it would otherwise have
+reused with the ones it derived. Check `/status`:
+
+```bash
+curl -fsS http://127.0.0.1:8080/status
+```
+
+Expected result:
+
+- `chain_indexed_reuse_mismatches` is empty.
+- Each entry has `chain_id`, `railgun_contract`, `dataset`, `range_start`, `range_end`, and `detected_unix_seconds`, and names a reused chunk whose range, SHA-256, or CID differed from what the indexed rows produce. The publisher logs the same mismatch as an error, `full derivation changed a chunk that chain-indexed publication would have reused`. It records an entry only after the cycle has validated its watermarks and selected the fully derived chunks for the manifest. An entry does not by itself prove that the manifest's IPNS publication succeeded. An entry means indexed rows changed without the publisher noticing, for example through a manual edit while the publisher was running. Find the cause before release.
+- The list only grows while the process runs and clears when the publisher restarts.
+
 ## Filebase And Gateway Checks
 
 Sample active CIDs from the audit table:

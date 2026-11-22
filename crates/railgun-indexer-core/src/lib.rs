@@ -13,6 +13,7 @@ pub mod poi_v4;
 pub mod public_txid;
 pub mod publication_sequence;
 pub mod publish;
+pub mod publisher_lock;
 pub mod scrape;
 pub mod snapshot;
 pub mod status;

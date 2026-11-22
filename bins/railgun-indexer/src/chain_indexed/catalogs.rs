@@ -6,20 +6,22 @@ impl ChainIndexedPublicationScheduler {
         &self,
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
-        max_block: u64,
-    ) -> Result<Vec<PublishedCatalog>> {
+        height: &LatestIndexedHeight,
+        reuse: ChunkReuse<'_>,
+    ) -> Result<(Vec<PublishedCatalog>, RememberedDataset)> {
+        let max_block = height.block_number;
         self.validate_public_txid_compatibility_omissions(chain, max_block)
             .await?;
-        if !chain.public_txid_compatibility_omissions.is_empty() {
-            warn!(target: LOG_TARGET,
-                chain_id = chain.chain_id,
-                omission_count = chain.public_txid_compatibility_omissions.len(),
-                "publishing public TXID catalog with compatibility omissions"
-            );
+        if let ChunkReuse::ReuseAll(previous) = reuse {
+            return self
+                .reuse_all_chunks(scope, previous, CatalogCoverage::DerivedFromChunks)
+                .await;
         }
-        let mut offset = 0_u64;
-        let mut chunks = Vec::new();
-        let mut checkpoint = PublicTxidCheckpoint::default();
+        // Pages end chunks, so derivation restarts at the page that held the last chunk.
+        let mut checkpoint = reuse.public_txid_checkpoint()?;
+        let mut offset = reuse.restart(0);
+        let mut chunks = reuse.kept_chunks(0);
+        let mut restart = offset;
         loop {
             let row_limit = public_txid_chunk_row_limit(
                 offset,
@@ -41,10 +43,13 @@ impl ChainIndexedPublicationScheduler {
             if rows.is_empty() {
                 break;
             }
+            restart = offset;
             let page_row_count = rows.len();
             let page_scope = scope.clone();
+            let planning = self.chunk_planning;
             let (returned_checkpoint, prepared) = run_blocking(move || {
-                let prepared = prepare_public_txid_page(&page_scope, &rows, &mut checkpoint)?;
+                let prepared =
+                    prepare_public_txid_page(&page_scope, &rows, &mut checkpoint, planning)?;
                 Ok((checkpoint, prepared))
             })
             .await?;
@@ -60,15 +65,42 @@ impl ChainIndexedPublicationScheduler {
                 break;
             }
         }
-        self.publish_catalogs(
-            scope,
-            IndexedDatasetKind::PublicTxid,
-            chunks,
-            CatalogCoverage::DerivedFromChunks,
-        )
-        .await
+        let remembered = RememberedDataset::new(height, chunks, restart, checkpoint);
+        self.publish_remembered(scope, remembered, CatalogCoverage::DerivedFromChunks)
+            .await
     }
 
+    /// Publishes the remembered chunks unchanged because the dataset's indexed height did not move.
+    async fn reuse_all_chunks(
+        &self,
+        scope: &ChainScope,
+        previous: &RememberedDataset,
+        coverage: CatalogCoverage,
+    ) -> Result<(Vec<PublishedCatalog>, RememberedDataset)> {
+        self.publish_remembered(scope, previous.clone(), coverage)
+            .await
+    }
+
+    /// Publishes the catalog of `remembered`'s chunks and returns it with `remembered`.
+    async fn publish_remembered(
+        &self,
+        scope: &ChainScope,
+        remembered: RememberedDataset,
+        coverage: CatalogCoverage,
+    ) -> Result<(Vec<PublishedCatalog>, RememberedDataset)> {
+        let catalogs = self
+            .publish_catalogs(
+                scope,
+                remembered.dataset_kind,
+                remembered.chunks.clone(),
+                coverage,
+            )
+            .await?;
+        Ok((catalogs, remembered))
+    }
+
+    /// Checks that every configured omission through `max_block` matches exactly one canonical
+    /// row, and warns when the catalog will be published with omissions.
     async fn validate_public_txid_compatibility_omissions(
         &self,
         chain: &ChainIndexedChainConfig,
@@ -98,6 +130,13 @@ impl ChainIndexedPublicationScheduler {
                     match_count,
                 ));
             }
+        }
+        if !chain.public_txid_compatibility_omissions.is_empty() {
+            warn!(target: LOG_TARGET,
+                chain_id = chain.chain_id,
+                omission_count = chain.public_txid_compatibility_omissions.len(),
+                "publishing public TXID catalog with compatibility omissions"
+            );
         }
         Ok(())
     }
@@ -159,21 +198,34 @@ impl ChainIndexedPublicationScheduler {
         &self,
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
-        max_block: u64,
-    ) -> Result<Vec<PublishedCatalog>> {
+        height: &LatestIndexedHeight,
+        reuse: ChunkReuse<'_>,
+    ) -> Result<(Vec<PublishedCatalog>, RememberedDataset)> {
+        let max_block = height.block_number;
         if max_block < chain.start_block {
-            return Ok(Vec::new());
+            return Ok((
+                Vec::new(),
+                RememberedDataset::new(height, Vec::new(), 0, PublicTxidCheckpoint::default()),
+            ));
         }
+        let coverage = CatalogCoverage::ExplicitBlockRange {
+            start_block: chain.start_block,
+            indexed_through_block: max_block,
+        };
 
+        if let ChunkReuse::ReuseAll(previous) = reuse {
+            return self.reuse_all_chunks(scope, previous, coverage).await;
+        }
+        // Restarting at the bucket that holds the last chunk's start keeps bucket alignment.
+        let mut chunks = reuse.kept_chunks(chain.start_block);
         let plan_items = self
-            .wallet_scan_plan_items(chain, scope, chain.start_block, max_block)
+            .wallet_scan_plan_items(chain, scope, reuse.restart(chain.start_block), max_block)
             .await?;
+        let planning = self.chunk_planning;
         let planned_chunks = run_blocking(move || {
-            plan_chunks(&plan_items, ChunkPlanningConfig::default())
-                .wrap_err("plan wallet-scan artifact chunks")
+            plan_chunks(&plan_items, planning).wrap_err("plan wallet-scan artifact chunks")
         })
         .await?;
-        let mut chunks = Vec::new();
         for planned in planned_chunks {
             let rows = self
                 .store
@@ -207,56 +259,36 @@ impl ChainIndexedPublicationScheduler {
                 .await?;
             chunks.push(published.descriptor);
         }
-        self.publish_catalogs(
-            scope,
-            IndexedDatasetKind::WalletScan,
-            chunks,
-            CatalogCoverage::ExplicitBlockRange {
-                start_block: chain.start_block,
-                indexed_through_block: max_block,
-            },
-        )
-        .await
+        let remembered = RememberedDataset::new(height, chunks, 0, PublicTxidCheckpoint::default());
+        self.publish_remembered(scope, remembered, coverage).await
     }
 
     pub(super) async fn publish_commitment_catalog(
         &self,
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
-        max_block: u64,
-    ) -> Result<Vec<PublishedCatalog>> {
-        let summaries = self
-            .store
-            .commitment_tree_summaries(
-                EVM_CHAIN_TYPE,
-                chain.chain_id,
-                chain.railgun_contract,
-                Some(max_block),
-            )
-            .await
-            .wrap_err("read commitment tree summaries for commitment publication")?;
-        let mut max_position = None;
-        for summary in summaries {
-            let last_position = summary
-                .leaf_count
-                .checked_sub(1)
-                .ok_or_else(|| eyre!("commitment tree summary has zero leaves"))?;
-            let tree_start = u64::from(summary.tree_number)
-                .checked_mul(TREE_LEAF_COUNT)
-                .ok_or_else(|| eyre!("commitment tree global position overflow"))?;
-            let global_position = tree_start
-                .checked_add(last_position)
-                .ok_or_else(|| eyre!("commitment tree global position overflow"))?;
-            max_position =
-                Some(max_position.map_or(global_position, |value: u64| value.max(global_position)));
+        height: &LatestIndexedHeight,
+        reuse: ChunkReuse<'_>,
+    ) -> Result<(Vec<PublishedCatalog>, RememberedDataset)> {
+        let max_block = height.block_number;
+        if let ChunkReuse::ReuseAll(previous) = reuse {
+            return self
+                .reuse_all_chunks(scope, previous, CatalogCoverage::DerivedFromChunks)
+                .await;
         }
-        let Some(max_position) = max_position else {
-            return Ok(Vec::new());
+        // Windows end chunks, so derivation restarts at the window that held the last chunk.
+        let mut start_position = reuse.restart(0);
+        let mut chunks = reuse.kept_chunks(0);
+        let Some(max_position) = self.max_commitment_position(chain, max_block).await? else {
+            return Ok((
+                Vec::new(),
+                RememberedDataset::new(height, Vec::new(), 0, PublicTxidCheckpoint::default()),
+            ));
         };
 
-        let mut start_position = 0_u64;
-        let mut chunks = Vec::new();
+        let mut restart = start_position;
         while start_position <= max_position {
+            let window_start = start_position;
             let end_position = start_position
                 .saturating_add(
                     self.config
@@ -281,11 +313,12 @@ impl ChainIndexedPublicationScheduler {
                 start_position = end_position.saturating_add(1);
                 continue;
             }
+            restart = window_start;
             let page_scope = scope.clone();
+            let planning = self.chunk_planning;
             let planned_chunks = run_blocking(move || {
                 let plan_items = commitment_plan_items(&page_scope, &rows)?;
-                plan_chunks(&plan_items, ChunkPlanningConfig::default())
-                    .wrap_err("plan commitment artifact chunks")
+                plan_chunks(&plan_items, planning).wrap_err("plan commitment artifact chunks")
             })
             .await?;
             for planned in planned_chunks {
@@ -314,21 +347,62 @@ impl ChainIndexedPublicationScheduler {
                 chunks.push(published.descriptor);
             }
         }
-        self.publish_catalogs(
-            scope,
-            IndexedDatasetKind::Commitments,
-            chunks,
-            CatalogCoverage::DerivedFromChunks,
-        )
-        .await
+        let remembered =
+            RememberedDataset::new(height, chunks, restart, PublicTxidCheckpoint::default());
+        self.publish_remembered(scope, remembered, CatalogCoverage::DerivedFromChunks)
+            .await
+    }
+
+    /// Highest global commitment position indexed through `max_block`, if any tree has leaves.
+    async fn max_commitment_position(
+        &self,
+        chain: &ChainIndexedChainConfig,
+        max_block: u64,
+    ) -> Result<Option<u64>> {
+        let summaries = self
+            .store
+            .commitment_tree_summaries(
+                EVM_CHAIN_TYPE,
+                chain.chain_id,
+                chain.railgun_contract,
+                Some(max_block),
+            )
+            .await
+            .wrap_err("read commitment tree summaries for commitment publication")?;
+        let mut max_position = None;
+        for summary in summaries {
+            let last_position = summary
+                .leaf_count
+                .checked_sub(1)
+                .ok_or_else(|| eyre!("commitment tree summary has zero leaves"))?;
+            let tree_start = u64::from(summary.tree_number)
+                .checked_mul(TREE_LEAF_COUNT)
+                .ok_or_else(|| eyre!("commitment tree global position overflow"))?;
+            let global_position = tree_start
+                .checked_add(last_position)
+                .ok_or_else(|| eyre!("commitment tree global position overflow"))?;
+            max_position =
+                Some(max_position.map_or(global_position, |value: u64| value.max(global_position)));
+        }
+        Ok(max_position)
     }
 
     pub(super) async fn publish_merkle_checkpoint_catalog(
         &self,
         chain: &ChainIndexedChainConfig,
         scope: &ChainScope,
-        max_block: u64,
-    ) -> Result<Vec<PublishedCatalog>> {
+        height: &LatestIndexedHeight,
+        reuse: ChunkReuse<'_>,
+    ) -> Result<(Vec<PublishedCatalog>, RememberedDataset)> {
+        let max_block = height.block_number;
+        if let ChunkReuse::ReuseAll(previous) = reuse {
+            return self
+                .reuse_all_chunks(scope, previous, CatalogCoverage::DerivedFromChunks)
+                .await;
+        }
+        // One artifact per tree, in tree order, so every tree before the last remembered one is
+        // unchanged.
+        let mut chunks = reuse.kept_chunks(0);
         let summaries = self
             .store
             .commitment_tree_summaries(
@@ -339,8 +413,8 @@ impl ChainIndexedPublicationScheduler {
             )
             .await
             .wrap_err("read commitment tree summaries for checkpoint publication")?;
-        let mut chunks = Vec::new();
-        for summary in summaries {
+        let reused_tree_count = chunks.len();
+        for summary in summaries.into_iter().skip(reused_tree_count) {
             let checkpoint = self
                 .store
                 .commitment_tree_checkpoint(
@@ -373,13 +447,9 @@ impl ChainIndexedPublicationScheduler {
                 .await?;
             chunks.push(published.descriptor);
         }
-        self.publish_catalogs(
-            scope,
-            IndexedDatasetKind::MerkleCheckpoint,
-            chunks,
-            CatalogCoverage::DerivedFromChunks,
-        )
-        .await
+        let remembered = RememberedDataset::new(height, chunks, 0, PublicTxidCheckpoint::default());
+        self.publish_remembered(scope, remembered, CatalogCoverage::DerivedFromChunks)
+            .await
     }
 
     async fn publish_catalogs(

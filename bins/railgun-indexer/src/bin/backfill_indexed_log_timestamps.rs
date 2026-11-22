@@ -10,12 +10,16 @@ use clap::{Parser, ValueEnum};
 use eyre::{Context, Result, bail, eyre};
 use railgun_indexer_core::chain_logs::block_timestamp_for_source;
 use railgun_indexer_core::config::{ChainIndexedChainConfig, Config};
+use railgun_indexer_core::publisher_lock::{
+    PUBLISHER_ADVISORY_LOCK_NAME, try_acquire_publisher_lock,
+};
 use railgun_indexer_core::store::{
     Store, StoredMissingWalletScanTimestampBlock, StoredWalletScanTimestampBackfill, run_migrations,
 };
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
+use sqlx::postgres::PgAdvisoryLock;
 use tracing_subscriber::EnvFilter;
 
 const EVM_CHAIN_TYPE: u8 = 0;
@@ -126,6 +130,8 @@ async fn main() -> Result<()> {
         .connect_postgres()
         .await
         .wrap_err("connect postgres")?;
+    let publisher_lock = PgAdvisoryLock::new(PUBLISHER_ADVISORY_LOCK_NAME);
+    let _publisher_lock_guard = try_acquire_publisher_lock(&publisher_lock, &pool).await?;
     run_migrations(&pool).await.wrap_err("run migrations")?;
     let store = Store::new(pool);
 

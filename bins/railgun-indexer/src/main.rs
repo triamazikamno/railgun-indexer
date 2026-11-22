@@ -35,15 +35,16 @@ use railgun_indexer_core::publish::ipns::{
     PublisherIdentities, amount_statistics_public_identity, signing_key_peer_id,
     v4_poi_public_identity, validate_publisher_identities,
 };
+use railgun_indexer_core::publisher_lock::{
+    PUBLISHER_ADVISORY_LOCK_NAME, try_acquire_publisher_lock,
+};
 use railgun_indexer_core::scrape::Orchestrator;
 use railgun_indexer_core::snapshot::Lifecycle;
 use railgun_indexer_core::status::{SharedStatus, Status};
 use railgun_indexer_core::store::{Store, run_migrations};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::pool::PoolConnection;
-use sqlx::postgres::{PgAdvisoryLock, PgAdvisoryLockGuard};
-use sqlx::{Either, Postgres};
+use sqlx::postgres::PgAdvisoryLock;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -73,7 +74,6 @@ const EVM_CHAIN_TYPE: u8 = 0;
 const RETENTION_SWEEP_INTERVAL_CAP: Duration = Duration::from_mins(10);
 const V4_BRIDGE_RETENTION_TARGET: Duration = Duration::from_hours(168);
 const BACKGROUND_TASK_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const PUBLISHER_ADVISORY_LOCK_NAME: &str = "railgun-indexer/publication-owner/v1";
 
 #[derive(Debug, Parser)]
 #[command(name = "railgun-indexer")]
@@ -314,28 +314,6 @@ fn init_ipns_publishers(
     Ok([v4_poi, chain_indexed, amount_statistics])
 }
 
-type PublisherLockGuard<'lock> = PgAdvisoryLockGuard<'lock, PoolConnection<Postgres>>;
-
-async fn try_acquire_publisher_lock<'lock>(
-    lock: &'lock PgAdvisoryLock,
-    pool: &sqlx::PgPool,
-) -> Result<PublisherLockGuard<'lock>> {
-    match lock
-        .try_acquire(
-            pool.acquire()
-                .await
-                .wrap_err("acquire publisher lock connection")?,
-        )
-        .await
-        .wrap_err("try publisher advisory lock")?
-    {
-        Either::Left(guard) => Ok(guard),
-        Either::Right(_) => Err(eyre!(
-            "publisher advisory lock is held; stop the publisher before running this process"
-        )),
-    }
-}
-
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct V4PoiPublicIdentityOutput {
     manifest_signing_public_key: String,
@@ -505,9 +483,10 @@ async fn run_background_tasks(
                     store,
                     ipfs_pinner,
                     chain_indexed_publisher,
-                    amount_statistics_ipns_publisher.map(|publisher| (publisher, status)),
+                    amount_statistics_ipns_publisher,
                     pin_lifecycle,
                     chain_canonicality,
+                    status,
                     shutdown,
                 )
                 .await

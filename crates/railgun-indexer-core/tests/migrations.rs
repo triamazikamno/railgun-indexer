@@ -3199,6 +3199,95 @@ async fn retention_prunes_stale_indexed_artifacts() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
+async fn retention_keeps_reused_indexed_artifact_after_its_manifest_is_superseded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping reused indexed artifact retention test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    let store = Store::new(pool.clone());
+    let reused_cid = raw_block_cid(b"reused indexed chunk")?;
+    let first_manifest_cid = raw_block_cid(b"manifest listing reused chunk")?;
+    let second_manifest_cid = raw_block_cid(b"manifest without reused chunk")?;
+
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_artifact_pin(
+        &mut tx,
+        IndexedArtifactPublicationKind::Chunk,
+        ManifestIndexedDatasetKind::WalletScan,
+        &indexed_scope(),
+        &indexed_block_range(0, 9),
+        &reused_cid,
+        128,
+        &[41_u8; 32],
+        1,
+    )
+    .await?;
+    tx.commit().await?;
+    // The chunk was last pinned long ago and only manifests have referenced it since.
+    sqlx::query("UPDATE published_indexed_artifacts SET last_referenced_at = to_timestamp(100)")
+        .execute(&pool)
+        .await?;
+
+    let mut tx = store.begin().await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &first_manifest_cid,
+        &[reused_cid.to_string()],
+        10,
+        96,
+        &[42_u8; 32],
+        1,
+        "{}",
+    )
+    .await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &first_manifest_cid, 10).await?;
+    Audit::record_indexed_manifest_pin(
+        &mut tx,
+        &second_manifest_cid,
+        &[],
+        11,
+        96,
+        &[43_u8; 32],
+        1,
+        "{}",
+    )
+    .await?;
+    Audit::record_indexed_manifest_ipns_publication(&mut tx, &second_manifest_cid, 11).await?;
+    tx.commit().await?;
+
+    let ipfs_client = RecordingIpfsClient::default();
+    let sweep = Retention::sweep(
+        &pool,
+        &ipfs_client,
+        std::time::SystemTime::now(),
+        Duration::from_hours(1),
+    )
+    .await?;
+    assert!(!sweep.unpinned_cids.contains(&reused_cid));
+    assert!(
+        !ipfs_client
+            .unpinned_cids()
+            .contains(&reused_cid.to_string())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn retention_first_forces_concurrent_reuse_to_observe_unpinned_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let node = match Postgres::default().start().await {

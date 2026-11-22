@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use broadcaster_core::contracts::railgun::{CommitmentPreimage, ShieldCiphertext, TokenData};
 use cid::Cid;
 use railgun_indexer_core::chain_logs::{
-    IndexedLogBatch, IndexedLogSource, IndexedShieldCommitment,
+    IndexedLogBatch, IndexedLogSource, IndexedPublicTransaction, IndexedShieldCommitment,
 };
 use railgun_indexer_core::manifest::{AmountStatisticsCoveredBlock, AmountStatisticsError};
 use railgun_indexer_core::publish::ipfs::raw_block_cid;
@@ -358,6 +358,27 @@ async fn publication_lease_blocks_reorg_until_release() {
         .expect("reorg acquisition timeout")
         .expect("reorg acquired notification");
     reorg.await.expect("reorg task");
+
+    let mut writer = coordinator.reorg_lease().await;
+    let snapshot_coordinator = coordinator.clone();
+    let snapshot = tokio::spawn(async move {
+        snapshot_coordinator
+            .publication_lease()
+            .await
+            .rewind_generation()
+    });
+    *writer += 1;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !snapshot.is_finished(),
+        "a generation snapshot must wait for the active writer"
+    );
+    drop(writer);
+    let generation = tokio::time::timeout(Duration::from_secs(1), snapshot)
+        .await
+        .expect("generation snapshot timeout")
+        .expect("generation snapshot task");
+    assert_eq!(generation, 1);
 }
 
 #[tokio::test]
@@ -568,28 +589,68 @@ fn publication_watermark_rejects_rewind_or_replacement_hash() -> Result<()> {
 }
 
 #[test]
-fn latest_indexed_block_returns_dataset_watermark() {
-    let latest_indexed = vec![
-        LatestIndexedHeight {
-            dataset_kind: IndexedDatasetKind::WalletScan,
-            block_number: 100,
-            block_hash: FixedBytes::from([1_u8; 32]),
-        },
-        LatestIndexedHeight {
-            dataset_kind: IndexedDatasetKind::PublicTxid,
-            block_number: 200,
-            block_hash: FixedBytes::from([2_u8; 32]),
-        },
-    ];
+fn chunk_reuse_requires_the_remembered_header() {
+    let height = |block_number: u64, hash: u8| LatestIndexedHeight {
+        dataset_kind: IndexedDatasetKind::PublicTxid,
+        block_number,
+        block_hash: FixedBytes::from([hash; 32]),
+    };
+    let remembered = RememberedDataset::new(
+        &height(100, 1),
+        Vec::new(),
+        0,
+        PublicTxidCheckpoint::default(),
+    );
+    let decide = |remembered: Option<&RememberedDataset>,
+                  current: LatestIndexedHeight,
+                  stored: Option<[u8; 32]>| {
+        match chunk_reuse(remembered, &current, stored) {
+            ChunkReuse::DeriveAll => "derive all",
+            ChunkReuse::ReuseAll(_) => "reuse all",
+            ChunkReuse::ReuseAllButLast(_) => "reuse all but last",
+        }
+    };
 
+    assert_eq!(decide(None, height(100, 1), Some([1; 32])), "derive all");
     assert_eq!(
-        latest_indexed_block(&latest_indexed, IndexedDatasetKind::PublicTxid),
-        Some(200)
+        decide(Some(&remembered), height(100, 1), Some([1; 32])),
+        "reuse all"
     );
     assert_eq!(
-        latest_indexed_block(&latest_indexed, IndexedDatasetKind::Commitments),
-        None
+        decide(Some(&remembered), height(120, 2), Some([1; 32])),
+        "reuse all but last"
     );
+    assert_eq!(
+        decide(Some(&remembered), height(120, 2), None),
+        "derive all"
+    );
+    assert_eq!(
+        decide(Some(&remembered), height(120, 2), Some([3; 32])),
+        "derive all"
+    );
+    assert_eq!(
+        decide(Some(&remembered), height(90, 2), Some([1; 32])),
+        "derive all"
+    );
+}
+
+#[test]
+fn full_derivation_is_due_daily_and_after_a_clock_rewind() {
+    let last = UNIX_EPOCH + Duration::from_hours(48);
+
+    assert!(full_derivation_due(None, last));
+    assert!(!full_derivation_due(
+        Some(last),
+        last + FULL_DERIVATION_INTERVAL - Duration::from_secs(1)
+    ));
+    assert!(full_derivation_due(
+        Some(last),
+        last + FULL_DERIVATION_INTERVAL
+    ));
+    assert!(full_derivation_due(
+        Some(last),
+        last - Duration::from_secs(1)
+    ));
 }
 
 #[tokio::test]
@@ -814,6 +875,308 @@ async fn chain_indexed_manifest_bytes_are_identical_with_statistics_enabled_and_
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn incremental_publication_equals_full_derivation() -> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    index_reuse_blocks(
+        &store,
+        &[(100, 0), (200, 1), (300, 2), (400, 3), (500, 4)],
+        1,
+    )
+    .await?;
+    let ipfs = Arc::new(ReconciliationIpfs::default());
+    let mut scheduler = reuse_scheduler(&store, ipfs.clone())?;
+    let chain = scheduler.config.chain_indexed.chains[0].clone();
+    let published = scheduler
+        .publish_chain_entry(&chain, true)
+        .await?
+        .expect("published chain entry");
+    for dataset in &published.remembered {
+        assert!(
+            dataset.dataset_kind == IndexedDatasetKind::MerkleCheckpoint
+                || dataset.chunks.len() > 1,
+            "{:?} needs several chunks",
+            dataset.dataset_kind
+        );
+    }
+    scheduler.remember_published_chains(vec![(
+        (chain.chain_id, chain.railgun_contract),
+        published.remembered,
+    )]);
+
+    // Block 550 grows the last public TXID page, commitment window and wallet-scan bucket.
+    index_reuse_blocks(&store, &[(550, 5), (800, 6)], 1).await?;
+    let (incremental_checks, full_checks) =
+        assert_incremental_equals_full(&mut scheduler, &ipfs, &store, &chain).await?;
+    assert!(
+        incremental_checks < full_checks,
+        "an append must reuse chunks: {incremental_checks} checks against {full_checks}"
+    );
+
+    let mut tx = store.begin().await?;
+    Store::rewind_chain_indexing_to_replay_block(&mut tx, EVM_CHAIN_TYPE, 1, REUSE_RAILGUN, 700)
+        .await?;
+    tx.commit().await?;
+    index_reuse_blocks(&store, &[(750, 6), (850, 7)], 2).await?;
+    assert_incremental_equals_full(&mut scheduler, &ipfs, &store, &chain).await?;
+
+    assert_incremental_equals_full(&mut scheduler, &ipfs, &store, &chain).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn failed_cycle_forgets_remembered_chunks() -> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    index_reuse_blocks(&store, &[(100, 0), (200, 1), (300, 2)], 1).await?;
+    let ipfs = Arc::new(ReconciliationIpfs::default());
+    let mut scheduler = reuse_scheduler(&store, ipfs.clone())?;
+    let chain = scheduler.config.chain_indexed.chains[0].clone();
+    let published = scheduler
+        .publish_chain_entry(&chain, true)
+        .await?
+        .expect("published chain entry");
+    scheduler.remember_published_chains(vec![(
+        (chain.chain_id, chain.railgun_contract),
+        published.remembered,
+    )]);
+
+    // The IPNS task is not running, so the cycle fails after recording its manifest.
+    let _ = scheduler
+        .publish_cycle(UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP))
+        .await
+        .expect_err("chain-indexed IPNS publication is unavailable");
+
+    assert!(scheduler.remembered_chains.is_empty());
+    assert_incremental_equals_full(&mut scheduler, &ipfs, &store, &chain).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn cycle_rejects_derivation_that_overlapped_a_reorg_rewind() -> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    let blocks = [(100, 0), (200, 1), (300, 2)];
+    index_reuse_blocks(&store, &blocks, 1).await?;
+    let ipfs = Arc::new(ReconciliationIpfs::default());
+    let mut scheduler = reuse_scheduler(&store, ipfs.clone())?;
+    let chain = scheduler.config.chain_indexed.chains[0].clone();
+    let mut published = scheduler
+        .publish_chain_entry(&chain, true)
+        .await?
+        .expect("published chain entry");
+    // A stale remembered chunk gives the full derivation a mismatch that rejection must discard.
+    published
+        .remembered
+        .iter_mut()
+        .find(|dataset| dataset.dataset_kind == IndexedDatasetKind::PublicTxid)
+        .expect("public TXID dataset")
+        .chunks[0]
+        .sha256 = FixedBytes::ZERO;
+    scheduler.remember_published_chains(vec![(
+        (chain.chain_id, chain.railgun_contract),
+        published.remembered,
+    )]);
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *ipfs.park.lock().expect("park lock") = Some((parked_tx, release_rx));
+
+    // Block 300 has another hash on both reads, before and after taking the reorg lease.
+    let asserter = Asserter::new();
+    asserter.push_success(&statistics_block_json());
+    asserter.push_success(&statistics_block_json());
+    let provider = ProviderBuilder::new()
+        .connect_mocked_client(asserter)
+        .root()
+        .clone();
+    let runtime = ChainRuntime {
+        chain: chain.clone(),
+        provider: provider.clone(),
+        archive_provider: provider,
+    };
+    let mut reorg_config = scheduler.config.clone();
+    // Replay then starts at the chain's start block, so no earlier header is fetched.
+    reorg_config.chain_indexed.max_blocks_per_batch = 1_000;
+    let canonicality = scheduler.canonicality.clone();
+    let rewind_and_replay = async {
+        parked_rx.await?;
+        let resume_block =
+            resume_block_after_reorg(&store, &reorg_config, &runtime, &canonicality).await?;
+        assert_eq!(resume_block, chain.start_block);
+        // Replay restores the cycle's watermark heights and block hashes.
+        index_reuse_blocks(&store, &blocks, 1).await?;
+        let _ = release_tx.send(());
+        Ok::<_, eyre::Report>(())
+    };
+
+    let (cycle, rewind) = tokio::join!(
+        scheduler.publish_cycle(UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP)),
+        rewind_and_replay
+    );
+
+    rewind?;
+    let error = cycle.expect_err("a cycle that derived across a rewind must not publish");
+    assert!(
+        format_report_chain(&error)
+            .contains("reorg rewind committed during chain-indexed artifact derivation"),
+        "unexpected cycle error: {error:?}"
+    );
+    let manifests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM published_indexed_manifests")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(manifests, 0);
+    assert!(scheduler.remembered_chains.is_empty());
+    let mismatches = scheduler
+        .status
+        .read()
+        .await
+        .chain_indexed_reuse_mismatches
+        .clone();
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn periodic_full_derivation_reports_a_stale_remembered_chunk() -> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    index_reuse_blocks(&store, &[(100, 0), (200, 1), (300, 2)], 1).await?;
+    let ipfs = Arc::new(ReconciliationIpfs::default());
+    let mut scheduler = reuse_scheduler(&store, ipfs)?;
+    let chain = scheduler.config.chain_indexed.chains[0].clone();
+    let mut published = scheduler
+        .publish_chain_entry(&chain, true)
+        .await?
+        .expect("published chain entry");
+    let public_txid = published
+        .remembered
+        .iter_mut()
+        .find(|dataset| dataset.dataset_kind == IndexedDatasetKind::PublicTxid)
+        .expect("public TXID dataset");
+    let stale_range = public_txid.chunks[0].range.clone();
+    public_txid.chunks[0].sha256 = FixedBytes::ZERO;
+    scheduler.remember_published_chains(vec![(
+        (chain.chain_id, chain.railgun_contract),
+        published.remembered,
+    )]);
+
+    // No full derivation has been recorded, so the cycle derives every chunk. The IPNS task is
+    // not running, so the cycle fails after recording its manifest.
+    let _ = scheduler
+        .publish_cycle(UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP))
+        .await
+        .expect_err("chain-indexed IPNS publication is unavailable");
+
+    let pending = Audit::pending_indexed_manifest_publication(
+        store.pool(),
+        &scheduler.signing_key.verifying_key().to_bytes(),
+    )
+    .await?
+    .expect("pending chain-indexed manifest");
+    let fresh = reuse_scheduler(&store, Arc::new(ReconciliationIpfs::default()))?
+        .publish_chain_entry(&chain, true)
+        .await?
+        .expect("fresh chain entry");
+    assert_eq!(pending.manifest.chains, vec![fresh.entry]);
+    let mismatches = scheduler
+        .status
+        .read()
+        .await
+        .chain_indexed_reuse_mismatches
+        .clone();
+    assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+    assert_eq!(mismatches[0].chain_id, chain.chain_id);
+    assert_eq!(
+        mismatches[0].railgun_contract,
+        chain.railgun_contract.to_string()
+    );
+    assert_eq!(mismatches[0].dataset, IndexedDatasetKind::PublicTxid);
+    assert_eq!(
+        (mismatches[0].range_start, mismatches[0].range_end),
+        (stale_range.start, stale_range.end)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn full_derivation_without_catalogs_reports_mismatches_and_forgets_remembered_chunks()
+-> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    index_reuse_blocks(&store, &[(100, 0), (200, 1), (300, 2)], 1).await?;
+    let mut scheduler = reuse_scheduler(&store, Arc::new(ReconciliationIpfs::default()))?;
+    scheduler.config.chain_indexed.chains[0].datasets = vec![IndexedDatasetKind::PublicTxid];
+    let chain = scheduler.config.chain_indexed.chains[0].clone();
+    let published = scheduler
+        .publish_chain_entry(&chain, true)
+        .await?
+        .expect("published chain entry");
+    let remembered_ranges = published
+        .remembered
+        .iter()
+        .find(|dataset| dataset.dataset_kind == IndexedDatasetKind::PublicTxid)
+        .expect("public TXID dataset")
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.range.start, chunk.range.end))
+        .collect::<Vec<_>>();
+    assert_eq!(remembered_ranges.len(), 2);
+    scheduler.remember_published_chains(vec![(
+        (chain.chain_id, chain.railgun_contract),
+        published.remembered,
+    )]);
+    // An outside edit removes this chain's rows (the only chain); progress and headers stay.
+    let _ = sqlx::query("DELETE FROM indexed_public_txid_rows")
+        .execute(store.pool())
+        .await?;
+
+    let now = UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP);
+    scheduler.publish_cycle(now).await?;
+
+    let status = scheduler.status.clone();
+    let reported = || async {
+        status
+            .read()
+            .await
+            .chain_indexed_reuse_mismatches
+            .iter()
+            .map(|mismatch| {
+                (
+                    mismatch.chain_id,
+                    mismatch.railgun_contract.clone(),
+                    mismatch.dataset,
+                    mismatch.range_start,
+                    mismatch.range_end,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = remembered_ranges
+        .iter()
+        .map(|&(start, end)| {
+            (
+                chain.chain_id,
+                chain.railgun_contract.to_string(),
+                IndexedDatasetKind::PublicTxid,
+                start,
+                end,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reported().await, expected);
+    assert!(scheduler.remembered_chains.is_empty());
+    let manifests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM published_indexed_manifests")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(manifests, 0);
+    assert_eq!(store.last_chain_indexed_ipns_sequence().await?, None);
+
+    scheduler.publish_cycle(now).await?;
+    assert_eq!(reported().await, expected);
+    Ok(())
+}
+
 #[test]
 fn oversized_snapshot_keeps_the_chains_last_snapshot_and_reports_why() {
     let kept = statistics_entry(1, "bafykept");
@@ -891,6 +1254,10 @@ fn reconciliation_scheduler(
         last_ipns_sequence: None,
         ipns_sequence_loaded: false,
         shutdown,
+        chunk_planning: ChunkPlanningConfig::default(),
+        remembered_chains: HashMap::new(),
+        last_full_derivation: None,
+        status: Status::default().shared(),
     })
 }
 
@@ -955,16 +1322,34 @@ struct ReconciliationIpfs {
     pinned: Mutex<Vec<Vec<u8>>>,
     unpin_count: AtomicUsize,
     fail_unpin: AtomicBool,
+    contains_count: AtomicUsize,
+    /// When set, the first pin or availability check signals the sender and waits on the receiver.
+    park: Mutex<Option<ParkFirstCall>>,
 }
 
+type ParkFirstCall = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 impl ReconciliationIpfs {
+    async fn park_first_call(&self) {
+        let park = self.park.lock().expect("park lock").take();
+        if let Some((parked, release)) = park {
+            let _ = parked.send(());
+            let _ = release.await;
+        }
+    }
+
     fn returning(returned_cid: Cid) -> Self {
         Self {
             returned_cid: Some(returned_cid),
-            pinned: Mutex::new(Vec::new()),
-            unpin_count: AtomicUsize::new(0),
-            fail_unpin: AtomicBool::new(false),
+            ..Self::default()
         }
+    }
+
+    fn contains_count(&self) -> usize {
+        self.contains_count.load(Ordering::SeqCst)
     }
 
     fn pinned_bytes(&self) -> Vec<Vec<u8>> {
@@ -987,6 +1372,7 @@ impl IpfsClient for ReconciliationIpfs {
     }
 
     async fn pin_bytes(&self, bytes: &[u8]) -> Result<Cid, IpfsError> {
+        self.park_first_call().await;
         self.pinned
             .lock()
             .expect("pinned bytes lock")
@@ -1011,6 +1397,8 @@ impl IpfsClient for ReconciliationIpfs {
     }
 
     async fn contains(&self, _cid: &Cid) -> Result<bool, IpfsError> {
+        self.park_first_call().await;
+        self.contains_count.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
 }
@@ -1247,6 +1635,174 @@ fn statistics_block_json() -> serde_json::Value {
         "uncles": [],
         "transactions": [],
     })
+}
+
+const REUSE_RAILGUN: Address = Address::repeat_byte(0xee);
+
+/// A scheduler for chain 1 at `REUSE_RAILGUN` with all four datasets and limits low enough that a
+/// few rows give several chunks.
+fn reuse_scheduler(
+    store: &Store,
+    ipfs: Arc<ReconciliationIpfs>,
+) -> Result<ChainIndexedPublicationScheduler> {
+    let mut scheduler =
+        reconciliation_scheduler(store.clone(), ipfs, SigningKey::from_bytes(&[85; 32]))?;
+    scheduler.config.chain_indexed.public_txid_chunk_row_limit = 2;
+    scheduler.config.chain_indexed.commitment_chunk_row_limit = 2;
+    scheduler.chunk_planning = ChunkPlanningConfig {
+        target_compressed_bytes: 1,
+        soft_min_compressed_bytes: 1,
+        soft_max_compressed_bytes: 1,
+        ..ChunkPlanningConfig::default()
+    };
+    scheduler
+        .config
+        .chain_indexed
+        .chains
+        .push(ChainIndexedChainConfig {
+            chain_id: 1,
+            railgun_contract: REUSE_RAILGUN,
+            rpc_url: "http://127.0.0.1:9".to_string(),
+            ws_url: None,
+            archive_rpc_url: "http://127.0.0.1:9".to_string(),
+            start_block: 0,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            action_start_block: None,
+            datasets: vec![
+                IndexedDatasetKind::WalletScan,
+                IndexedDatasetKind::Commitments,
+                IndexedDatasetKind::MerkleCheckpoint,
+                IndexedDatasetKind::PublicTxid,
+            ],
+            public_txid_compatibility_omissions: Vec::new(),
+        });
+    Ok(scheduler)
+}
+
+/// Publishes `chain` on `scheduler` and on a fresh scheduler, asserts both entries are equal,
+/// remembers the incremental result as a published manifest would, and returns how many provider
+/// calls the incremental and the full derivation made. Every derived chunk and catalog costs one
+/// availability check or one pin; a reused chunk costs none.
+async fn assert_incremental_equals_full(
+    scheduler: &mut ChainIndexedPublicationScheduler,
+    ipfs: &ReconciliationIpfs,
+    store: &Store,
+    chain: &ChainIndexedChainConfig,
+) -> Result<(usize, usize)> {
+    let provider_calls = |ipfs: &ReconciliationIpfs| ipfs.contains_count() + ipfs.pin_count();
+    let calls_before = provider_calls(ipfs);
+    let incremental = scheduler
+        .publish_chain_entry(chain, false)
+        .await?
+        .expect("incremental chain entry");
+    let incremental_checks = provider_calls(ipfs) - calls_before;
+    let full_ipfs = Arc::new(ReconciliationIpfs::default());
+    let full = reuse_scheduler(store, full_ipfs.clone())?
+        .publish_chain_entry(chain, true)
+        .await?
+        .expect("full chain entry");
+
+    assert_eq!(incremental.entry, full.entry);
+    scheduler.remember_published_chains(vec![(
+        (chain.chain_id, chain.railgun_contract),
+        incremental.remembered,
+    )]);
+    Ok((incremental_checks, provider_calls(&full_ipfs)))
+}
+
+fn reuse_hash(block_number: u64, variant: u8) -> FixedBytes<32> {
+    let mut hash = [variant; 32];
+    hash[..8].copy_from_slice(&block_number.to_be_bytes());
+    FixedBytes::from(hash)
+}
+
+/// One shield and one public transaction at `block_number` and `tree_position`.
+fn reuse_block_batch(block_number: u64, tree_position: u64, variant: u8) -> IndexedLogBatch {
+    let source = IndexedLogSource {
+        block_number,
+        block_timestamp: Some(STATISTICS_BLOCK_TIMESTAMP + block_number),
+        block_hash: reuse_hash(block_number, variant),
+        transaction_hash: reuse_hash(block_number, !variant),
+        log_index: 0,
+    };
+    IndexedLogBatch {
+        shield_commitments: vec![IndexedShieldCommitment {
+            tree_number: 0,
+            tree_position,
+            preimage: CommitmentPreimage {
+                npk: FixedBytes::repeat_byte(variant),
+                token: TokenData {
+                    tokenType: 0,
+                    tokenAddress: Address::repeat_byte(0x11),
+                    tokenSubID: U256::ZERO,
+                },
+                value: Uint::<120, 2>::from(tree_position + 1),
+            },
+            shield_ciphertext: ShieldCiphertext {
+                encryptedBundle: [FixedBytes::repeat_byte(0x02); 3],
+                shieldKey: FixedBytes::repeat_byte(0x03),
+            },
+            source: source.clone(),
+        }],
+        public_transactions: vec![IndexedPublicTransaction {
+            source,
+            first_log_index: 0,
+            last_log_index: 0,
+            railgun_transaction_index: 0,
+            id: format!("0x{block_number:x}:{variant}"),
+            block_timestamp: STATISTICS_BLOCK_TIMESTAMP + block_number,
+            nullifiers: vec![FixedBytes::repeat_byte(variant)],
+            commitments: vec![FixedBytes::repeat_byte(0x22)],
+            bound_params_hash: FixedBytes::repeat_byte(0x23),
+            has_unshield: false,
+            unshield_preimage: None,
+            utxo_tree_in: 0,
+            utxo_tree_out: 0,
+            utxo_batch_start_position_out: tree_position,
+            railgun_txid: U256::from(block_number),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Indexes one shield and one public transaction per `(block, tree position)` and advances every
+/// dataset to the last block. `variant` changes every row and block hash.
+async fn index_reuse_blocks(store: &Store, blocks: &[(u64, u64)], variant: u8) -> Result<()> {
+    let mut tx = store.begin().await?;
+    for &(block_number, tree_position) in blocks {
+        let batch = reuse_block_batch(block_number, tree_position, variant);
+        Store::persist_indexed_log_batch(&mut tx, EVM_CHAIN_TYPE, 1, REUSE_RAILGUN, &batch).await?;
+        Store::record_indexed_block_header(
+            &mut tx,
+            EVM_CHAIN_TYPE,
+            1,
+            block_number,
+            reuse_hash(block_number, variant).as_slice(),
+            &[0; 32],
+        )
+        .await?;
+    }
+    let &(last_block, _) = blocks.last().expect("at least one block");
+    for dataset_kind in [
+        StoreDatasetKind::WalletScan,
+        StoreDatasetKind::Commitments,
+        StoreDatasetKind::MerkleCheckpoint,
+        StoreDatasetKind::PublicTxid,
+    ] {
+        Store::record_chain_indexing_progress(
+            &mut tx,
+            EVM_CHAIN_TYPE,
+            1,
+            REUSE_RAILGUN,
+            dataset_kind,
+            last_block,
+            reuse_hash(last_block, variant).as_slice(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 fn statistics_entry(chain_id: u64, cid: &str) -> AmountStatisticsChainEntry {

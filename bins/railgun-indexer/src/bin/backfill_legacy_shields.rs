@@ -11,7 +11,11 @@ use clap::Parser;
 use eyre::{Context, Result, bail};
 use railgun_indexer_core::chain_logs::{hydrate_indexed_log_source_timestamps, ingest_chain_logs};
 use railgun_indexer_core::config::{ChainIndexedChainConfig, Config};
+use railgun_indexer_core::publisher_lock::{
+    PUBLISHER_ADVISORY_LOCK_NAME, try_acquire_publisher_lock,
+};
 use railgun_indexer_core::store::{Store, run_migrations};
+use sqlx::postgres::PgAdvisoryLock;
 use tracing_subscriber::EnvFilter;
 
 const EVM_CHAIN_TYPE: u8 = 0;
@@ -68,6 +72,8 @@ async fn main() -> Result<()> {
         .connect_postgres()
         .await
         .wrap_err("connect postgres")?;
+    let publisher_lock = PgAdvisoryLock::new(PUBLISHER_ADVISORY_LOCK_NAME);
+    let _publisher_lock_guard = try_acquire_publisher_lock(&publisher_lock, &pool).await?;
     run_migrations(&pool).await.wrap_err("run migrations")?;
     let store = Store::new(pool);
 

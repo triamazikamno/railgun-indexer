@@ -196,12 +196,17 @@ pub fn public_txid_checkpoint_root(
 
 /// Leaf hashes of the TXID tree being published, so each chunk's checkpoint root reuses the hashes
 /// of earlier chunks.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PublicTxidCheckpoint {
     leaves: Vec<U256>,
 }
 
 impl PublicTxidCheckpoint {
+    /// Keeps at most the first `leaf_count` leaves, so extending resumes at that tree offset.
+    pub fn truncate(&mut self, leaf_count: usize) {
+        self.leaves.truncate(leaf_count);
+    }
+
     /// Appends `records` and returns the root of the tree prefix ending at the last record.
     pub fn extend(
         &mut self,
@@ -544,6 +549,23 @@ mod tests {
                 actual: 4
             })
         ));
+    }
+
+    #[test]
+    fn public_txid_checkpoint_truncate_resumes_tree_prefix() {
+        let records = (0..5)
+            .map(|index| record(index, 100 + index))
+            .collect::<Vec<_>>();
+        let mut checkpoint = PublicTxidCheckpoint::default();
+        checkpoint.extend(&records).expect("full prefix root");
+
+        checkpoint.truncate(2);
+        let root = checkpoint.extend(&records[2..]).expect("resumed root");
+
+        assert_eq!(
+            root,
+            public_txid_checkpoint_root(&records).expect("checkpoint root")
+        );
     }
 
     #[test]
