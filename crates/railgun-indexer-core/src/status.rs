@@ -18,6 +18,8 @@ pub struct Status {
     #[serde(rename = "poi_v4_publication")]
     pub poi_artifact_publication: Option<PoiArtifactPublicationStatus>,
     pub last_retention_sweep: Option<RetentionSweepStatus>,
+    /// Absent while amount-statistics publication is disabled or has not run.
+    pub amount_statistics: Option<AmountStatisticsPublicationStatus>,
 }
 
 impl Status {
@@ -45,6 +47,7 @@ impl Status {
             chain_indexed_peer_id: None,
             poi_artifact_publication: None,
             last_retention_sweep: None,
+            amount_statistics: None,
         }
     }
 
@@ -172,6 +175,28 @@ impl Status {
 
     pub fn clear_poi_artifact_publication(&mut self) {
         self.poi_artifact_publication = None;
+    }
+
+    /// Records the active amount-statistics manifest.
+    pub fn record_amount_statistics_publication(&mut self, manifest_cid: String, sequence: u64) {
+        let status = self.amount_statistics.get_or_insert_default();
+        status.manifest_cid = Some(manifest_cid);
+        status.sequence = Some(sequence);
+    }
+
+    /// Replaces the chains whose snapshot this cycle did not publish.
+    pub fn record_amount_statistics_chain_failures(
+        &mut self,
+        chain_failures: Vec<AmountStatisticsChainFailure>,
+    ) {
+        self.amount_statistics
+            .get_or_insert_default()
+            .chain_failures = chain_failures;
+    }
+
+    /// Records how the last amount-statistics cycle ended; `None` means it succeeded.
+    pub fn record_amount_statistics_error(&mut self, error: Option<String>) {
+        self.amount_statistics.get_or_insert_default().last_error = error;
     }
 
     pub fn record_retention_sweep(&mut self, unpinned_count: usize, failed_count: usize) {
@@ -309,6 +334,22 @@ impl From<&ManifestEntry> for PoiArtifactScopePublicationStatus {
                 .map(|bridge| bridge.range.end_index),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmountStatisticsPublicationStatus {
+    pub manifest_cid: Option<String>,
+    pub sequence: Option<u64>,
+    pub last_error: Option<String>,
+    /// Chains whose last published snapshot stays current, with the reason.
+    pub chain_failures: Vec<AmountStatisticsChainFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmountStatisticsChainFailure {
+    pub chain_id: u64,
+    pub railgun_contract: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

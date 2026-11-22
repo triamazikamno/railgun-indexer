@@ -99,6 +99,16 @@ pub struct ChainIndexedDatasetConfig {
     pub safe_confirmations: u64,
     pub public_txid_chunk_row_limit: u64,
     pub commitment_chunk_row_limit: u64,
+    #[serde(default)]
+    pub amount_statistics: AmountStatisticsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmountStatisticsConfig {
+    /// Publishes amount statistics after each chain-indexed cycle. Operators opt in.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -548,6 +558,7 @@ mod tests {
                 safe_confirmations: 12,
                 public_txid_chunk_row_limit: 1_000,
                 commitment_chunk_row_limit: 1_000,
+                amount_statistics: AmountStatisticsConfig::default(),
             },
         }
     }

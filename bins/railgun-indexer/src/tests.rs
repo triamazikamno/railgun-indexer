@@ -214,7 +214,7 @@ fn offline_identity_output_matches_vector_and_contains_only_public_values() -> R
 
     assert_eq!(
         output,
-        r#"{"manifest_signing_public_key":"0x03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8","v4_ipns_public_key":"0x56f6df3102df0467da6a5adc7ef6ff577fabf2944fd1bd606f6a47464f22abc9","v4_ipns_peer_id":"12D3KooWFfqZkgZyH41hEVExsTkwAEVk9bTmHdLTP99uD1uwWo52","v4_ipns_name":"k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft"}"#
+        r#"{"manifest_signing_public_key":"0x03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8","amount_statistics_ipns_name":"k51qzi5uqu5dkryf96orv3p8eanrw5v1fcluj6e0aw7t8kuexerybwex6p3y1w","v4_ipns_public_key":"0x56f6df3102df0467da6a5adc7ef6ff577fabf2944fd1bd606f6a47464f22abc9","v4_ipns_peer_id":"12D3KooWFfqZkgZyH41hEVExsTkwAEVk9bTmHdLTP99uD1uwWo52","v4_ipns_name":"k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft"}"#
     );
     assert!(!output.contains(&hex::encode(seed)));
     assert_eq!(
@@ -222,7 +222,7 @@ fn offline_identity_output_matches_vector_and_contains_only_public_values() -> R
             .as_object()
             .expect("identity JSON object")
             .len(),
-        4
+        5
     );
     Ok(())
 }

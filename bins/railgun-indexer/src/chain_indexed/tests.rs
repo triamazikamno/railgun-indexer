@@ -1,15 +1,24 @@
 use super::*;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256, Uint};
+use alloy::transports::mock::Asserter;
 use async_trait::async_trait;
+use broadcaster_core::contracts::railgun::{CommitmentPreimage, ShieldCiphertext, TokenData};
 use cid::Cid;
+use railgun_indexer_core::chain_logs::{
+    IndexedLogBatch, IndexedLogSource, IndexedShieldCommitment,
+};
+use railgun_indexer_core::manifest::{AmountStatisticsCoveredBlock, AmountStatisticsError};
 use railgun_indexer_core::publish::ipfs::raw_block_cid;
-use railgun_indexer_core::publish::ipns::IpnsPublisherConfig;
+use railgun_indexer_core::publish::ipns::{IpnsPublisherConfig, IpnsPublisherTask};
+use railgun_indexer_core::status::Status;
 use railgun_indexer_core::store::run_migrations;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::UNIX_EPOCH;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tokio::io::AsyncReadExt;
 
 #[tokio::test]
 #[ignore = "requires Docker PostgreSQL"]
@@ -583,6 +592,256 @@ fn latest_indexed_block_returns_dataset_watermark() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn statistics_failure_keeps_chain_indexed_outcome_and_unchanged_block_publishes_nothing()
+-> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    seed_statistics_chain(&store).await?;
+    let ipfs = Arc::new(ReconciliationIpfs::default());
+    let mut scheduler = reconciliation_scheduler(
+        store.clone(),
+        ipfs.clone(),
+        SigningKey::from_bytes(&[79; 32]),
+    )?;
+    let (status, asserter, _statistics_ipns_task) = enable_statistics(&mut scheduler)?;
+    let now = UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP);
+
+    // The amount-statistics IPNS task is held but never run, so its publication times out and the
+    // first manifest stays pending. The chain-indexed task is dropped, so a request sent through
+    // that publisher would fail as not running instead.
+    asserter.push_success(&statistics_block_json());
+    scheduler
+        .publish_cycles(now)
+        .await
+        .wrap_err("a statistics failure must not fail chain-indexed publication")?;
+    let first_error = status
+        .read()
+        .await
+        .amount_statistics
+        .clone()
+        .and_then(|statistics| statistics.last_error)
+        .unwrap_or_default();
+    assert!(
+        first_error.contains("timed out"),
+        "statistics manifest must use the amount-statistics IPNS publisher: {first_error}"
+    );
+    let (manifest_cid, sequence): (String, i64) =
+        sqlx::query_as("SELECT cid, ipns_sequence FROM published_amount_statistics_manifests")
+            .fetch_one(store.pool())
+            .await?;
+    // Checked as a wallet would: the envelope against the chain-indexed key, then the entry
+    // against the pinned compressed snapshot. Finding bytes by raw CID checks the CID.
+    let pinned = ipfs.pinned_bytes();
+    let pinned_at = |cid: &str| {
+        pinned
+            .iter()
+            .find(|bytes| {
+                raw_block_cid(bytes).is_ok_and(|pinned_cid| pinned_cid.to_string() == cid)
+            })
+            .unwrap_or_else(|| panic!("nothing pinned under {cid}"))
+    };
+    let manifest = AmountStatisticsManifestEnvelope::from_json_slice(pinned_at(&manifest_cid))?
+        .verify_trusted(&scheduler.signing_key.verifying_key().to_bytes())?;
+    assert_eq!(manifest.chains.len(), 1);
+    let entry = &manifest.chains[0].snapshot;
+    let snapshot_bytes = pinned_at(&entry.cid);
+    assert_eq!(entry.sha256, FixedBytes::from(content_hash(snapshot_bytes)));
+    assert_eq!(entry.byte_size, u64::try_from(snapshot_bytes.len())?);
+    let mut tx = store.begin().await?;
+    Audit::record_amount_statistics_manifest_ipns_publication(
+        &mut tx,
+        &manifest_cid.parse::<Cid>()?,
+        u64::try_from(sequence)?,
+    )
+    .await?;
+    tx.commit().await?;
+    let pins_after_first_cycle = ipfs.pin_count();
+    // Activation records PostgreSQL's clock, so the later cycles run relative to it.
+    let published_at = Audit::active_amount_statistics_manifest(store.pool())
+        .await?
+        .expect("active amount-statistics manifest")
+        .ipns_published_at;
+    let republish_interval = *scheduler.config.ipns_republish_interval;
+
+    asserter.push_success(&statistics_block_json());
+    scheduler
+        .publish_cycles(published_at + Duration::from_mins(10))
+        .await?;
+
+    assert_eq!(ipfs.pin_count(), pins_after_first_cycle);
+    let manifests: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM published_amount_statistics_manifests")
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(manifests, 1);
+    let statistics = status
+        .read()
+        .await
+        .amount_statistics
+        .clone()
+        .expect("amount-statistics status");
+    assert_eq!(statistics.last_error, None);
+    assert_eq!(statistics.manifest_cid, Some(manifest_cid.clone()));
+    assert_eq!(
+        statistics.chain_failures.len(),
+        0,
+        "{:?}",
+        statistics.chain_failures
+    );
+
+    // Once the IPNS record is due for renewal, the same snapshot goes out under a new manifest.
+    asserter.push_success(&statistics_block_json());
+    scheduler
+        .publish_cycles(published_at + republish_interval)
+        .await?;
+
+    assert_eq!(
+        ipfs.pin_count(),
+        pins_after_first_cycle + 1,
+        "a renewal pins its manifest and no snapshot"
+    );
+    let renewal_snapshot_cids: Vec<String> = sqlx::query_scalar(
+        r"
+        SELECT snapshot.snapshot_cid
+        FROM published_amount_statistics_manifest_snapshots AS snapshot
+        JOIN published_amount_statistics_manifests AS manifest
+            ON manifest.id = snapshot.manifest_id
+        WHERE manifest.cid <> $1
+        ",
+    )
+    .bind(&manifest_cid)
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(renewal_snapshot_cids, vec![entry.cid.clone()]);
+    let renewal_error = status
+        .read()
+        .await
+        .amount_statistics
+        .clone()
+        .and_then(|statistics| statistics.last_error)
+        .unwrap_or_default();
+    assert!(
+        renewal_error.contains("publish amount-statistics manifest CID to IPNS"),
+        "the renewal must reach IPNS publication: {renewal_error}"
+    );
+    let active = Audit::active_amount_statistics_manifest(store.pool())
+        .await?
+        .expect("active amount-statistics manifest");
+    assert_eq!(
+        (active.cid, active.ipns_published_at),
+        (manifest_cid, published_at),
+        "a failed renewal keeps the active manifest and its publication time"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn stalled_statistics_rpc_times_out_and_releases_the_canonicality_lease() -> Result<()> {
+    let (_postgres, store) = reconciliation_store().await?;
+    seed_statistics_chain(&store).await?;
+    let mut scheduler = reconciliation_scheduler(
+        store,
+        Arc::new(ReconciliationIpfs::default()),
+        SigningKey::from_bytes(&[83; 32]),
+    )?;
+    let (status, _asserter, _statistics_ipns_task) = enable_statistics(&mut scheduler)?;
+    // An RPC endpoint that reads the request and never replies, keeping the connection open.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let rpc_url = format!("http://{}", listener.local_addr()?);
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let _rpc = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept statistics RPC");
+        let mut request = vec![0_u8; 4096];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read statistics RPC request");
+        request.truncate(read);
+        let _ = request_tx.send(request);
+        std::future::pending::<()>().await;
+    });
+    let statistics = scheduler
+        .amount_statistics
+        .as_mut()
+        .expect("statistics enabled");
+    statistics.chains = vec![(statistics_scope(), build_provider(&rpc_url)?)];
+    statistics.chain_timeout = Duration::from_millis(200);
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        scheduler.publish_cycles(UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP)),
+    )
+    .await
+    .wrap_err("publication must not wait on a stalled statistics RPC")??;
+
+    let request = tokio::time::timeout(Duration::from_secs(1), request_rx).await??;
+    assert!(
+        request.starts_with(b"POST "),
+        "{}",
+        String::from_utf8_lossy(&request)
+    );
+    let statistics = status
+        .read()
+        .await
+        .amount_statistics
+        .clone()
+        .expect("amount-statistics status");
+    assert_eq!(
+        statistics.chain_failures.len(),
+        1,
+        "{:?}",
+        statistics.chain_failures
+    );
+    let failure = &statistics.chain_failures[0];
+    assert_eq!(failure.chain_id, 1);
+    assert!(failure.reason.contains("timed out"), "{}", failure.reason);
+    tokio::time::timeout(Duration::from_secs(1), scheduler.canonicality.reorg_lease())
+        .await
+        .wrap_err("the statistics step must release the canonicality lease")?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn chain_indexed_manifest_bytes_are_identical_with_statistics_enabled_and_disabled()
+-> Result<()> {
+    let disabled = chain_indexed_manifest_json(false).await?;
+    let enabled = chain_indexed_manifest_json(true).await?;
+
+    assert_eq!(enabled, disabled);
+    Ok(())
+}
+
+#[test]
+fn oversized_snapshot_keeps_the_chains_last_snapshot_and_reports_why() {
+    let kept = statistics_entry(1, "bafykept");
+    let refreshed = statistics_entry(2, "bafyrefreshed");
+    let oversized = eyre::Report::new(AmountStatisticsError::CompressedTooLarge {
+        actual: 5 * 1024 * 1024,
+        maximum: 4 * 1024 * 1024,
+    })
+    .wrap_err("encode amount-statistics snapshot");
+
+    let (chains, failures) = next_manifest_chains(
+        &[kept.clone(), statistics_entry(2, "bafystale")],
+        vec![
+            (kept.scope.clone(), Err(oversized)),
+            (refreshed.scope.clone(), Ok(refreshed.clone())),
+        ],
+    );
+
+    assert_eq!(chains, vec![kept, refreshed]);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].chain_id, 1);
+    assert!(
+        failures[0].reason.contains("compressed size"),
+        "{}",
+        failures[0].reason
+    );
+}
+
 async fn reconciliation_store() -> Result<(ContainerAsync<Postgres>, Store)> {
     let node = Postgres::default()
         .start()
@@ -626,6 +885,7 @@ fn reconciliation_scheduler(
         ipfs_client,
         signing_key,
         ipns_publisher,
+        amount_statistics: None,
         pin_lifecycle: PinLifecycleCoordinator::default(),
         canonicality: ChainCanonicalityCoordinator::default(),
         last_ipns_sequence: None,
@@ -809,6 +1069,203 @@ fn wallet_chunk_descriptor(
             checkpoint_block: Some(end),
             last_indexed_block: Some(end),
             ..Default::default()
+        },
+    }
+}
+
+const STATISTICS_RAILGUN: Address = Address::repeat_byte(0xdd);
+const STATISTICS_BLOCK: u64 = 100;
+const STATISTICS_BLOCK_HASH: FixedBytes<32> = FixedBytes::repeat_byte(0x64);
+const STATISTICS_BLOCK_TIMESTAMP: u64 = 1_700_000_000;
+
+const fn statistics_scope() -> ChainScope {
+    ChainScope {
+        chain_type: ChainType::Evm,
+        chain_id: 1,
+        railgun_contract: STATISTICS_RAILGUN,
+    }
+}
+
+/// Publishes one cycle on a fresh database and returns the chain-indexed manifest body.
+async fn chain_indexed_manifest_json(statistics_enabled: bool) -> Result<String> {
+    let (_postgres, store) = reconciliation_store().await?;
+    seed_statistics_chain(&store).await?;
+    let ipfs = Arc::new(ReconciliationIpfs::default());
+    let mut scheduler =
+        reconciliation_scheduler(store.clone(), ipfs, SigningKey::from_bytes(&[81; 32]))?;
+    scheduler
+        .config
+        .chain_indexed
+        .chains
+        .push(ChainIndexedChainConfig {
+            chain_id: 1,
+            railgun_contract: STATISTICS_RAILGUN,
+            rpc_url: "http://127.0.0.1:9".to_string(),
+            ws_url: None,
+            archive_rpc_url: "http://127.0.0.1:9".to_string(),
+            start_block: 0,
+            v2_start_block: 0,
+            legacy_shield_block: 0,
+            action_start_block: None,
+            datasets: vec![
+                IndexedDatasetKind::WalletScan,
+                IndexedDatasetKind::PublicTxid,
+            ],
+            public_txid_compatibility_omissions: Vec::new(),
+        });
+    if statistics_enabled {
+        let (_status, asserter, _) = enable_statistics(&mut scheduler)?;
+        asserter.push_success(&statistics_block_json());
+    }
+
+    // Neither IPNS task runs, so the chain-indexed step fails after recording its manifest.
+    let _ = scheduler
+        .publish_cycles(UNIX_EPOCH + Duration::from_secs(STATISTICS_BLOCK_TIMESTAMP))
+        .await
+        .expect_err("chain-indexed IPNS publication is unavailable");
+
+    let snapshots: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM published_amount_statistics_snapshots")
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(snapshots, i64::from(statistics_enabled));
+    Ok(
+        sqlx::query_scalar("SELECT manifest_json FROM published_indexed_manifests")
+            .fetch_one(store.pool())
+            .await?,
+    )
+}
+
+/// Enables statistics for `statistics_scope` with a mocked RPC provider. The returned status is
+/// the one statistics report to. The IPNS task is returned unrun, so every statistics IPNS
+/// publication fails: at once when the caller drops the task, by timeout while it holds it.
+fn enable_statistics(
+    scheduler: &mut ChainIndexedPublicationScheduler,
+) -> Result<(SharedStatus, Asserter, IpnsPublisherTask)> {
+    let asserter = Asserter::new();
+    let provider = ProviderBuilder::new()
+        .connect_mocked_client(asserter.clone())
+        .root()
+        .clone();
+    let (ipns_publisher, ipns_task) = IpnsPublisher::new_amount_statistics(
+        &scheduler.signing_key,
+        IpnsPublisherConfig {
+            bootstrap_peers: Vec::new(),
+            record_lifetime: Duration::from_mins(1),
+            record_ttl: Duration::from_secs(30),
+            publish_timeout: Duration::from_secs(1),
+        },
+    )?;
+    let status = Status::default().shared();
+    scheduler.amount_statistics = Some(AmountStatisticsPublication {
+        ipns_publisher,
+        chains: vec![(statistics_scope(), provider)],
+        status: status.clone(),
+        chain_timeout: Duration::from_secs(30),
+    });
+    Ok((status, asserter, ipns_task))
+}
+
+/// Indexes one USDC shield at `STATISTICS_BLOCK` with both datasets indexed through it.
+async fn seed_statistics_chain(store: &Store) -> Result<()> {
+    let shield = IndexedShieldCommitment {
+        tree_number: 0,
+        tree_position: 0,
+        preimage: CommitmentPreimage {
+            npk: FixedBytes::repeat_byte(0x01),
+            token: TokenData {
+                tokenType: 0,
+                tokenAddress: Address::repeat_byte(0x11),
+                tokenSubID: U256::ZERO,
+            },
+            value: Uint::<120, 2>::from(997_500_000_u64),
+        },
+        shield_ciphertext: ShieldCiphertext {
+            encryptedBundle: [FixedBytes::repeat_byte(0x02); 3],
+            shieldKey: FixedBytes::repeat_byte(0x03),
+        },
+        source: IndexedLogSource {
+            block_number: STATISTICS_BLOCK,
+            block_timestamp: Some(STATISTICS_BLOCK_TIMESTAMP),
+            block_hash: STATISTICS_BLOCK_HASH,
+            transaction_hash: FixedBytes::repeat_byte(0x10),
+            log_index: 0,
+        },
+    };
+    let batch = IndexedLogBatch {
+        shield_commitments: vec![shield],
+        ..Default::default()
+    };
+    let mut tx = store.begin().await?;
+    Store::persist_indexed_log_batch(&mut tx, EVM_CHAIN_TYPE, 1, STATISTICS_RAILGUN, &batch)
+        .await?;
+    Store::record_indexed_block_header(
+        &mut tx,
+        EVM_CHAIN_TYPE,
+        1,
+        STATISTICS_BLOCK,
+        STATISTICS_BLOCK_HASH.as_slice(),
+        &[0; 32],
+    )
+    .await?;
+    for dataset_kind in [StoreDatasetKind::WalletScan, StoreDatasetKind::PublicTxid] {
+        Store::record_chain_indexing_progress(
+            &mut tx,
+            EVM_CHAIN_TYPE,
+            1,
+            STATISTICS_RAILGUN,
+            dataset_kind,
+            STATISTICS_BLOCK,
+            STATISTICS_BLOCK_HASH.as_slice(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The `eth_getBlockByHash` response for the covered block.
+fn statistics_block_json() -> serde_json::Value {
+    let zero_hash = format!("0x{}", "00".repeat(32));
+    serde_json::json!({
+        "hash": STATISTICS_BLOCK_HASH,
+        "parentHash": zero_hash,
+        "sha3Uncles": zero_hash,
+        "miner": Address::ZERO,
+        "stateRoot": zero_hash,
+        "transactionsRoot": zero_hash,
+        "receiptsRoot": zero_hash,
+        "logsBloom": format!("0x{}", "00".repeat(256)),
+        "difficulty": "0x0",
+        "number": format!("0x{STATISTICS_BLOCK:x}"),
+        "gasLimit": "0x1c9c380",
+        "gasUsed": "0x0",
+        "timestamp": format!("0x{STATISTICS_BLOCK_TIMESTAMP:x}"),
+        "extraData": "0x",
+        "mixHash": zero_hash,
+        "nonce": "0x0000000000000000",
+        "uncles": [],
+        "transactions": [],
+    })
+}
+
+fn statistics_entry(chain_id: u64, cid: &str) -> AmountStatisticsChainEntry {
+    AmountStatisticsChainEntry {
+        scope: ChainScope {
+            chain_id,
+            ..statistics_scope()
+        },
+        covered_block: AmountStatisticsCoveredBlock {
+            number: STATISTICS_BLOCK,
+            hash: STATISTICS_BLOCK_HASH,
+            timestamp: STATISTICS_BLOCK_TIMESTAMP,
+        },
+        snapshot: AmountStatisticsSnapshotDescriptor {
+            cid: cid.to_string(),
+            sha256: FixedBytes::ZERO,
+            byte_size: 1,
+            encoding_version: 1,
+            compression: CompressionAlgorithm::Zstd,
         },
     }
 }

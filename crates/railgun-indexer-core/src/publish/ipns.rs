@@ -28,8 +28,10 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
+/// Salt of every HKDF-derived IPNS identity; the info string separates the domains.
 pub const V4_POI_IPNS_KDF_SALT: &[u8] = b"railgun-indexer/ipns-key-derivation/v1";
 pub const V4_POI_IPNS_KDF_INFO: &[u8] = b"poi-artifact/chunked-manifest/v4";
+pub const AMOUNT_STATISTICS_IPNS_KDF_INFO: &[u8] = b"amount-statistics/snapshot-manifest/v1";
 
 const IPNS_RECORD_KEY_PREFIX: &[u8] = b"/ipns/";
 const IPFS_PATH_PREFIX: &str = "/ipfs/";
@@ -111,7 +113,7 @@ pub struct IpnsPublisherTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct V4PoiPublicIdentity {
+pub struct DerivedPublicIdentity {
     pub ed25519_public_key: [u8; 32],
     pub peer_id: PeerId,
     pub ipns_name: String,
@@ -164,7 +166,18 @@ impl IpnsPublisher {
         poi_publisher_signing_key: &SigningKey,
         config: IpnsPublisherConfig,
     ) -> Result<(Self, IpnsPublisherTask), IpnsError> {
-        let keypair = identity_keypair_from_v4_poi_signing_key(poi_publisher_signing_key)?;
+        let keypair = derived_identity_keypair(poi_publisher_signing_key, V4_POI_IPNS_KDF_INFO)?;
+        Self::from_identity_keypair(keypair, config)
+    }
+
+    pub fn new_amount_statistics(
+        chain_indexed_publisher_signing_key: &SigningKey,
+        config: IpnsPublisherConfig,
+    ) -> Result<(Self, IpnsPublisherTask), IpnsError> {
+        let keypair = derived_identity_keypair(
+            chain_indexed_publisher_signing_key,
+            AMOUNT_STATISTICS_IPNS_KDF_INFO,
+        )?;
         Self::from_identity_keypair(keypair, config)
     }
 
@@ -249,16 +262,47 @@ impl IpnsPublisher {
     }
 }
 
-pub fn validate_publisher_identities(
-    v4_poi: &IpnsPublisher,
-    chain_indexed: &IpnsPublisher,
-) -> Result<(), IpnsError> {
-    if v4_poi.peer_id == chain_indexed.peer_id {
-        return Err(IpnsError::PublisherIdentityCollision {
-            left: "v4 POI",
-            right: "chain-indexed",
-            peer_id: v4_poi.peer_id,
-        });
+#[derive(Debug)]
+pub struct PublisherIdentities {
+    pub v4_poi: PeerId,
+    pub chain_indexed: PeerId,
+    pub legacy_poi: PeerId,
+    pub amount_statistics: PeerId,
+}
+
+/// Rejects a v4 POI identity equal to the chain-indexed one, and an amount-statistics identity
+/// equal to any of the others.
+pub fn validate_publisher_identities(identities: &PublisherIdentities) -> Result<(), IpnsError> {
+    let PublisherIdentities {
+        v4_poi,
+        chain_indexed,
+        legacy_poi,
+        amount_statistics,
+    } = *identities;
+    let rejected_pairs = [
+        ("v4 POI", v4_poi, "chain-indexed", chain_indexed),
+        (
+            "amount-statistics",
+            amount_statistics,
+            "chain-indexed",
+            chain_indexed,
+        ),
+        (
+            "amount-statistics",
+            amount_statistics,
+            "legacy POI",
+            legacy_poi,
+        ),
+        ("amount-statistics", amount_statistics, "v4 POI", v4_poi),
+    ];
+    for (left, peer_id, right, other) in rejected_pairs {
+        if peer_id == other {
+            return Err(IpnsError::PublisherIdentityCollision {
+                left,
+                right,
+                peer_id,
+            });
+        }
     }
 
     Ok(())
@@ -445,8 +489,31 @@ pub fn ipns_name(peer_id: PeerId) -> Result<String, IpnsError> {
 
 pub fn v4_poi_public_identity(
     poi_publisher_signing_key: &SigningKey,
-) -> Result<V4PoiPublicIdentity, IpnsError> {
-    let keypair = identity_keypair_from_v4_poi_signing_key(poi_publisher_signing_key)?;
+) -> Result<DerivedPublicIdentity, IpnsError> {
+    derived_public_identity(poi_publisher_signing_key, V4_POI_IPNS_KDF_INFO)
+}
+
+pub fn amount_statistics_public_identity(
+    chain_indexed_publisher_signing_key: &SigningKey,
+) -> Result<DerivedPublicIdentity, IpnsError> {
+    derived_public_identity(
+        chain_indexed_publisher_signing_key,
+        AMOUNT_STATISTICS_IPNS_KDF_INFO,
+    )
+}
+
+/// Peer ID of the identity that uses the signing key directly, as the legacy POI and
+/// chain-indexed publishers do.
+pub fn signing_key_peer_id(signing_key: &SigningKey) -> Result<PeerId, IpnsError> {
+    let keypair = identity_keypair_from_signing_key(signing_key)?;
+    Ok(PeerId::from(keypair.public()))
+}
+
+fn derived_public_identity(
+    input_key: &SigningKey,
+    info: &[u8],
+) -> Result<DerivedPublicIdentity, IpnsError> {
+    let keypair = derived_identity_keypair(input_key, info)?;
     let ed25519_public_key = keypair
         .public()
         .try_into_ed25519()
@@ -454,7 +521,7 @@ pub fn v4_poi_public_identity(
         .to_bytes();
     let peer_id = PeerId::from(keypair.public());
 
-    Ok(V4PoiPublicIdentity {
+    Ok(DerivedPublicIdentity {
         ed25519_public_key,
         peer_id,
         ipns_name: ipns_name(peer_id)?,
@@ -468,15 +535,15 @@ fn identity_keypair_from_signing_key(
     identity::Keypair::ed25519_from_bytes(&mut *seed).map_err(IpnsError::Identity)
 }
 
-fn identity_keypair_from_v4_poi_signing_key(
-    poi_publisher_signing_key: &SigningKey,
+fn derived_identity_keypair(
+    input_key: &SigningKey,
+    info: &[u8],
 ) -> Result<identity::Keypair, IpnsError> {
-    let poi_publisher_seed = Zeroizing::new(poi_publisher_signing_key.to_bytes());
-    let (mut prk, hkdf) =
-        Hkdf::<Sha256>::extract(Some(V4_POI_IPNS_KDF_SALT), poi_publisher_seed.as_ref());
+    let input_seed = Zeroizing::new(input_key.to_bytes());
+    let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(V4_POI_IPNS_KDF_SALT), input_seed.as_ref());
     prk.as_mut_slice().zeroize();
     let mut child_seed = Zeroizing::new([0_u8; 32]);
-    hkdf.expand(V4_POI_IPNS_KDF_INFO, &mut *child_seed)
+    hkdf.expand(info, &mut *child_seed)
         .map_err(|_| IpnsError::KdfOutputLength)?;
     drop(hkdf);
     identity::Keypair::ed25519_from_bytes(&mut *child_seed).map_err(IpnsError::Identity)
@@ -978,7 +1045,7 @@ pub enum IpnsError {
     Identity(#[source] identity::DecodingError),
     #[error("publisher identity is not ed25519")]
     UnexpectedIdentityType,
-    #[error("v4 POI IPNS HKDF output length is invalid")]
+    #[error("IPNS HKDF output length is invalid")]
     KdfOutputLength,
     #[error("{left} and {right} publisher identities collide at peer ID {peer_id}")]
     PublisherIdentityCollision {
@@ -1054,6 +1121,15 @@ mod tests {
     ];
     const VECTOR_PEER_ID: &str = "12D3KooWFfqZkgZyH41hEVExsTkwAEVk9bTmHdLTP99uD1uwWo52";
     const VECTOR_IPNS_NAME: &str = "k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft";
+    const AMOUNT_STATISTICS_VECTOR_PUBLIC_KEY: [u8; 32] = [
+        0xb8, 0x4d, 0x44, 0x01, 0x79, 0x83, 0x43, 0x9e, 0x44, 0xb5, 0x9b, 0xbf, 0xae, 0x5b, 0x48,
+        0x11, 0x21, 0xb7, 0x9e, 0xa0, 0xf4, 0xbf, 0xaa, 0xe2, 0x58, 0xdf, 0x8a, 0x08, 0x31, 0x77,
+        0xf0, 0x24,
+    ];
+    const AMOUNT_STATISTICS_VECTOR_PEER_ID: &str =
+        "12D3KooWNDoX5GvtCYZxq61RPNan5DkcCja5DnosB6bbJByTEtL3";
+    const AMOUNT_STATISTICS_VECTOR_IPNS_NAME: &str =
+        "k51qzi5uqu5dkryf96orv3p8eanrw5v1fcluj6e0aw7t8kuexerybwex6p3y1w";
 
     #[test]
     fn v4_poi_hkdf_vector_matches_shared_public_identity() {
@@ -1097,18 +1173,87 @@ mod tests {
     }
 
     #[test]
-    fn every_publisher_identity_collision_is_rejected() {
-        let (v4, _v4_task) = IpnsPublisher::new(&SigningKey::from_bytes(&[2; 32]), test_config())
-            .expect("v4 publisher");
-        let (chain, _chain_task) =
-            IpnsPublisher::new(&SigningKey::from_bytes(&[3; 32]), test_config())
-                .expect("chain publisher");
-        assert!(matches!(
-            validate_publisher_identities(&v4, &v4),
-            Err(IpnsError::PublisherIdentityCollision { .. })
-        ));
+    fn amount_statistics_hkdf_vector_matches_public_identity() {
+        assert_eq!(
+            AMOUNT_STATISTICS_IPNS_KDF_INFO,
+            b"amount-statistics/snapshot-manifest/v1"
+        );
+        let chain_indexed_key = SigningKey::from_bytes(&VECTOR_ROOT_SEED);
+        let identity =
+            amount_statistics_public_identity(&chain_indexed_key).expect("statistics identity");
 
-        validate_publisher_identities(&v4, &chain).expect("distinct identities");
+        assert_eq!(
+            identity.ed25519_public_key,
+            AMOUNT_STATISTICS_VECTOR_PUBLIC_KEY
+        );
+        assert_eq!(
+            identity.peer_id.to_string(),
+            AMOUNT_STATISTICS_VECTOR_PEER_ID
+        );
+        assert_eq!(identity.ipns_name, AMOUNT_STATISTICS_VECTOR_IPNS_NAME);
+
+        let (publisher, _task) =
+            IpnsPublisher::new_amount_statistics(&chain_indexed_key, test_config())
+                .expect("statistics publisher");
+        assert_eq!(publisher.peer_id(), identity.peer_id);
+    }
+
+    #[test]
+    fn every_publisher_identity_collision_is_rejected() {
+        let distinct = PublisherIdentities {
+            v4_poi: test_peer_id(2),
+            chain_indexed: test_peer_id(3),
+            legacy_poi: test_peer_id(4),
+            amount_statistics: test_peer_id(5),
+        };
+        validate_publisher_identities(&distinct).expect("distinct identities");
+
+        let collisions = [
+            (
+                PublisherIdentities {
+                    chain_indexed: distinct.v4_poi,
+                    ..distinct
+                },
+                "v4 POI",
+                "chain-indexed",
+            ),
+            (
+                PublisherIdentities {
+                    chain_indexed: distinct.amount_statistics,
+                    ..distinct
+                },
+                "amount-statistics",
+                "chain-indexed",
+            ),
+            (
+                PublisherIdentities {
+                    legacy_poi: distinct.amount_statistics,
+                    ..distinct
+                },
+                "amount-statistics",
+                "legacy POI",
+            ),
+            (
+                PublisherIdentities {
+                    v4_poi: distinct.amount_statistics,
+                    ..distinct
+                },
+                "amount-statistics",
+                "v4 POI",
+            ),
+        ];
+        for (identities, expected_left, expected_right) in collisions {
+            let error = validate_publisher_identities(&identities)
+                .expect_err("colliding identities are rejected");
+            assert!(
+                matches!(
+                    error,
+                    IpnsError::PublisherIdentityCollision { left, right, .. }
+                        if left == expected_left && right == expected_right
+                ),
+                "unexpected error: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -1368,6 +1513,10 @@ mod tests {
             record_ttl: Duration::from_mins(1),
             publish_timeout: Duration::from_secs(1),
         }
+    }
+
+    fn test_peer_id(seed_byte: u8) -> PeerId {
+        signing_key_peer_id(&SigningKey::from_bytes(&[seed_byte; 32])).expect("test peer ID")
     }
 
     fn test_derived_publisher(root_seed: &[u8; 32], salt: &[u8], info: &[u8]) -> IpnsPublisher {

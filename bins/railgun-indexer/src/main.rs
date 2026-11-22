@@ -32,6 +32,7 @@ use railgun_indexer_core::publish::ipfs::{
 };
 use railgun_indexer_core::publish::ipns::{
     IpnsPublisher, IpnsPublisherConfig, IpnsPublisherTask, ManifestIpnsPublisher,
+    PublisherIdentities, amount_statistics_public_identity, signing_key_peer_id,
     v4_poi_public_identity, validate_publisher_identities,
 };
 use railgun_indexer_core::scrape::Orchestrator;
@@ -233,14 +234,11 @@ async fn main() -> Result<()> {
     let ipfs_pinner = init_ipfs_pinner(&config).wrap_err("initialize IPFS pinner")?;
     let ipns_config =
         IpnsPublisherConfig::from_indexer_config(&config).wrap_err("initialize IPNS config")?;
-    let (v4_poi_ipns_publisher, v4_poi_ipns_task) =
-        IpnsPublisher::new_v4_poi(&publisher_key, ipns_config.clone())
-            .wrap_err("initialize v4 POI IPNS publisher")?;
-    let (chain_indexed_ipns_publisher, chain_indexed_ipns_task) =
-        IpnsPublisher::new(&chain_indexed_publisher_key, ipns_config)
-            .wrap_err("initialize chain-indexed IPNS publisher")?;
-    validate_publisher_identities(&v4_poi_ipns_publisher, &chain_indexed_ipns_publisher)
-        .wrap_err("validate publisher identities")?;
+    let [
+        (v4_poi_ipns_publisher, v4_poi_ipns_task),
+        (chain_indexed_ipns_publisher, chain_indexed_ipns_task),
+        amount_statistics_ipns,
+    ] = init_ipns_publishers(&publisher_key, &chain_indexed_publisher_key, ipns_config)?;
     let poi_v4_ipns_name = v4_poi_ipns_publisher
         .ipns_name()
         .wrap_err("derive v4 POI IPNS name")?;
@@ -274,16 +272,46 @@ async fn main() -> Result<()> {
         store,
         orchestrator,
         publisher_key,
-        chain_indexed_publisher_key,
         ipfs_pinner,
         v4_poi_ipns_publisher,
         v4_poi_ipns_task,
-        chain_indexed_ipns_publisher,
+        chain_indexed::ChainIndexedPublisher {
+            signing_key: chain_indexed_publisher_key,
+            ipns_publisher: chain_indexed_ipns_publisher,
+        },
         chain_indexed_ipns_task,
+        amount_statistics_ipns,
         status_listener,
         status,
     )
     .await
+}
+
+/// Builds the v4 POI, chain-indexed and amount-statistics IPNS publishers, in that order, and
+/// refuses to start on a publication identity collision that `validate_publisher_identities`
+/// rejects.
+fn init_ipns_publishers(
+    publisher_key: &SigningKey,
+    chain_indexed_publisher_key: &SigningKey,
+    ipns_config: IpnsPublisherConfig,
+) -> Result<[(IpnsPublisher, IpnsPublisherTask); 3]> {
+    let v4_poi = IpnsPublisher::new_v4_poi(publisher_key, ipns_config.clone())
+        .wrap_err("initialize v4 POI IPNS publisher")?;
+    let chain_indexed = IpnsPublisher::new(chain_indexed_publisher_key, ipns_config.clone())
+        .wrap_err("initialize chain-indexed IPNS publisher")?;
+    let amount_statistics =
+        IpnsPublisher::new_amount_statistics(chain_indexed_publisher_key, ipns_config)
+            .wrap_err("initialize amount-statistics IPNS publisher")?;
+    let legacy_poi =
+        signing_key_peer_id(publisher_key).wrap_err("derive legacy POI IPNS identity")?;
+    validate_publisher_identities(&PublisherIdentities {
+        v4_poi: v4_poi.0.peer_id(),
+        chain_indexed: chain_indexed.0.peer_id(),
+        legacy_poi,
+        amount_statistics: amount_statistics.0.peer_id(),
+    })
+    .wrap_err("validate publisher identities")?;
+    Ok([v4_poi, chain_indexed, amount_statistics])
 }
 
 type PublisherLockGuard<'lock> = PgAdvisoryLockGuard<'lock, PoolConnection<Postgres>>;
@@ -311,6 +339,7 @@ async fn try_acquire_publisher_lock<'lock>(
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct V4PoiPublicIdentityOutput {
     manifest_signing_public_key: String,
+    amount_statistics_ipns_name: String,
     v4_ipns_public_key: String,
     v4_ipns_peer_id: String,
     v4_ipns_name: String,
@@ -325,8 +354,11 @@ fn print_v4_poi_public_identity(key_path: &PathBuf) -> Result<()> {
 
 fn v4_poi_public_identity_json(signing_key: &SigningKey) -> Result<String> {
     let identity = v4_poi_public_identity(signing_key).wrap_err("derive v4 POI public identity")?;
+    let amount_statistics = amount_statistics_public_identity(signing_key)
+        .wrap_err("derive amount-statistics public identity")?;
     let output = V4PoiPublicIdentityOutput {
         manifest_signing_public_key: hex::encode_prefixed(signing_key.verifying_key().to_bytes()),
+        amount_statistics_ipns_name: amount_statistics.ipns_name,
         v4_ipns_public_key: hex::encode_prefixed(identity.ed25519_public_key),
         v4_ipns_peer_id: identity.peer_id.to_string(),
         v4_ipns_name: identity.ipns_name,
@@ -378,12 +410,12 @@ async fn run_background_tasks(
     store: Store,
     orchestrator: Orchestrator,
     publisher_key: SigningKey,
-    chain_indexed_publisher_key: SigningKey,
     ipfs_pinner: Arc<dyn IpfsClient>,
     v4_poi_ipns_publisher: IpnsPublisher,
     v4_poi_ipns_task: IpnsPublisherTask,
-    chain_indexed_ipns_publisher: IpnsPublisher,
+    chain_indexed_publisher: chain_indexed::ChainIndexedPublisher,
     chain_indexed_ipns_task: IpnsPublisherTask,
+    amount_statistics_ipns: (IpnsPublisher, IpnsPublisherTask),
     status_listener: TcpListener,
     status: SharedStatus,
 ) -> Result<()> {
@@ -392,24 +424,18 @@ async fn run_background_tasks(
     let pin_lifecycle = PinLifecycleCoordinator::default();
     let chain_canonicality = ChainCanonicalityCoordinator::default();
 
-    tasks.spawn({
-        let shutdown = shutdown_rx.clone();
-        async move {
-            v4_poi_ipns_task
-                .run(shutdown)
-                .await
-                .wrap_err("v4 POI IPNS publisher task")
-        }
-    });
-    tasks.spawn({
-        let shutdown = shutdown_rx.clone();
-        async move {
-            chain_indexed_ipns_task
-                .run(shutdown)
-                .await
-                .wrap_err("chain-indexed IPNS publisher task")
-        }
-    });
+    spawn_ipns_task(
+        &mut tasks,
+        v4_poi_ipns_task,
+        &shutdown_rx,
+        "v4 POI IPNS publisher task",
+    );
+    spawn_ipns_task(
+        &mut tasks,
+        chain_indexed_ipns_task,
+        &shutdown_rx,
+        "chain-indexed IPNS publisher task",
+    );
     tasks.spawn({
         let orchestrator = orchestrator.clone();
         let shutdown = shutdown_rx.clone();
@@ -463,6 +489,8 @@ async fn run_background_tasks(
                     .wrap_err("chain-indexed RPC indexing task")
             }
         });
+        let amount_statistics_ipns_publisher =
+            spawn_amount_statistics_ipns(&mut tasks, &config, amount_statistics_ipns, &shutdown_rx);
         tasks.spawn({
             let config = config.clone();
             let store = store.clone();
@@ -470,13 +498,14 @@ async fn run_background_tasks(
             let shutdown = shutdown_rx.clone();
             let pin_lifecycle = pin_lifecycle.clone();
             let chain_canonicality = chain_canonicality.clone();
+            let status = status.clone();
             async move {
                 chain_indexed::run_publication_loop(
                     config,
                     store,
                     ipfs_pinner,
-                    chain_indexed_publisher_key,
-                    chain_indexed_ipns_publisher,
+                    chain_indexed_publisher,
+                    amount_statistics_ipns_publisher.map(|publisher| (publisher, status)),
                     pin_lifecycle,
                     chain_canonicality,
                     shutdown,
@@ -532,6 +561,39 @@ async fn run_background_tasks(
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+/// Starts the amount-statistics IPNS publisher task and returns its publisher when
+/// amount-statistics publication is enabled.
+fn spawn_amount_statistics_ipns(
+    tasks: &mut JoinSet<Result<()>>,
+    config: &Config,
+    amount_statistics_ipns: (IpnsPublisher, IpnsPublisherTask),
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Option<IpnsPublisher> {
+    if config.chain_indexed.amount_statistics.enabled {
+        let (publisher, task) = amount_statistics_ipns;
+        spawn_ipns_task(
+            tasks,
+            task,
+            shutdown_rx,
+            "amount-statistics IPNS publisher task",
+        );
+        Some(publisher)
+    } else {
+        None
+    }
+}
+
+/// Runs an IPNS publisher task as a background task until shutdown.
+fn spawn_ipns_task(
+    tasks: &mut JoinSet<Result<()>>,
+    task: IpnsPublisherTask,
+    shutdown_rx: &watch::Receiver<bool>,
+    name: &'static str,
+) {
+    let shutdown = shutdown_rx.clone();
+    tasks.spawn(async move { task.run(shutdown).await.wrap_err(name) });
 }
 
 async fn run_scraper_loop(

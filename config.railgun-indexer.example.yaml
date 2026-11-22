@@ -26,6 +26,7 @@ railgun_indexer:
   ipns_record_ttl: "1h"
 
   # Cadence for republishing the latest IPNS record when no new manifest is emitted.
+  # Amount statistics renew theirs with a new manifest that lists the same snapshots.
   ipns_republish_interval: "12h"
 
   # Timeout for one IPNS DHT publish or resolve attempt.
@@ -107,6 +108,10 @@ chain_indexed:
 
   # Commitment chunks are contiguous global tree-position ranges.
   commitment_chunk_row_limit: 50000
+
+  # Publishes per-chain amount statistics under their own IPNS name after each publication cycle.
+  amount_statistics:
+    enabled: false
 
   chains:
     - chain_id: 1

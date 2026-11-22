@@ -48,6 +48,7 @@ Important fields:
 - `poi.delta_publish_interval`: the POI publication tick.
 - `poi.base_rebuild_interval`: age at which the POI checkpoint rotates.
 - `poi.per_pair_concurrency_limit`: maximum concurrent `(list_key, chain_id)` sync workers.
+- `chain_indexed.amount_statistics.enabled`: publishes amount statistics after each chain-indexed publication cycle. Defaults to `false`. See Amount Statistics below.
 
 See `docs/railgun-indexer-production-validation.md` for the manual production
 validation checklist before enabling chain-indexed artifacts as an official
@@ -92,6 +93,69 @@ The status server binds to `127.0.0.1:8080` by default. Override with
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/status
 ```
+
+## Amount Statistics
+
+With `chain_indexed.amount_statistics.enabled: true`, each chain-indexed
+publication cycle also publishes one amount-statistics snapshot per chain and a
+manifest that lists them. A chain whose covered block has not moved reuses its
+pinned snapshot. When no chain's entry changed, nothing is published until
+`ipns_republish_interval` has passed since the active manifest's IPNS
+publication. The indexer then publishes a new manifest with the next sequence
+and the same entries, which renews the IPNS record.
+
+The chain-indexed publisher key signs the manifest. The manifest goes out under
+its own IPNS name, which is derived from that key with HKDF and is different
+from the chain-indexed and POI names. A statistics failure never fails
+chain-indexed publication.
+
+Wallets need the amount-statistics IPNS name and the chain-indexed
+manifest-signing public key. This command prints both without loading config or
+starting network services:
+
+```bash
+cargo run --bin railgun-indexer -- \
+  --print-v4-poi-public-identity \
+  --publisher-signing-key-path secrets/railgun-indexer-chain-indexed-publisher.key
+```
+
+The command derives every field from the key it is given. With the chain-indexed
+publisher key, use `manifest_signing_public_key` and
+`amount_statistics_ipns_name` and ignore the `v4_*` fields. With the POI
+publisher key, the reverse holds: `manifest_signing_public_key` and the `v4_*`
+fields apply, and `amount_statistics_ipns_name` does not.
+
+`/status` reports statistics publication under `amount_statistics`, which is
+`null` while statistics are disabled and until the first cycle runs:
+
+- `manifest_cid` and `sequence`: the active manifest.
+- `last_error`: why the last cycle failed, or `null`.
+- `chain_failures`: chains whose snapshot this cycle did not publish, each with `chain_id`, `railgun_contract` and `reason`. The manifest keeps such a chain's previous entry, if it has one. A snapshot over 4 MiB compressed or 32 MiB decoded lands here, and so does a chain whose derivation takes longer than 30 s, with a reason that says it timed out.
+
+To recompute a published snapshot from the indexed tables and compare every
+figure, take the snapshot CID from the chain's manifest entry and run:
+
+```bash
+cargo run --release -p railgun-indexer --bin verify_amount_statistics --locked -- \
+  --config config.railgun-indexer.yaml \
+  --chain-id 1 \
+  --snapshot-cid "$SNAPSHOT_CID"
+```
+
+The verifier only reads Postgres and makes no RPC calls. It fetches the snapshot
+from the gateways in `trustless_artifacts::DEFAULT_GATEWAYS` (`dweb.link`,
+`ipfs.filebase.io`, `ipfs.io`, `gateway.pinata.cloud`) one at a time and checks
+the returned bytes against the requested CID, raw or UnixFS, before decoding. A
+gateway that serves other content counts as a failed attempt, and the verifier
+fails when no gateway returns matching bytes. It prints `every figure matches`
+and exits 0, or prints one
+`mismatch token=... figure=... published=... recomputed=...` line per difference
+and exits with a failure status. It also fails when this database is indexed only
+below the snapshot's covered block, or when its indexed header at that block has
+a different hash. The indexer records a header only where an indexing range
+ended, so another operator's database usually has none at that block. The
+verifier then reads the records by block number and prints a note that the
+covered block hash was not checked.
 
 ## First Run
 

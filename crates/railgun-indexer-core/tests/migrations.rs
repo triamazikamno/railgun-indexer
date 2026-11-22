@@ -26,7 +26,9 @@ use railgun_indexer_core::chain_logs::{
 };
 use railgun_indexer_core::config::PublicTxidCompatibilityOmission;
 use railgun_indexer_core::manifest::{
-    ChainScope, ChainType, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
+    AmountStatisticsChainEntry, AmountStatisticsCoveredBlock, AmountStatisticsManifest,
+    AmountStatisticsSnapshotDescriptor, ChainScope, ChainType, CompressionAlgorithm,
+    IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
     IndexedDatasetKind as ManifestIndexedDatasetKind, PublisherIdentity, content_hash,
 };
 use railgun_indexer_core::publication_sequence::PoiPublicationSequenceAllocator;
@@ -355,7 +357,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     .execute(&pool)
     .await?;
     sqlx::query(
-        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 23, now())",
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 24, now())",
     )
     .execute(&pool)
     .await?;
@@ -363,7 +365,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     run_migrations(&pool).await?;
 
     assert!(!table_exists(&pool, "poi_events").await?);
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
 
     Ok(())
 }
@@ -563,7 +565,7 @@ async fn v15_invalidates_preexisting_pending_reconciliation_until_newer_channel_
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
     let v4_invalidated: Option<i64> = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM reconciliation_invalidated_at)::BIGINT \
          FROM published_poi_v4_manifests WHERE cid = $1",
@@ -938,7 +940,7 @@ async fn v11_conservatively_backfills_active_manifest_artifact_references()
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
     let references: Vec<(String, String)> = sqlx::query_as(
         r"
         SELECT manifest.cid, reference.artifact_cid
@@ -1050,7 +1052,7 @@ async fn v15_to_v17_invalidates_bodyless_indexed_pending_and_replaces_at_higher_
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
     assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(17));
     assert!(
         Audit::pending_indexed_manifest_publication(&pool, &trusted_publisher_pubkey)
@@ -1220,7 +1222,7 @@ async fn v16_to_v17_invalidates_bodyless_indexed_pending_without_lowering_sequen
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
     assert_eq!(store.last_chain_indexed_ipns_sequence().await?, Some(30));
     let state: (bool, bool, bool) = sqlx::query_as(
         "SELECT reconciliation_invalidated_at IS NOT NULL, \
@@ -1640,7 +1642,7 @@ async fn unshield_preimage_migration_backfill_and_new_ingest_roundtrip()
     .await?;
 
     run_migrations(&pool).await?;
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
     assert!(
         !sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
@@ -2862,7 +2864,7 @@ async fn v23_drops_unpinned_legacy_tables_and_keeps_current_publications()
 
     run_migrations(&pool).await?;
 
-    assert_eq!(schema_version(&pool).await?, 23);
+    assert_eq!(schema_version(&pool).await?, 24);
     for table in LEGACY_PUBLICATION_TABLES {
         assert!(!table_exists(&pool, table).await?, "{table}");
     }
@@ -2872,6 +2874,71 @@ async fn v23_drops_unpinned_legacy_tables_and_keeps_current_publications()
             .await?;
     assert_eq!(one_pending_index, None);
     assert_eq!(publication_states(&pool).await?, states);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker PostgreSQL"]
+async fn retention_keeps_statistics_snapshots_of_active_and_pending_manifests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = Postgres::default().start().await?;
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+    run_migrations(&pool).await?;
+    let store = Store::new(pool.clone());
+    let superseded_snapshot = raw_block_cid(b"superseded statistics snapshot")?;
+    let active_snapshot = raw_block_cid(b"active statistics snapshot")?;
+    let pending_snapshot = raw_block_cid(b"pending statistics snapshot")?;
+    let superseded_manifest = raw_block_cid(b"superseded statistics manifest")?;
+    let active_manifest = raw_block_cid(b"active statistics manifest")?;
+    let pending_manifest = raw_block_cid(b"pending statistics manifest")?;
+
+    let mut tx = store.begin().await?;
+    record_statistics_manifest(&mut tx, &superseded_manifest, 1, &superseded_snapshot).await?;
+    Audit::record_amount_statistics_manifest_ipns_publication(&mut tx, &superseded_manifest, 1)
+        .await?;
+    record_statistics_manifest(&mut tx, &active_manifest, 2, &active_snapshot).await?;
+    Audit::record_amount_statistics_manifest_ipns_publication(&mut tx, &active_manifest, 2).await?;
+    record_statistics_manifest(&mut tx, &pending_manifest, 3, &pending_snapshot).await?;
+    tx.commit().await?;
+    // Every row is older than the retention cutoff below.
+    sqlx::query(
+        "UPDATE published_amount_statistics_snapshots \
+         SET published_at = to_timestamp(100), last_referenced_at = to_timestamp(100)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE published_amount_statistics_manifests \
+         SET published_at = to_timestamp(100), \
+             superseded_at = CASE WHEN superseded_at IS NULL THEN NULL ELSE to_timestamp(100) END",
+    )
+    .execute(&pool)
+    .await?;
+
+    let ipfs_client = RecordingIpfsClient::default();
+    let sweep = Retention::sweep(
+        &pool,
+        &ipfs_client,
+        UNIX_EPOCH + Duration::from_secs(200),
+        Duration::from_secs(50),
+    )
+    .await?;
+
+    assert_eq!(
+        sorted_cids(sweep.unpinned_cids),
+        sorted_strings([
+            superseded_manifest.to_string(),
+            superseded_snapshot.to_string()
+        ])
+    );
 
     Ok(())
 }
@@ -3325,6 +3392,41 @@ const LEGACY_PUBLICATION_TABLES: [&str; 3] = [
     "published_snapshots",
     "published_blocked_shields",
 ];
+
+/// Records a snapshot pinned for covered block `sequence` and a pending manifest that
+/// references it.
+async fn record_statistics_manifest(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    manifest_cid: &Cid,
+    sequence: u64,
+    snapshot_cid: &Cid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = AmountStatisticsChainEntry {
+        scope: indexed_scope(),
+        covered_block: AmountStatisticsCoveredBlock {
+            number: sequence,
+            hash: FixedBytes::from([7_u8; 32]),
+            timestamp: 1_700_000_000,
+        },
+        snapshot: AmountStatisticsSnapshotDescriptor {
+            cid: snapshot_cid.to_string(),
+            sha256: FixedBytes::from([8_u8; 32]),
+            byte_size: 64,
+            encoding_version: 1,
+            compression: CompressionAlgorithm::Zstd,
+        },
+    };
+    Audit::record_amount_statistics_snapshot_pin(tx, &entry, snapshot_cid, 256).await?;
+    let manifest = AmountStatisticsManifest {
+        format_version: 1,
+        issued_at_ms: sequence,
+        sequence,
+        publisher: PublisherIdentity::ed25519(FixedBytes::ZERO),
+        chains: vec![entry],
+    };
+    Audit::record_amount_statistics_manifest_pin(tx, manifest_cid, &manifest, "{}").await?;
+    Ok(())
+}
 
 /// Rewinds a fully migrated database to `version` for a replay test. Every version below 23 still
 /// has the legacy POI publication tables, so recreate them with the columns and the one-pending

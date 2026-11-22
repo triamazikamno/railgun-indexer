@@ -346,7 +346,10 @@ impl ChainIndexedPublicationScheduler {
         }))
     }
 
-    async fn ensure_indexed_artifacts_available(&self, artifact_cids: &[String]) -> Result<()> {
+    pub(super) async fn ensure_indexed_artifacts_available(
+        &self,
+        artifact_cids: &[String],
+    ) -> Result<()> {
         for cid in artifact_cids {
             let parsed = cid
                 .parse::<cid::Cid>()

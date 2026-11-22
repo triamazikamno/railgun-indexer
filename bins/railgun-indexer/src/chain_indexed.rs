@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use railgun_indexer_core::amount_statistics::derive_amount_statistics;
 use railgun_indexer_core::audit::{
     Audit, ChainCanonicalityCoordinator, ChainCanonicalityLease, IndexedArtifactPublicationKind,
     PinLifecycleCoordinator, PinOwnershipLease,
@@ -35,11 +36,13 @@ use railgun_indexer_core::chunk::{ChunkPlanItem, ChunkPlanningConfig, plan_chunk
 use railgun_indexer_core::commitments::{commitment_chunk_plan_item, prepare_commitment_chunk};
 use railgun_indexer_core::config::{ChainIndexedChainConfig, Config};
 use railgun_indexer_core::manifest::{
+    AMOUNT_STATISTICS_MANIFEST_FORMAT_VERSION, AmountStatisticsChainEntry,
+    AmountStatisticsManifest, AmountStatisticsManifestEnvelope, AmountStatisticsSnapshotDescriptor,
     ChainScope, ChainType, CompressionAlgorithm, DatasetDescriptorMetadata,
     INDEXED_ARTIFACT_CATALOG_FORMAT_VERSION, INDEXED_ARTIFACT_MANIFEST_FORMAT_VERSION,
     IndexedArtifactCatalog, IndexedArtifactChainEntry, IndexedArtifactDescriptor,
     IndexedArtifactRange, IndexedArtifactRangeKind, IndexedDatasetKind, LatestIndexedHeight,
-    PublisherIdentity, content_hash,
+    PublisherIdentity, content_hash, encode_amount_statistics_snapshot,
 };
 use railgun_indexer_core::merkle_checkpoint::{
     MerkleCheckpointArtifact, prepare_merkle_checkpoint_artifact,
@@ -49,6 +52,7 @@ use railgun_indexer_core::public_txid::{
 };
 use railgun_indexer_core::publish::ipfs::{IpfsClient, IpfsError, pin_indexed_chunk, pin_manifest};
 use railgun_indexer_core::publish::ipns::IpnsPublisher;
+use railgun_indexer_core::status::{AmountStatisticsChainFailure, SharedStatus};
 use railgun_indexer_core::store::{
     IndexedDatasetKind as StoreDatasetKind, Store, StoredIndexedBlockHeader, StoredPublicTxidRow,
 };
@@ -59,10 +63,14 @@ use crate::{
     sleep_or_shutdown, unix_millis,
 };
 
+mod amount_statistics;
 mod catalog_descriptors;
 mod catalogs;
 mod publication;
 
+use amount_statistics::AmountStatisticsPublication;
+#[cfg(test)]
+use amount_statistics::next_manifest_chains;
 #[cfg(test)]
 use catalog_descriptors::catalog_descriptor;
 use catalog_descriptors::{
@@ -473,12 +481,20 @@ fn chain_index_subscription_event_signatures() -> Vec<alloy::primitives::FixedBy
     ]
 }
 
+/// The key that signs chain-indexed publications and the IPNS publisher that announces them.
+pub(crate) struct ChainIndexedPublisher {
+    pub(crate) signing_key: SigningKey,
+    pub(crate) ipns_publisher: IpnsPublisher,
+}
+
+/// `amount_statistics` holds the amount-statistics IPNS publisher and the status it reports to,
+/// and is `Some` only when amount-statistics publication is enabled.
 pub(crate) async fn run_publication_loop(
     config: Config,
     store: Store,
     ipfs_client: Arc<dyn IpfsClient>,
-    signing_key: SigningKey,
-    ipns_publisher: IpnsPublisher,
+    publisher: ChainIndexedPublisher,
+    amount_statistics: Option<(IpnsPublisher, SharedStatus)>,
     pin_lifecycle: PinLifecycleCoordinator,
     canonicality: ChainCanonicalityCoordinator,
     mut shutdown: watch::Receiver<bool>,
@@ -487,12 +503,18 @@ pub(crate) async fn run_publication_loop(
         *config.chain_indexed.publish_interval,
         "chain_indexed.publish_interval",
     )?;
+    let amount_statistics = amount_statistics
+        .map(|(ipns_publisher, status)| {
+            AmountStatisticsPublication::new(&config, ipns_publisher, status)
+        })
+        .transpose()?;
     let mut scheduler = ChainIndexedPublicationScheduler {
         config,
         store,
         ipfs_client,
-        signing_key,
-        ipns_publisher,
+        signing_key: publisher.signing_key,
+        ipns_publisher: publisher.ipns_publisher,
+        amount_statistics,
         pin_lifecycle,
         canonicality,
         last_ipns_sequence: None,
@@ -516,7 +538,7 @@ pub(crate) async fn run_publication_loop(
     }
 
     loop {
-        match scheduler.publish_cycle(SystemTime::now()).await {
+        match scheduler.publish_cycles(SystemTime::now()).await {
             Ok(()) => {}
             Err(error) => {
                 warn!(
@@ -846,6 +868,7 @@ struct ChainIndexedPublicationScheduler {
     ipfs_client: Arc<dyn IpfsClient>,
     signing_key: SigningKey,
     ipns_publisher: IpnsPublisher,
+    amount_statistics: Option<AmountStatisticsPublication>,
     pin_lifecycle: PinLifecycleCoordinator,
     canonicality: ChainCanonicalityCoordinator,
     last_ipns_sequence: Option<u64>,

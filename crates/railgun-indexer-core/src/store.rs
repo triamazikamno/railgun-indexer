@@ -12,7 +12,24 @@ use tracing::info;
 
 pub(crate) const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
 const CHAIN_INDEXED_IPNS_SEQUENCE_STATE_KEY: &str = "chain_indexed_ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 23;
+const AMOUNT_STATISTICS_SEQUENCE_STATE_KEY: &str = "amount_statistics_last_sequence";
+const CURRENT_SCHEMA_VERSION: i32 = 24;
+const POI_PUBLICATION_SEQUENCE: ReservedSequence = ReservedSequence {
+    key: IPNS_SEQUENCE_STATE_KEY,
+    field: "poi_publication_sequence",
+};
+const AMOUNT_STATISTICS_SEQUENCE: ReservedSequence = ReservedSequence {
+    key: AMOUNT_STATISTICS_SEQUENCE_STATE_KEY,
+    field: "amount_statistics_sequence",
+};
+
+/// An `indexer_state` sequence that `Store::reserve_state_sequence` advances.
+#[derive(Clone, Copy)]
+struct ReservedSequence {
+    key: &'static str,
+    /// Names the sequence in conversion errors.
+    field: &'static str,
+}
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -554,7 +571,27 @@ impl Store {
         &self,
         minimum_sequence: u64,
     ) -> Result<u64, StoreError> {
-        let minimum_sequence = u64_to_i64(minimum_sequence, "poi_publication_sequence")?;
+        self.reserve_state_sequence(POI_PUBLICATION_SEQUENCE, minimum_sequence)
+            .await
+    }
+
+    /// Returns a sequence above every earlier amount-statistics sequence and at least
+    /// `minimum_sequence`.
+    pub async fn reserve_amount_statistics_sequence(
+        &self,
+        minimum_sequence: u64,
+    ) -> Result<u64, StoreError> {
+        self.reserve_state_sequence(AMOUNT_STATISTICS_SEQUENCE, minimum_sequence)
+            .await
+    }
+
+    async fn reserve_state_sequence(
+        &self,
+        reserved: ReservedSequence,
+        minimum_sequence: u64,
+    ) -> Result<u64, StoreError> {
+        let ReservedSequence { key, field } = reserved;
+        let minimum_sequence = u64_to_i64(minimum_sequence, field)?;
         let sequence = sqlx::query_scalar::<_, i64>(
             r"
             INSERT INTO indexer_state (key, value)
@@ -565,11 +602,11 @@ impl Store {
             RETURNING value
             ",
         )
-        .bind(IPNS_SEQUENCE_STATE_KEY)
+        .bind(key)
         .bind(minimum_sequence)
         .fetch_one(&self.pool)
         .await?;
-        i64_to_u64(sequence, "poi_publication_sequence")
+        i64_to_u64(sequence, field)
     }
 
     pub async fn last_chain_indexed_ipns_sequence(&self) -> Result<Option<u64>, StoreError> {
@@ -3168,6 +3205,7 @@ const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[
     (21, V21_MIGRATIONS),
     (22, V22_MIGRATIONS),
     (23, V23_MIGRATIONS),
+    (24, V24_MIGRATIONS),
 ];
 
 const V4_MIGRATIONS: &[&str] = &[
@@ -4167,6 +4205,65 @@ const V23_MIGRATIONS: &[&str] = &[
     END $$
     ",
     "DROP TABLE published_manifests, published_snapshots, published_blocked_shields",
+];
+
+// Amount-statistics snapshots and their signed manifests, retained like the chain-indexed
+// artifacts and manifests. The sequence lives in `indexer_state`.
+const V24_MIGRATIONS: &[&str] = &[
+    r"
+    CREATE TABLE IF NOT EXISTS published_amount_statistics_snapshots (
+        id BIGSERIAL PRIMARY KEY,
+        chain_type SMALLINT NOT NULL CHECK (chain_type = 0),
+        chain_id BIGINT NOT NULL,
+        railgun_contract TEXT NOT NULL,
+        covered_block_number BIGINT NOT NULL CHECK (covered_block_number >= 0),
+        covered_block_hash BYTEA NOT NULL CHECK (octet_length(covered_block_hash) = 32),
+        covered_block_timestamp BIGINT NOT NULL CHECK (covered_block_timestamp >= 0),
+        cid TEXT NOT NULL,
+        byte_size BIGINT NOT NULL,
+        content_hash BYTEA NOT NULL CHECK (octet_length(content_hash) = 32),
+        decoded_byte_size BIGINT NOT NULL,
+        encoding_version INTEGER NOT NULL,
+        published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_referenced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        unpinned_at TIMESTAMPTZ,
+        UNIQUE (chain_type, chain_id, railgun_contract, covered_block_number, cid)
+    )
+    ",
+    r"
+    CREATE TABLE IF NOT EXISTS published_amount_statistics_manifests (
+        id BIGSERIAL PRIMARY KEY,
+        cid TEXT NOT NULL,
+        ipns_sequence BIGINT NOT NULL,
+        issued_at_ms BIGINT NOT NULL,
+        byte_size BIGINT NOT NULL,
+        content_hash BYTEA NOT NULL CHECK (octet_length(content_hash) = 32),
+        format_version INTEGER NOT NULL,
+        envelope_json TEXT NOT NULL,
+        published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        ipns_published_at TIMESTAMPTZ,
+        superseded_at TIMESTAMPTZ,
+        unpinned_at TIMESTAMPTZ
+    )
+    ",
+    r"
+    CREATE TABLE IF NOT EXISTS published_amount_statistics_manifest_snapshots (
+        manifest_id BIGINT NOT NULL REFERENCES published_amount_statistics_manifests(id) ON DELETE CASCADE,
+        snapshot_cid TEXT NOT NULL,
+        PRIMARY KEY (manifest_id, snapshot_cid)
+    )
+    ",
+    r"
+    CREATE UNIQUE INDEX IF NOT EXISTS published_amount_statistics_manifests_one_pending
+    ON published_amount_statistics_manifests ((TRUE))
+    WHERE ipns_published_at IS NULL
+      AND superseded_at IS NULL
+      AND unpinned_at IS NULL
+    ",
+    "CREATE INDEX IF NOT EXISTS published_amount_statistics_snapshots_reuse_lookup ON published_amount_statistics_snapshots (chain_type, chain_id, railgun_contract, covered_block_number, content_hash) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_amount_statistics_snapshots_retention_lookup ON published_amount_statistics_snapshots (last_referenced_at, cid) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_amount_statistics_manifests_retention_lookup ON published_amount_statistics_manifests (superseded_at, published_at, unpinned_at, cid) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_amount_statistics_manifest_snapshots_cid_lookup ON published_amount_statistics_manifest_snapshots (snapshot_cid, manifest_id)",
 ];
 
 fn decode_fixed_hex<const N: usize>(

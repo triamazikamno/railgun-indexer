@@ -457,6 +457,83 @@ Do not accept manual JSON inspection as a substitute for signature and descripto
 verification. Use the wallet artifact client tests or an equivalent verifier when
 checking manifests, catalogs, and chunks.
 
+## Amount Statistics Checks
+
+Run these checks only with `chain_indexed.amount_statistics.enabled: true`.
+Statistics publication runs after each chain-indexed publication cycle, and its
+failures never fail that cycle.
+
+Get the amount-statistics IPNS name from the chain-indexed publisher key. The
+command loads no config and starts no network services. It refuses `--config`,
+which clap also takes from the `RAILGUN_INDEXER_CONFIG` exported at startup, so
+unset that variable for this run:
+
+```bash
+env -u RAILGUN_INDEXER_CONFIG cargo run --bin railgun-indexer -- \
+  --print-v4-poi-public-identity \
+  --publisher-signing-key-path secrets/railgun-indexer-chain-indexed-publisher.key
+```
+
+Record `amount_statistics_ipns_name` and `manifest_signing_public_key`; wallets
+need both. Ignore the `v4_*` fields in this output. They describe the POI
+identity only when the command runs with the POI publisher key. Startup refuses
+an amount-statistics name that equals the chain-indexed or a POI name.
+
+Check `/status`:
+
+```bash
+curl -fsS http://127.0.0.1:8080/status
+```
+
+Expected result:
+
+- `amount_statistics.manifest_cid` and `amount_statistics.sequence` name the active manifest, and `sequence` rises with each new manifest. When no chain's covered block moves, a renewal manifest with the same entries still appears once `ipns_republish_interval` has passed.
+- `amount_statistics.last_error` is `null`.
+- `amount_statistics.chain_failures` is empty. Each entry names a chain whose snapshot this cycle did not publish, with the `reason`, for example a snapshot over 4 MiB compressed or 32 MiB decoded, or a derivation that `timed out after 30s`. The manifest keeps that chain's previous entry, if it has one.
+
+List the snapshots of the active manifest:
+
+```bash
+psql "$POSTGRES_URL" -c "
+SELECT m.ipns_sequence, s.chain_id, s.covered_block_number, s.cid
+FROM published_amount_statistics_manifests m
+JOIN published_amount_statistics_manifest_snapshots ms ON ms.manifest_id = m.id
+JOIN published_amount_statistics_snapshots s ON s.cid = ms.snapshot_cid
+WHERE m.ipns_published_at IS NOT NULL
+  AND m.superseded_at IS NULL
+  AND m.unpinned_at IS NULL
+ORDER BY s.chain_id;
+"
+```
+
+For each chain, recompute its snapshot from the indexed tables and compare every
+figure. The verifier fetches the snapshot from the gateways in
+`trustless_artifacts::DEFAULT_GATEWAYS` (`dweb.link`, `ipfs.filebase.io`,
+`ipfs.io`, `gateway.pinata.cloud`) and checks the returned bytes against the
+requested CID before decoding. It then checks that both datasets are indexed
+through the snapshot's covered block and reads the records at or below that
+block. It only reads Postgres and makes no RPC calls. When the database has an
+indexed header at the covered block, the header's hash must match the
+snapshot's. The indexer records a header only where an indexing range ended, so
+any indexer's database works, but on one without that header the verifier
+prints `note: this database has no indexed header at block ...`.
+
+```bash
+export SNAPSHOT_CID=...
+cargo run --release -p railgun-indexer --bin verify_amount_statistics --locked -- \
+  --config "$RAILGUN_INDEXER_CONFIG" \
+  --chain-id 1 \
+  --snapshot-cid "$SNAPSHOT_CID"
+```
+
+Expected result:
+
+- The command prints `every figure matches` and exits 0.
+- A `fetch snapshot` error means no gateway returned bytes that match the CID. A gateway that serves other content counts as a failed attempt. Confirm the snapshot is still pinned and reachable, as in Filebase And Gateway Checks.
+- A `mismatch token=... figure=... published=... recomputed=...` line and a failure exit status mean the published snapshot differs from the indexed tables. Find the cause before release.
+- An error that the chain is indexed only below the covered block means the database has not reached it or rewound past it. Wait for indexing to pass the block, or verify the chain's next snapshot.
+- An error that the covered block hash differs from the indexed header means the snapshot was built on a block this database does not hold as canonical, usually because a reorg replaced it after publication. Verify the chain's next snapshot instead.
+
 ## Fallback Checks
 
 Before enabling official wallet defaults, validate fallback behavior in a staging
@@ -486,6 +563,7 @@ The production validation passes only when all of these are true:
 - Dedicated chain-indexed IPNS publishes the latest signed manifest and does not reuse the POI IPNS name or key.
 - Official gateways can retrieve and verify the active manifest, catalogs, and representative chunks.
 - Public TXID chunks carry checkpoint/root metadata and verify before wallet proof use.
+- With amount statistics enabled, `verify_amount_statistics` reports that every figure matches for each chain's active snapshot.
 - Squid GraphQL and RPC/archive RPC fallback behavior are validated before artifacts become the wallet default.
 
 If any release criterion fails, keep wallet defaults pointed at Squid/manual source,

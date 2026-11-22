@@ -31,12 +31,13 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2"
 zeroize = "1"
-zstd = "0.13"
+zstd = "0.14"
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "5bf96f25d30fc56abdf34301a121aeb6d8d3d342" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "5bf96f25d30fc56abdf34301a121aeb6d8d3d342" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "5bf96f25d30fc56abdf34301a121aeb6d8d3d342" }
-railgun-indexed-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "5bf96f25d30fc56abdf34301a121aeb6d8d3d342" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "71b65e0922473f1c3ea710bb9705e77e3e2fd2f3" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "71b65e0922473f1c3ea710bb9705e77e3e2fd2f3" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "71b65e0922473f1c3ea710bb9705e77e3e2fd2f3" }
+railgun-indexed-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "71b65e0922473f1c3ea710bb9705e77e3e2fd2f3" }
+trustless-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", rev = "71b65e0922473f1c3ea710bb9705e77e3e2fd2f3" }
 
 [profile.release]
 opt-level = 3
@@ -55,6 +56,12 @@ strip = "none"
 
 [profile.dev.build-override]
 opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+debug-assertions = false
+overflow-checks = false
 
 [workspace.lints]
 rust.unreachable_pub = "warn"

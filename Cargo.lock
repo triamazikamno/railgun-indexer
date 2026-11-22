@@ -808,7 +808,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -819,7 +819,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1718,6 +1718,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2b_simd"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3560a7b1951efe814fcd721938313adc56753ca39f4b23847d7e9a2402f5dbff"
+dependencies = [
+ "arrayvec",
+ "constant_time_eq",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1863,7 +1873,7 @@ dependencies = [
 [[package]]
 name = "broadcaster-core"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=71b65e0922473f1c3ea710bb9705e77e3e2fd2f3#71b65e0922473f1c3ea710bb9705e77e3e2fd2f3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2982,7 +2992,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3378,9 +3388,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4071,6 +4083,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipld-dagpb"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e51fc90b345e57d8d5346dcef5eb16d51d1d19572a8a2d23c15009904e68244"
+dependencies = [
+ "bytes",
+ "ipld-core",
+ "quick-protobuf",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4724,7 +4748,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 [[package]]
 name = "merkletree"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=71b65e0922473f1c3ea710bb9705e77e3e2fd2f3#71b65e0922473f1c3ea710bb9705e77e3e2fd2f3"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -4948,7 +4972,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5344,7 +5368,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "poi"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=71b65e0922473f1c3ea710bb9705e77e3e2fd2f3#71b65e0922473f1c3ea710bb9705e77e3e2fd2f3"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -5694,7 +5718,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "railgun-indexed-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=71b65e0922473f1c3ea710bb9705e77e3e2fd2f3#71b65e0922473f1c3ea710bb9705e77e3e2fd2f3"
 dependencies = [
  "alloy-primitives",
  "ed25519-dalek 3.0.0",
@@ -5734,6 +5758,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trustless-artifacts",
  "url",
 ]
 
@@ -5759,7 +5784,7 @@ dependencies = [
  "poi",
  "railgun-indexed-artifacts",
  "reqwest 0.13.4",
- "rust-ipns",
+ "rust-ipns 0.8.1",
  "rust-s3",
  "serde",
  "serde_json",
@@ -6130,6 +6155,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-car"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "660d1576a918f8ccab9a98025367f6c1996e7551d5059833ddf0995e2f444cbf"
+dependencies = [
+ "blake2b_simd",
+ "futures",
+ "ipld-core",
+ "serde_ipld_dagcbor",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "rs-poseidon"
 version = "0.1.0"
 source = "git+https://github.com/codex-storage/rs-poseidon.git?rev=bdbb8ba2735406e6e7b747abd3bc6711d55370aa#bdbb8ba2735406e6e7b747abd3bc6711d55370aa"
@@ -6224,6 +6262,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-ipns"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bf91a0f1965c7c4b8e90daff7966c4d904f72c83ca54e11af460b5cc374ab95"
+dependencies = [
+ "bytes",
+ "chrono",
+ "getrandom 0.4.3",
+ "ipld-core",
+ "libp2p-identity",
+ "multihash",
+ "quick-protobuf",
+ "serde",
+ "serde_ipld_dagcbor",
+]
+
+[[package]]
 name = "rust-s3"
 version = "0.37.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6306,7 +6361,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6365,7 +6420,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6929,7 +6984,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7680,6 +7735,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "trustless-artifacts"
+version = "0.1.0"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=71b65e0922473f1c3ea710bb9705e77e3e2fd2f3#71b65e0922473f1c3ea710bb9705e77e3e2fd2f3"
+dependencies = [
+ "blake2b_simd",
+ "bytes",
+ "chrono",
+ "cid",
+ "futures",
+ "ipld-core",
+ "ipld-dagpb",
+ "libp2p-identity",
+ "poi",
+ "quick-protobuf",
+ "reqwest 0.13.4",
+ "rs-car",
+ "rust-ipns 0.9.0",
+ "serde_ipld_dagcbor",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8113,7 +8194,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8834,27 +8915,27 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.2.4"
+version = "8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+version = "2.1.3+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
 dependencies = [
  "cc",
  "pkg-config",

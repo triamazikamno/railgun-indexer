@@ -1,3 +1,4 @@
+pub mod amount_statistics;
 pub mod audit;
 pub mod blocked;
 pub mod chain_indexer;

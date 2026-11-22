@@ -520,35 +520,9 @@ impl ChainIndexedPublicationScheduler {
         )
         .await
         .wrap_err("lookup reusable indexed artifact CID")?;
-        let (cid, ownership) = if let Some(cid) = reusable {
-            if self
-                .ipfs_client
-                .contains(&cid)
-                .await
-                .wrap_err("check reusable indexed artifact availability")?
-            {
-                (cid, None)
-            } else {
-                warn!(target: LOG_TARGET, %cid, "reusable indexed artifact CID is missing; repinning");
-                let ownership = self.acquire_pin_ownership()?;
-                match self.pin_indexed_artifact(artifact_kind, bytes).await {
-                    Ok(returned) => (returned, Some(ownership)),
-                    Err(error) => {
-                        ownership.settle();
-                        return Err(error);
-                    }
-                }
-            }
-        } else {
-            let ownership = self.acquire_pin_ownership()?;
-            match self.pin_indexed_artifact(artifact_kind, bytes).await {
-                Ok(returned) => (returned, Some(ownership)),
-                Err(error) => {
-                    ownership.settle();
-                    return Err(error);
-                }
-            }
-        };
+        let (cid, ownership) = self
+            .reuse_or_pin_bytes(reusable, artifact_kind, bytes)
+            .await?;
         let audit_result = async {
             let mut tx = self
                 .store
@@ -571,9 +545,53 @@ impl ChainIndexedPublicationScheduler {
             tx.commit().await.wrap_err("commit indexed artifact audit")
         }
         .await;
+        self.settle_pin_audit(&cid, ownership, audit_result, "indexed artifact")
+            .await?;
+        self.ensure_publication_running()?;
+        Ok(cid.to_string())
+    }
+
+    /// Returns `reusable` while the provider still holds it, otherwise pins `bytes` and returns
+    /// the pin ownership that `settle_pin_audit` must settle. Call with the pin lifecycle lock
+    /// held.
+    pub(super) async fn reuse_or_pin_bytes(
+        &self,
+        reusable: Option<cid::Cid>,
+        artifact_kind: IndexedArtifactPublicationKind,
+        bytes: &[u8],
+    ) -> Result<(cid::Cid, Option<PinOwnershipLease>)> {
+        if let Some(cid) = reusable {
+            if self
+                .ipfs_client
+                .contains(&cid)
+                .await
+                .wrap_err("check reusable indexed artifact availability")?
+            {
+                return Ok((cid, None));
+            }
+            warn!(target: LOG_TARGET, %cid, "reusable indexed artifact CID is missing; repinning");
+        }
+        let ownership = self.acquire_pin_ownership()?;
+        match self.pin_indexed_artifact(artifact_kind, bytes).await {
+            Ok(returned) => Ok((returned, Some(ownership))),
+            Err(error) => {
+                ownership.settle();
+                Err(error)
+            }
+        }
+    }
+
+    /// Settles a fresh pin once its audit committed, or cleans it up when the audit failed.
+    pub(super) async fn settle_pin_audit(
+        &self,
+        cid: &cid::Cid,
+        ownership: Option<PinOwnershipLease>,
+        audit_result: Result<()>,
+        label: &'static str,
+    ) -> Result<()> {
         if let Err(error) = audit_result {
             if let Some(ownership) = ownership {
-                self.cleanup_uncommitted_pin_while_locked(&cid, "indexed artifact", ownership)
+                self.cleanup_uncommitted_pin_while_locked(cid, label, ownership)
                     .await;
             }
             return Err(error);
@@ -581,8 +599,7 @@ impl ChainIndexedPublicationScheduler {
         if let Some(ownership) = ownership {
             ownership.settle();
         }
-        self.ensure_publication_running()?;
-        Ok(cid.to_string())
+        Ok(())
     }
 
     async fn pin_indexed_artifact(

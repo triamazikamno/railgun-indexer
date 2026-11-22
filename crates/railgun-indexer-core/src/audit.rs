@@ -1,4 +1,5 @@
 use crate::manifest::{
+    AmountStatisticsChainEntry, AmountStatisticsManifest, AmountStatisticsManifestEnvelope,
     ChainScope, ChainType, IndexedArtifactManifest, IndexedArtifactRange, IndexedArtifactRangeKind,
     IndexedDatasetKind,
 };
@@ -229,6 +230,14 @@ pub struct ActivePoiManifestPublication {
     pub entries: Vec<ManifestEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveAmountStatisticsManifest {
+    pub cid: String,
+    pub sequence: u64,
+    pub ipns_published_at: SystemTime,
+    pub manifest: AmountStatisticsManifest,
+}
+
 impl Audit {
     pub async fn record_pin_cleanup_debt(
         pool: &PgPool,
@@ -275,6 +284,14 @@ impl Audit {
                     FROM published_poi_v4_manifest_artifacts AS edge
                     JOIN published_poi_v4_manifests AS manifest ON manifest.id = edge.manifest_id
                     WHERE edge.artifact_cid = $1 AND manifest.unpinned_at IS NULL
+                )
+                OR EXISTS(SELECT 1 FROM published_amount_statistics_snapshots WHERE cid = $1 AND unpinned_at IS NULL)
+                OR EXISTS(SELECT 1 FROM published_amount_statistics_manifests WHERE cid = $1 AND unpinned_at IS NULL)
+                OR EXISTS(
+                    SELECT 1
+                    FROM published_amount_statistics_manifest_snapshots AS edge
+                    JOIN published_amount_statistics_manifests AS manifest ON manifest.id = edge.manifest_id
+                    WHERE edge.snapshot_cid = $1 AND manifest.unpinned_at IS NULL
                 )
             ",
         )
@@ -1036,6 +1053,278 @@ impl Audit {
 
         Ok(())
     }
+
+    /// The manifest the amount-statistics IPNS name points at. Its body is read back without
+    /// verification: the indexer signed it, and a rotated key must not stop publication.
+    pub async fn active_amount_statistics_manifest(
+        pool: &PgPool,
+    ) -> Result<Option<ActiveAmountStatisticsManifest>, AuditError> {
+        let row = sqlx::query_as::<_, (String, i64, String, i64)>(
+            r"
+            SELECT cid, ipns_sequence, envelope_json,
+                   EXTRACT(EPOCH FROM ipns_published_at)::BIGINT
+            FROM published_amount_statistics_manifests
+            WHERE ipns_published_at IS NOT NULL
+              AND superseded_at IS NULL
+              AND unpinned_at IS NULL
+            ORDER BY ipns_sequence DESC, id DESC
+            LIMIT 1
+            ",
+        )
+        .fetch_optional(pool)
+        .await?;
+        let Some((cid, sequence, envelope_json, published_at)) = row else {
+            return Ok(None);
+        };
+        let envelope: AmountStatisticsManifestEnvelope = serde_json::from_str(&envelope_json)?;
+        Ok(Some(ActiveAmountStatisticsManifest {
+            cid,
+            sequence: i64_to_u64(sequence, "ipns_sequence")?,
+            ipns_published_at: i64_to_system_time(published_at, "ipns_published_at")?,
+            manifest: serde_json::from_str(&envelope.body)?,
+        }))
+    }
+
+    /// A pinned snapshot with the same chain, covered block and bytes as `entry`.
+    pub async fn live_amount_statistics_snapshot_cid(
+        pool: &PgPool,
+        entry: &AmountStatisticsChainEntry,
+    ) -> Result<Option<Cid>, AuditError> {
+        let cid = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT cid
+            FROM published_amount_statistics_snapshots
+            WHERE chain_type = $1
+                AND chain_id = $2
+                AND railgun_contract = $3
+                AND covered_block_number = $4
+                AND content_hash = $5
+                AND byte_size = $6
+                AND encoding_version = $7
+                AND unpinned_at IS NULL
+            ORDER BY last_referenced_at DESC, published_at DESC
+            LIMIT 1
+            ",
+        )
+        .bind(chain_type_discriminant(entry.scope.chain_type))
+        .bind(u64_to_i64(entry.scope.chain_id, "chain_id")?)
+        .bind(hex::encode_prefixed(
+            entry.scope.railgun_contract.as_slice(),
+        ))
+        .bind(u64_to_i64(
+            entry.covered_block.number,
+            "covered_block_number",
+        )?)
+        .bind(entry.snapshot.sha256.as_slice())
+        .bind(u64_to_i64(entry.snapshot.byte_size, "byte_size")?)
+        .bind(i32::from(entry.snapshot.encoding_version))
+        .fetch_optional(pool)
+        .await?;
+
+        cid.map(|cid| parse_cid(&cid)).transpose()
+    }
+
+    pub async fn record_amount_statistics_snapshot_pin(
+        tx: &mut Transaction<'_, Postgres>,
+        entry: &AmountStatisticsChainEntry,
+        cid: &Cid,
+        decoded_byte_size: u64,
+    ) -> Result<(), AuditError> {
+        sqlx::query(
+            r"
+            INSERT INTO published_amount_statistics_snapshots (
+                chain_type,
+                chain_id,
+                railgun_contract,
+                covered_block_number,
+                covered_block_hash,
+                covered_block_timestamp,
+                cid,
+                byte_size,
+                content_hash,
+                decoded_byte_size,
+                encoding_version
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (chain_type, chain_id, railgun_contract, covered_block_number, cid)
+            DO UPDATE SET
+                last_referenced_at = now(),
+                unpinned_at = NULL
+            ",
+        )
+        .bind(chain_type_discriminant(entry.scope.chain_type))
+        .bind(u64_to_i64(entry.scope.chain_id, "chain_id")?)
+        .bind(hex::encode_prefixed(
+            entry.scope.railgun_contract.as_slice(),
+        ))
+        .bind(u64_to_i64(
+            entry.covered_block.number,
+            "covered_block_number",
+        )?)
+        .bind(entry.covered_block.hash.as_slice())
+        .bind(u64_to_i64(
+            entry.covered_block.timestamp,
+            "covered_block_timestamp",
+        )?)
+        .bind(cid.to_string())
+        .bind(u64_to_i64(entry.snapshot.byte_size, "byte_size")?)
+        .bind(entry.snapshot.sha256.as_slice())
+        .bind(u64_to_i64(decoded_byte_size, "decoded_byte_size")?)
+        .bind(i32::from(entry.snapshot.encoding_version))
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Records a pinned manifest as pending IPNS publication. It supersedes a manifest that an
+    /// earlier cycle left pending, since this one replaces it.
+    pub async fn record_amount_statistics_manifest_pin(
+        tx: &mut Transaction<'_, Postgres>,
+        cid: &Cid,
+        manifest: &AmountStatisticsManifest,
+        envelope_json: &str,
+    ) -> Result<(), AuditError> {
+        let snapshot_cids = manifest
+            .chains
+            .iter()
+            .map(|entry| entry.snapshot.cid.clone())
+            .collect::<Vec<_>>();
+        ensure_live_amount_statistics_snapshots(tx, &snapshot_cids).await?;
+        let byte_size =
+            i64::try_from(envelope_json.len()).map_err(|_| AuditError::IntegerOutOfRange {
+                field: "byte_size",
+                value: envelope_json.len().to_string(),
+            })?;
+        let content_hash = crate::blocked::content_hash(envelope_json.as_bytes());
+
+        sqlx::query(
+            r"
+            UPDATE published_amount_statistics_manifests
+            SET superseded_at = now()
+            WHERE ipns_published_at IS NULL
+              AND superseded_at IS NULL
+            ",
+        )
+        .execute(&mut **tx)
+        .await?;
+        let manifest_id = sqlx::query_scalar::<_, i64>(
+            r"
+            INSERT INTO published_amount_statistics_manifests (
+                cid,
+                ipns_sequence,
+                issued_at_ms,
+                byte_size,
+                content_hash,
+                format_version,
+                envelope_json
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id
+            ",
+        )
+        .bind(cid.to_string())
+        .bind(u64_to_i64(manifest.sequence, "sequence")?)
+        .bind(u64_to_i64(manifest.issued_at_ms, "issued_at_ms")?)
+        .bind(byte_size)
+        .bind(content_hash.as_slice())
+        .bind(i32::from(manifest.format_version))
+        .bind(envelope_json)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            r"
+            INSERT INTO published_amount_statistics_manifest_snapshots (manifest_id, snapshot_cid)
+            SELECT $1, snapshot_cid
+            FROM UNNEST($2::TEXT[]) AS snapshot_cid
+            ON CONFLICT (manifest_id, snapshot_cid) DO NOTHING
+            ",
+        )
+        .bind(manifest_id)
+        .bind(snapshot_cids.as_slice())
+        .execute(&mut **tx)
+        .await?;
+        // A snapshot carried forward from an earlier manifest gets no new snapshot pin, so this
+        // keeps it retained for the retention interval after its last referencing manifest.
+        sqlx::query(
+            r"
+            UPDATE published_amount_statistics_snapshots
+            SET last_referenced_at = now()
+            WHERE cid = ANY($1::TEXT[])
+              AND unpinned_at IS NULL
+            ",
+        )
+        .bind(snapshot_cids.as_slice())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Marks the manifest as the one IPNS points at and supersedes every other.
+    pub async fn record_amount_statistics_manifest_ipns_publication(
+        tx: &mut Transaction<'_, Postgres>,
+        cid: &Cid,
+        sequence: u64,
+    ) -> Result<(), AuditError> {
+        let cid = cid.to_string();
+        let manifest_id = sqlx::query_scalar::<_, i64>(
+            r"
+            UPDATE published_amount_statistics_manifests
+            SET ipns_published_at = COALESCE(ipns_published_at, now())
+            WHERE cid = $1
+                AND ipns_sequence = $2
+                AND superseded_at IS NULL
+                AND unpinned_at IS NULL
+            RETURNING id
+            ",
+        )
+        .bind(&cid)
+        .bind(u64_to_i64(sequence, "sequence")?)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(manifest_id) = manifest_id else {
+            return Err(AuditError::UnrecordedManifest { cid });
+        };
+        sqlx::query(
+            r"
+            UPDATE published_amount_statistics_manifests
+            SET superseded_at = now()
+            WHERE superseded_at IS NULL
+              AND id <> $1
+            ",
+        )
+        .bind(manifest_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+}
+
+async fn ensure_live_amount_statistics_snapshots(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot_cids: &[String],
+) -> Result<(), AuditError> {
+    let live_count = sqlx::query_scalar::<_, i64>(
+        r"
+        SELECT COUNT(DISTINCT cid)
+        FROM published_amount_statistics_snapshots
+        WHERE cid = ANY($1::TEXT[])
+            AND unpinned_at IS NULL
+        ",
+    )
+    .bind(snapshot_cids)
+    .fetch_one(&mut **tx)
+    .await?;
+    let actual = usize::try_from(live_count).unwrap_or(0);
+    if actual != snapshot_cids.len() {
+        return Err(AuditError::MissingAmountStatisticsSnapshots {
+            expected: snapshot_cids.len(),
+            actual,
+        });
+    }
+    Ok(())
 }
 
 async fn invalidate_pending_poi_manifest_reconciliation(
@@ -1351,6 +1640,18 @@ impl Retention {
                 WHERE unpinned_at IS NULL
                 GROUP BY cid
                 HAVING MAX(last_referenced_at) <= to_timestamp($1)
+                UNION
+                SELECT cid
+                FROM published_amount_statistics_manifests
+                WHERE unpinned_at IS NULL
+                    AND superseded_at IS NOT NULL
+                    AND superseded_at <= to_timestamp($1)
+                UNION
+                SELECT cid
+                FROM published_amount_statistics_snapshots
+                WHERE unpinned_at IS NULL
+                GROUP BY cid
+                HAVING MAX(last_referenced_at) <= to_timestamp($1)
             )
             SELECT DISTINCT candidates.cid
             FROM candidates
@@ -1400,6 +1701,29 @@ impl Retention {
                         AND manifest.superseded_at IS NULL
                         AND manifest.unpinned_at IS NULL
                 )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM published_amount_statistics_manifests AS manifest
+                    WHERE manifest.cid = candidates.cid
+                        AND manifest.superseded_at IS NULL
+                        AND manifest.unpinned_at IS NULL
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM published_amount_statistics_snapshots AS snapshot
+                    WHERE snapshot.cid = candidates.cid
+                        AND snapshot.unpinned_at IS NULL
+                        AND snapshot.last_referenced_at > to_timestamp($1)
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM published_amount_statistics_manifest_snapshots AS reference
+                    JOIN published_amount_statistics_manifests AS manifest
+                        ON manifest.id = reference.manifest_id
+                    WHERE reference.snapshot_cid = candidates.cid
+                        AND manifest.superseded_at IS NULL
+                        AND manifest.unpinned_at IS NULL
+                )
             ORDER BY candidates.cid ASC
             ",
         )
@@ -1412,95 +1736,11 @@ impl Retention {
             let cid = parse_cid(&cid_text)?;
             let _pin_lifecycle = coordinator.lock().await;
             let mut tx = pool.begin().await?;
-            let still_eligible = sqlx::query_scalar::<_, bool>(
-                r"
-                SELECT (
-                    (
-                        EXISTS (
-                            SELECT 1
-                            FROM published_indexed_manifests
-                            WHERE cid = $1
-                                AND unpinned_at IS NULL
-                                AND superseded_at IS NOT NULL
-                                AND superseded_at <= to_timestamp($2)
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM published_indexed_artifacts
-                            WHERE cid = $1
-                                AND unpinned_at IS NULL
-                            GROUP BY cid
-                            HAVING MAX(last_referenced_at) <= to_timestamp($2)
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM published_poi_v4_manifests
-                            WHERE cid = $1
-                                AND unpinned_at IS NULL
-                                AND superseded_at IS NOT NULL
-                                AND superseded_at <= to_timestamp($2)
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM published_poi_v4_artifacts
-                            WHERE cid = $1 AND unpinned_at IS NULL
-                            GROUP BY cid
-                            HAVING MAX(last_referenced_at) <= to_timestamp($2)
-                        )
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_manifests AS active
-                        WHERE active.cid = $1
-                            AND active.ipns_published_at IS NOT NULL
-                            AND active.superseded_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_artifacts AS active
-                        WHERE active.cid = $1
-                            AND active.unpinned_at IS NULL
-                            AND active.last_referenced_at > to_timestamp($2)
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_indexed_manifest_artifacts AS reference
-                        JOIN published_indexed_manifests AS manifest
-                            ON manifest.id = reference.manifest_id
-                        WHERE reference.artifact_cid = $1
-                            AND manifest.superseded_at IS NULL
-                            AND manifest.unpinned_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_poi_v4_manifests AS manifest
-                        WHERE manifest.cid = $1
-                            AND manifest.superseded_at IS NULL
-                            AND manifest.unpinned_at IS NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_poi_v4_artifacts AS artifact
-                        WHERE artifact.cid = $1
-                            AND artifact.unpinned_at IS NULL
-                            AND artifact.last_referenced_at > to_timestamp($2)
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM published_poi_v4_manifest_artifacts AS reference
-                        JOIN published_poi_v4_manifests AS manifest
-                            ON manifest.id = reference.manifest_id
-                        WHERE reference.artifact_cid = $1
-                            AND manifest.superseded_at IS NULL
-                            AND manifest.unpinned_at IS NULL
-                    )
-                )
-                ",
-            )
-            .bind(&cid_text)
-            .bind(cutoff)
-            .fetch_one(&mut *tx)
-            .await?;
+            let still_eligible = sqlx::query_scalar::<_, bool>(RETENTION_STILL_ELIGIBLE_SQL)
+                .bind(&cid_text)
+                .bind(cutoff)
+                .fetch_one(&mut *tx)
+                .await?;
             if !still_eligible {
                 tx.rollback().await?;
                 continue;
@@ -1600,6 +1840,7 @@ impl Retention {
             .bind(cutoff)
             .execute(&mut *tx)
             .await?;
+            Self::mark_amount_statistics_unpinned(&mut tx, &cid_text, swept_at, cutoff).await?;
             tx.commit().await?;
             info!(cid = %cid, "unpinned stale railgun-indexer publication CID");
             unpinned_cids.push(cid);
@@ -1610,7 +1851,171 @@ impl Retention {
             failed_cids,
         })
     }
+
+    /// Marks the amount-statistics manifest and snapshot rows of an unpinned CID, in the sweep's
+    /// transaction.
+    async fn mark_amount_statistics_unpinned(
+        tx: &mut Transaction<'_, Postgres>,
+        cid_text: &str,
+        swept_at: i64,
+        cutoff: i64,
+    ) -> Result<(), AuditError> {
+        sqlx::query(
+            r"
+            UPDATE published_amount_statistics_manifests
+            SET unpinned_at = to_timestamp($1)
+            WHERE cid = $2
+                AND unpinned_at IS NULL
+                AND superseded_at IS NOT NULL
+                AND superseded_at <= to_timestamp($3)
+            ",
+        )
+        .bind(swept_at)
+        .bind(cid_text)
+        .bind(cutoff)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE published_amount_statistics_snapshots
+            SET unpinned_at = to_timestamp($1)
+            WHERE cid = $2
+                AND unpinned_at IS NULL
+                AND last_referenced_at <= to_timestamp($3)
+            ",
+        )
+        .bind(swept_at)
+        .bind(cid_text)
+        .bind(cutoff)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
 }
+
+/// Rechecks under the pin-lifecycle lock that CID `$1` is still past the retention cutoff `$2`
+/// and that no live publication references it.
+const RETENTION_STILL_ELIGIBLE_SQL: &str = r"
+    SELECT (
+        (
+            EXISTS (
+                SELECT 1
+                FROM published_indexed_manifests
+                WHERE cid = $1
+                    AND unpinned_at IS NULL
+                    AND superseded_at IS NOT NULL
+                    AND superseded_at <= to_timestamp($2)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM published_indexed_artifacts
+                WHERE cid = $1
+                    AND unpinned_at IS NULL
+                GROUP BY cid
+                HAVING MAX(last_referenced_at) <= to_timestamp($2)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM published_poi_v4_manifests
+                WHERE cid = $1
+                    AND unpinned_at IS NULL
+                    AND superseded_at IS NOT NULL
+                    AND superseded_at <= to_timestamp($2)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM published_poi_v4_artifacts
+                WHERE cid = $1 AND unpinned_at IS NULL
+                GROUP BY cid
+                HAVING MAX(last_referenced_at) <= to_timestamp($2)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM published_amount_statistics_manifests
+                WHERE cid = $1
+                    AND unpinned_at IS NULL
+                    AND superseded_at IS NOT NULL
+                    AND superseded_at <= to_timestamp($2)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM published_amount_statistics_snapshots
+                WHERE cid = $1 AND unpinned_at IS NULL
+                GROUP BY cid
+                HAVING MAX(last_referenced_at) <= to_timestamp($2)
+            )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_indexed_manifests AS active
+            WHERE active.cid = $1
+                AND active.ipns_published_at IS NOT NULL
+                AND active.superseded_at IS NULL
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_indexed_artifacts AS active
+            WHERE active.cid = $1
+                AND active.unpinned_at IS NULL
+                AND active.last_referenced_at > to_timestamp($2)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_indexed_manifest_artifacts AS reference
+            JOIN published_indexed_manifests AS manifest
+                ON manifest.id = reference.manifest_id
+            WHERE reference.artifact_cid = $1
+                AND manifest.superseded_at IS NULL
+                AND manifest.unpinned_at IS NULL
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_poi_v4_manifests AS manifest
+            WHERE manifest.cid = $1
+                AND manifest.superseded_at IS NULL
+                AND manifest.unpinned_at IS NULL
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_poi_v4_artifacts AS artifact
+            WHERE artifact.cid = $1
+                AND artifact.unpinned_at IS NULL
+                AND artifact.last_referenced_at > to_timestamp($2)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_poi_v4_manifest_artifacts AS reference
+            JOIN published_poi_v4_manifests AS manifest
+                ON manifest.id = reference.manifest_id
+            WHERE reference.artifact_cid = $1
+                AND manifest.superseded_at IS NULL
+                AND manifest.unpinned_at IS NULL
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_amount_statistics_manifests AS manifest
+            WHERE manifest.cid = $1
+                AND manifest.superseded_at IS NULL
+                AND manifest.unpinned_at IS NULL
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_amount_statistics_snapshots AS snapshot
+            WHERE snapshot.cid = $1
+                AND snapshot.unpinned_at IS NULL
+                AND snapshot.last_referenced_at > to_timestamp($2)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM published_amount_statistics_manifest_snapshots AS reference
+            JOIN published_amount_statistics_manifests AS manifest
+                ON manifest.id = reference.manifest_id
+            WHERE reference.snapshot_cid = $1
+                AND manifest.superseded_at IS NULL
+                AND manifest.unpinned_at IS NULL
+        )
+    )
+";
 
 async fn retry_pin_cleanup_debt(
     pool: &PgPool,
@@ -1754,6 +2159,10 @@ pub enum AuditError {
     PoiArtifactConflict { cid: String, byte_size: u64 },
     #[error("POI v4 manifest references {expected} artifacts but only {actual} remain live")]
     MissingManifestArtifacts { expected: usize, actual: usize },
+    #[error(
+        "amount-statistics manifest references {expected} snapshots but only {actual} remain live"
+    )]
+    MissingAmountStatisticsSnapshots { expected: usize, actual: usize },
 }
 
 const fn indexed_artifact_publication_kind_str(
